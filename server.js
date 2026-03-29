@@ -17,10 +17,7 @@ const supabase = createClient(
 );
 
 // ── MIDDLEWARE ─────────────────────────────────
-app.use(cors({
-  origin: process.env.FRONTEND_URL || '*',
-  credentials: true
-}));
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // Rate limiting — protect against abuse
