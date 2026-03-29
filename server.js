@@ -62,8 +62,23 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     });
 
     const raw = message.content[0].text;
-    const clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const plan = JSON.parse(clean);
+console.log('Raw plan response (first 500 chars):', raw.substring(0, 500));
+
+let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+const start = clean.indexOf('{');
+const end = clean.lastIndexOf('}');
+if (start !== -1 && end !== -1) {
+  clean = clean.substring(start, end + 1);
+}
+
+let plan;
+try {
+  plan = JSON.parse(clean);
+} catch(parseErr) {
+  console.error('JSON parse error:', parseErr.message);
+  throw new Error('Failed to parse plan JSON: ' + parseErr.message);
+}
 
     // Save to DB
     const { data, error } = await supabase
