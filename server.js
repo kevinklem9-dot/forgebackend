@@ -6,7 +6,6 @@ const Anthropic = require('@anthropic-ai/sdk').default;
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 
 // ── CLIENTS ────────────────────────────────────
@@ -18,7 +17,10 @@ const supabase = createClient(
 );
 
 // ── MIDDLEWARE ─────────────────────────────────
-app.use(cors({ origin: '*' }));
+app.use(cors({
+  origin: process.env.FRONTEND_URL || '*',
+  credentials: true
+}));
 app.use(express.json());
 
 // Rate limiting — protect against abuse
@@ -63,23 +65,26 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     });
 
     const raw = message.content[0].text;
-console.log('Raw plan response (first 500 chars):', raw.substring(0, 500));
-
-let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-
-const start = clean.indexOf('{');
-const end = clean.lastIndexOf('}');
-if (start !== -1 && end !== -1) {
-  clean = clean.substring(start, end + 1);
-}
-
-let plan;
-try {
-  plan = JSON.parse(clean);
-} catch(parseErr) {
-  console.error('JSON parse error:', parseErr.message);
-  throw new Error('Failed to parse plan JSON: ' + parseErr.message);
-}
+    console.log('Raw plan response (first 500 chars):', raw.substring(0, 500));
+    
+    // Strip markdown fences and find the JSON object
+    let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    
+    // Find the outermost { } in case there's extra text
+    const start = clean.indexOf('{');
+    const end = clean.lastIndexOf('}');
+    if (start !== -1 && end !== -1) {
+      clean = clean.substring(start, end + 1);
+    }
+    
+    let plan;
+    try {
+      plan = JSON.parse(clean);
+    } catch(parseErr) {
+      console.error('JSON parse error:', parseErr.message);
+      console.error('Attempted to parse:', clean.substring(0, 500));
+      throw new Error('Failed to parse plan JSON: ' + parseErr.message);
+    }
 
     // Save to DB
     const { data, error } = await supabase
@@ -434,6 +439,48 @@ ${historyStr}
 
 YOUR ROLE: Be their coach. Give specific, personalised advice based on their exact profile and history. Reference their actual numbers. Sound like someone who's fully invested in this person's progress.`;
 }
+
+// ── ADMIN — Get all users ──────────────────────────────
+app.get('/api/admin/users', requireAuth, async (req, res) => {
+  try {
+    const adminEmail = process.env.ADMIN_EMAIL;
+    const { data: { user } } = await supabase.auth.admin.getUserById(req.user.id);
+    if (user?.email !== adminEmail) return res.status(403).json({ error: 'Forbidden' });
+
+    const { data: profiles, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const { data: { users: authUsers } } = await supabase.auth.admin.listUsers();
+    const emailMap = {};
+    authUsers.forEach(u => emailMap[u.id] = u.email);
+
+    const users = profiles.map(p => ({ ...p, email: emailMap[p.id] || '—' }));
+    res.json({ users });
+  } catch (err) {
+    console.error('Admin users error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ADMIN — Delete user ────────────────────────────────
+app.delete('/api/admin/users/:userId', requireAuth, async (req, res) => {
+  try {
+    const adminEmail = process.env.ADMIN_EMAIL;
+    const { data: { user } } = await supabase.auth.admin.getUserById(req.user.id);
+    if (user?.email !== adminEmail) return res.status(403).json({ error: 'Forbidden' });
+
+    const { error } = await supabase.auth.admin.deleteUser(req.params.userId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete user error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ── START ──────────────────────────────────────
 app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
