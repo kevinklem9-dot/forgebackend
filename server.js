@@ -51,6 +51,49 @@ function requireAdmin(req, res, next) {
 // ── HEALTH CHECK ───────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', app: 'FORGE' }));
 
+// ── SIGNUP — Check email + create account ──────
+app.post('/api/signup', async (req, res) => {
+  const { email, password, name } = req.body;
+  if (!email || !password || !name) return res.status(400).json({ error: 'All fields required.' });
+  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+
+  try {
+    // Check if email already exists
+    const { data: { users }, error: listErr } = await supabase.auth.admin.listUsers();
+    if (listErr) throw listErr;
+
+    const exists = users.some(u => u.email?.toLowerCase() === email.toLowerCase());
+    if (exists) {
+      return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
+    }
+
+    // Create the account via admin (auto-confirms email)
+    const { data, error } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { name }
+    });
+    if (error) throw error;
+
+    // Sign them in to get a session token
+    const { data: signInData, error: signInErr } = await supabase.auth.signInWithPassword({ email, password });
+    if (signInErr) throw signInErr;
+
+    // Save name to profile
+    await supabase.from('profiles').update({ name }).eq('id', data.user.id);
+
+    res.json({
+      access_token: signInData.session.access_token,
+      refresh_token: signInData.session.refresh_token,
+      user: { ...signInData.user, email }
+    });
+  } catch (err) {
+    console.error('Signup error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GENERATE PLAN ──────────────────────────────
 // Called after onboarding — AI generates a personalised workout + nutrition plan
 app.post('/api/generate-plan', requireAuth, async (req, res) => {
