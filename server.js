@@ -518,6 +518,14 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
 app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, res) => {
   const { userId } = req.params;
   try {
+    // Get target user's email
+    const { data: { user: targetUser } } = await supabase.auth.admin.getUserById(userId);
+
+    // Block deletion of admin account
+    if (targetUser?.email === process.env.ADMIN_EMAIL) {
+      return res.status(403).json({ error: 'Cannot delete the admin account.' });
+    }
+
     // Delete all user data from every table first
     await Promise.all([
       supabase.from('exercise_history').delete().eq('user_id', userId),
@@ -530,7 +538,7 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
     // Delete profile row
     await supabase.from('profiles').delete().eq('id', userId);
 
-    // Delete auth account — this is the final step that prevents re-login
+    // Delete auth account
     const { error } = await supabase.auth.admin.deleteUser(userId);
     if (error) throw error;
 
