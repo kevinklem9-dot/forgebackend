@@ -490,6 +490,89 @@ ${historyStr}
 YOUR ROLE: Be their coach. Give specific, personalised advice based on their exact profile and history. Reference their actual numbers. Sound like someone who's fully invested in this person's progress.`;
 }
 
+// ── GET CONVERSATIONS LIST ─────────────────────────────
+app.get('/api/conversations', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('chat_conversations')
+      .select('id, title, created_at, updated_at')
+      .eq('user_id', req.user.id)
+      .order('updated_at', { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+    res.json({ conversations: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET SINGLE CONVERSATION ────────────────────────────
+app.get('/api/conversations/:id', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('chat_conversations')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (error) throw error;
+    res.json({ conversation: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── SAVE / UPDATE CONVERSATION ─────────────────────────
+app.post('/api/conversations', requireAuth, async (req, res) => {
+  try {
+    const { id, title, messages } = req.body;
+
+    if (id) {
+      // Update existing
+      const { data, error } = await supabase
+        .from('chat_conversations')
+        .update({ messages, title, updated_at: new Date().toISOString() })
+        .eq('id', id)
+        .eq('user_id', req.user.id)
+        .select()
+        .single();
+
+      if (error) throw error;
+      res.json({ conversation: data });
+    } else {
+      // Create new
+      const { data, error } = await supabase
+        .from('chat_conversations')
+        .insert({ user_id: req.user.id, title, messages })
+        .select()
+        .single();
+
+      if (error) throw error;
+      res.json({ conversation: data });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE CONVERSATION ────────────────────────────────
+app.delete('/api/conversations/:id', requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('chat_conversations')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── ADMIN — Get all users ──────────────────────────────
 app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   try {
