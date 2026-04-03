@@ -37,7 +37,14 @@ async function requireAuth(req, res, next) {
   const { data: { user }, error } = await supabase.auth.getUser(token);
   if (error || !user) return res.status(401).json({ error: 'Invalid token' });
 
-  req.user = user;
+  req.user = user; // user.email is available here directly
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  const adminEmail = process.env.ADMIN_EMAIL;
+  if (!adminEmail) return res.status(500).json({ error: 'ADMIN_EMAIL not configured' });
+  if (req.user?.email !== adminEmail) return res.status(403).json({ error: 'Forbidden' });
   next();
 }
 
@@ -441,12 +448,8 @@ YOUR ROLE: Be their coach. Give specific, personalised advice based on their exa
 }
 
 // ── ADMIN — Get all users ──────────────────────────────
-app.get('/api/admin/users', requireAuth, async (req, res) => {
+app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const adminEmail = process.env.ADMIN_EMAIL;
-    const { data: { user } } = await supabase.auth.admin.getUserById(req.user.id);
-    if (user?.email !== adminEmail) return res.status(403).json({ error: 'Forbidden' });
-
     const { data: profiles, error } = await supabase
       .from('profiles')
       .select('*')
@@ -454,7 +457,9 @@ app.get('/api/admin/users', requireAuth, async (req, res) => {
 
     if (error) throw error;
 
-    const { data: { users: authUsers } } = await supabase.auth.admin.listUsers();
+    const { data: { users: authUsers }, error: authErr } = await supabase.auth.admin.listUsers();
+    if (authErr) throw authErr;
+
     const emailMap = {};
     authUsers.forEach(u => emailMap[u.id] = u.email);
 
@@ -467,12 +472,8 @@ app.get('/api/admin/users', requireAuth, async (req, res) => {
 });
 
 // ── ADMIN — Delete user ────────────────────────────────
-app.delete('/api/admin/users/:userId', requireAuth, async (req, res) => {
+app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const adminEmail = process.env.ADMIN_EMAIL;
-    const { data: { user } } = await supabase.auth.admin.getUserById(req.user.id);
-    if (user?.email !== adminEmail) return res.status(403).json({ error: 'Forbidden' });
-
     const { error } = await supabase.auth.admin.deleteUser(req.params.userId);
     if (error) throw error;
     res.json({ success: true });
