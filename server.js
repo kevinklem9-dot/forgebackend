@@ -473,9 +473,24 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
 
 // ── ADMIN — Delete user ────────────────────────────────
 app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
   try {
-    const { error } = await supabase.auth.admin.deleteUser(req.params.userId);
+    // Delete all user data from every table first
+    await Promise.all([
+      supabase.from('exercise_history').delete().eq('user_id', userId),
+      supabase.from('session_logs').delete().eq('user_id', userId),
+      supabase.from('personal_records').delete().eq('user_id', userId),
+      supabase.from('bodyweight_log').delete().eq('user_id', userId),
+      supabase.from('plans').delete().eq('user_id', userId),
+    ]);
+
+    // Delete profile row
+    await supabase.from('profiles').delete().eq('id', userId);
+
+    // Delete auth account — this is the final step that prevents re-login
+    const { error } = await supabase.auth.admin.deleteUser(userId);
     if (error) throw error;
+
     res.json({ success: true });
   } catch (err) {
     console.error('Delete user error:', err);
