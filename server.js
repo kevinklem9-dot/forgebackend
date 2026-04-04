@@ -95,46 +95,67 @@ app.post('/api/signup', async (req, res) => {
 });
 
 // ── GENERATE PLAN ──────────────────────────────
-// Called after onboarding — AI generates a personalised workout + nutrition plan
 app.post('/api/generate-plan', requireAuth, async (req, res) => {
   try {
-    const { data: profile } = await supabase
+    const { data: profile, error: profileErr } = await supabase
       .from('profiles')
       .select('*')
       .eq('id', req.user.id)
       .single();
 
-    if (!profile) return res.status(404).json({ error: 'Profile not found' });
+    if (profileErr || !profile) {
+      console.error('Profile fetch error:', profileErr?.message);
+      return res.status(404).json({ error: 'Profile not found. Please try again.' });
+    }
+
+    console.log('Generating plan for:', profile.name, '| goal:', profile.goal, '| injuries:', profile.injuries);
 
     const prompt = buildPlanPrompt(profile);
 
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 8000,
-      messages: [{ role: 'user', content: prompt }]
-    });
+    // Try up to 2 times in case of JSON parse failure
+    let plan = null;
+    let lastError = null;
 
-    const raw = message.content[0].text;
-    console.log('Raw plan response (first 500 chars):', raw.substring(0, 500));
-    
-    // Strip markdown fences and find the JSON object
-    let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    
-    // Find the outermost { } in case there's extra text
-    const start = clean.indexOf('{');
-    const end = clean.lastIndexOf('}');
-    if (start !== -1 && end !== -1) {
-      clean = clean.substring(start, end + 1);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const message = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 8000,
+          messages: [{ role: 'user', content: prompt }]
+        });
+
+        const raw = message.content[0].text;
+        console.log(`Attempt ${attempt} - raw response length:`, raw.length);
+
+        // Strip markdown fences
+        let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+        // Find outermost { }
+        const start = clean.indexOf('{');
+        const end = clean.lastIndexOf('}');
+        if (start === -1 || end === -1) throw new Error('No JSON object found in response');
+        clean = clean.substring(start, end + 1);
+
+        plan = JSON.parse(clean);
+
+        // Validate plan has required fields
+        if (!plan.workout?.days?.length) throw new Error('Plan missing workout days');
+        if (!plan.nutrition?.meals?.length) throw new Error('Plan missing nutrition meals');
+
+        break; // success
+      } catch (err) {
+        console.error(`Attempt ${attempt} failed:`, err.message);
+        lastError = err;
+        if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
+      }
     }
-    
-    let plan;
-    try {
-      plan = JSON.parse(clean);
-    } catch(parseErr) {
-      console.error('JSON parse error:', parseErr.message);
-      console.error('Attempted to parse:', clean.substring(0, 500));
-      throw new Error('Failed to parse plan JSON: ' + parseErr.message);
+
+    if (!plan) {
+      return res.status(500).json({ error: 'Failed to generate plan — please try again', detail: lastError?.message });
     }
+
+    // Delete any existing plan for this user first (clean slate)
+    await supabase.from('plans').delete().eq('user_id', req.user.id);
 
     // Save to DB
     const { data, error } = await supabase
@@ -143,15 +164,19 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error('DB insert error:', error.message);
+      throw error;
+    }
 
     // Mark onboarding complete
     await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
 
+    console.log('Plan generated successfully for:', profile.name);
     res.json({ plan: data });
   } catch (err) {
-    console.error('Generate plan error:', err);
-    res.status(500).json({ error: 'Failed to generate plan', detail: err.message });
+    console.error('Generate plan error:', err.message);
+    res.status(500).json({ error: 'Failed to generate plan — please try again', detail: err.message });
   }
 });
 
