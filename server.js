@@ -553,10 +553,11 @@ PROFILE:
 - Goal: ${profile.goal}
 - Experience: ${profile.experience}
 - Training days per week: ${profile.days_per_week}
+- Preferred training days: ${profile.preferred_days || 'flexible'}
 - Equipment: ${profile.equipment}
 - Diet style: ${profile.diet_style}
-- Diet restrictions: ${profile.diet_restrictions || 'None'}
-- Injuries/limitations: ${profile.injuries || 'None'}
+- Diet restrictions: ${(profile.diet_restrictions || 'none').substring(0, 200)}
+- Injuries/limitations: ${(profile.injuries || 'none').substring(0, 200)}
 - Target weight: ${profile.target_weight_kg || 'Not specified'}kg
 
 Generate a plan that is completely tailored to this person. Consider their experience level, goal, available days, and equipment.
