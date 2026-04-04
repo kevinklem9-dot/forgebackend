@@ -337,6 +337,26 @@ function applyPlanUpdate(plan, instruction) {
     if (day) day.exercises = instruction.exercises;
   }
 
+  if (instruction.type === 'reschedule_days') {
+    // Remap day names: { type: 'reschedule_days', mapping: [
+    //   { old_day_name: 'Monday', new_day_name: 'Thursday', new_day_index: 3 },
+    //   ...
+    // ], summary: '...' }
+    if (instruction.mapping && updated.workout?.days) {
+      instruction.mapping.forEach(m => {
+        const day = updated.workout.days.find(d =>
+          d.day_name?.toLowerCase() === m.old_day_name?.toLowerCase()
+        );
+        if (day) {
+          day.day_name = m.new_day_name;
+          day.day_index = m.new_day_index;
+        }
+      });
+      // Re-sort days by day_index
+      updated.workout.days.sort((a, b) => a.day_index - b.day_index);
+    }
+  }
+
   return updated;
 }
 
@@ -679,7 +699,10 @@ Swap an exercise:
 <PLAN_UPDATE>{"type":"swap_exercise","day_index":0,"old_exercise":"Bench Press","new_exercise":{"name":"Dumbbell Press","note":"coaching cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8},"summary":"Swapped Bench Press for Dumbbell Press on Monday"}</PLAN_UPDATE>
 
 Change sets/reps/note of an exercise:
-<PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Bench Press","changes":{"sets":"5","reps":"3-5"},"summary":"Updated Bench Press to 5×3-5 on Monday"}</PLAN_UPDATE>
+<PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Bench Press","changes":{"sets":"5","reps":"3-5"},"summary":"Updated Bench Press to 5x3-5 on Monday"}</PLAN_UPDATE>
+
+Reschedule training days (e.g. move Monday to Thursday):
+<PLAN_UPDATE>{"type":"reschedule_days","mapping":[{"old_day_name":"Monday","new_day_name":"Thursday","new_day_index":3},{"old_day_name":"Tuesday","new_day_name":"Saturday","new_day_index":5}],"summary":"Moved training days from Mon/Tue to Thu/Sat"}</PLAN_UPDATE>
 
 Update nutrition macros:
 <PLAN_UPDATE>{"type":"update_nutrition","changes":{"calories":3100,"protein_g":200},"summary":"Increased calories to 3100 and protein to 200g"}</PLAN_UPDATE>
