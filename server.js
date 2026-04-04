@@ -110,7 +110,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
+      max_tokens: 8000,
       messages: [{ role: 'user', content: prompt }]
     });
 
@@ -192,16 +192,34 @@ app.get('/api/profile', requireAuth, async (req, res) => {
 // ── UPDATE PROFILE ─────────────────────────────
 app.patch('/api/profile', requireAuth, async (req, res) => {
   try {
+    // Only update columns that exist in the schema — ignore unknowns
+    const allowed = ['name','age','sex','height_cm','weight_kg','goal','experience',
+      'days_per_week','preferred_days','equipment','diet_style','diet_restrictions',
+      'injuries','target_weight_kg','onboarding_complete'];
+    const update = { updated_at: new Date().toISOString() };
+    allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
+
     const { data, error } = await supabase
       .from('profiles')
-      .update({ ...req.body, updated_at: new Date().toISOString() })
+      .update(update)
       .eq('id', req.user.id)
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      // If error is about missing column (preferred_days not migrated yet), retry without it
+      if (error.message?.includes('preferred_days')) {
+        delete update.preferred_days;
+        const { data: data2, error: err2 } = await supabase
+          .from('profiles').update(update).eq('id', req.user.id).select().single();
+        if (err2) throw err2;
+        return res.json({ profile: data2 });
+      }
+      throw error;
+    }
     res.json({ profile: data });
   } catch (err) {
+    console.error('Profile update error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -544,29 +562,35 @@ app.get('/api/bodyweight', requireAuth, async (req, res) => {
 
 // ── PROMPT BUILDERS ────────────────────────────
 function buildPlanPrompt(profile) {
-  return `You are an expert strength and conditioning coach. Generate a completely personalised workout and nutrition plan for this person.
+  // Sanitise all string fields to prevent JSON issues
+  const safe = (v, fallback = 'not specified') => String(v || fallback).replace(/["""'']/g, '').substring(0, 200).trim();
+
+  return `You are an expert strength and conditioning coach. Generate a completely personalised workout and nutrition plan.
 
 PROFILE:
-- Name: ${profile.name || 'User'}
-- Age: ${profile.age}, Sex: ${profile.sex}
-- Height: ${profile.height_cm}cm, Weight: ${profile.weight_kg}kg
-- Goal: ${profile.goal}
-- Experience: ${profile.experience}
-- Training days per week: ${profile.days_per_week}
-- Preferred training days: ${profile.preferred_days || 'flexible'}
-- Equipment: ${profile.equipment}
-- Diet style: ${profile.diet_style}
-- Diet restrictions: ${(profile.diet_restrictions || 'none').substring(0, 200)}
-- Injuries/limitations: ${(profile.injuries || 'none').substring(0, 200)}
-- Target weight: ${profile.target_weight_kg || 'Not specified'}kg
+- Name: ${safe(profile.name, 'User')}
+- Age: ${profile.age || 18}, Sex: ${safe(profile.sex, 'male')}
+- Height: ${profile.height_cm || 175}cm, Weight: ${profile.weight_kg || 70}kg
+- Goal: ${safe(profile.goal, 'muscle')}
+- Experience: ${safe(profile.experience, 'intermediate')}
+- Training days per week: ${profile.days_per_week || 4}
+- Preferred training days: ${safe(profile.preferred_days, 'flexible')}
+- Equipment: ${safe(profile.equipment, 'full_gym')}
+- Diet style: ${safe(profile.diet_style, 'anything')}
+- Diet restrictions: ${safe(profile.diet_restrictions, 'none')}
+- Injuries or limitations: ${safe(profile.injuries, 'none')}
 
-Generate a plan that is completely tailored to this person. Consider their experience level, goal, available days, and equipment.
+CRITICAL INSTRUCTIONS:
+1. Respond ONLY with a single valid JSON object. No text before or after it.
+2. Do NOT use special characters like dashes (use to instead), smart quotes, or em dashes inside string values.
+3. Every string value must use only standard ASCII characters.
+4. The JSON must be complete and valid - do not truncate it.
 
-Respond ONLY with valid JSON in exactly this structure (no markdown, no explanation):
+Use EXACTLY this JSON structure:
 {
   "workout": {
-    "split_name": "e.g. PPL x2, Upper/Lower, Full Body",
-    "split_description": "brief description of the split logic",
+    "split_name": "PPL x2",
+    "split_description": "Push Pull Legs repeated twice per week",
     "days": [
       {
         "day_index": 0,
@@ -576,7 +600,7 @@ Respond ONLY with valid JSON in exactly this structure (no markdown, no explanat
         "exercises": [
           {
             "name": "Barbell Bench Press",
-            "note": "coaching cue",
+            "note": "Full ROM, control the negative",
             "sets": "4",
             "reps": "6-8",
             "rest": "3 min",
@@ -591,11 +615,11 @@ Respond ONLY with valid JSON in exactly this structure (no markdown, no explanat
     "protein_g": 185,
     "carbs_g": 340,
     "fat_g": 95,
-    "strategy": "brief explanation of the approach",
+    "strategy": "Caloric surplus for muscle gain",
     "meals": [
       {
-        "name": "Meal 1 — Breakfast",
-        "time": "7:00–8:00 AM",
+        "name": "Meal 1 Breakfast",
+        "time": "7:00-8:00 AM",
         "kcal": 680,
         "protein_g": 47,
         "carbs_g": 72,
