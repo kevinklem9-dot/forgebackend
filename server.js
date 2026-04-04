@@ -206,19 +206,17 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
   }
 });
 
-// ── AI CHAT ────────────────────────────────────
+// ── AI CHAT (with plan editing capability) ─────
 app.post('/api/chat', requireAuth, async (req, res) => {
   try {
-    const { messages } = req.body;
+    const { messages, context } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'No messages' });
 
-    // Fetch user profile + latest plan for context
     const [{ data: profile }, { data: planData }] = await Promise.all([
       supabase.from('profiles').select('*').eq('id', req.user.id).single(),
       supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single()
     ]);
 
-    // Fetch recent exercise history for context
     const { data: recentHistory } = await supabase
       .from('exercise_history')
       .select('*')
@@ -226,18 +224,153 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       .order('logged_at', { ascending: false })
       .limit(20);
 
-    const systemPrompt = buildCoachPrompt(profile, planData, recentHistory);
+    const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context);
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
+      max_tokens: 2000,
       system: systemPrompt,
       messages
     });
 
-    res.json({ reply: response.content[0].text });
+    const rawReply = response.content[0].text;
+
+    // Check if the reply contains a plan update command
+    // Coach wraps plan changes in <PLAN_UPDATE>...</PLAN_UPDATE> tags
+    const planUpdateMatch = rawReply.match(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/);
+    let planUpdate = null;
+    let cleanReply = rawReply.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
+
+    if (planUpdateMatch && planData) {
+      try {
+        const updateInstruction = JSON.parse(planUpdateMatch[1].trim());
+        const currentPlan = {
+          workout: planData.workout_plan,
+          nutrition: planData.nutrition_plan
+        };
+        const updatedPlan = applyPlanUpdate(currentPlan, updateInstruction);
+
+        // Save updated plan
+        await supabase.from('plans')
+          .update({
+            workout_plan: updatedPlan.workout,
+            nutrition_plan: updatedPlan.nutrition,
+            generated_at: new Date().toISOString()
+          })
+          .eq('id', planData.id);
+
+        planUpdate = {
+          type: updateInstruction.type,
+          summary: updateInstruction.summary
+        };
+      } catch(e) {
+        console.error('Plan update parse error:', e.message);
+      }
+    }
+
+    res.json({ reply: cleanReply, plan_update: planUpdate });
   } catch (err) {
     console.error('Chat error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── APPLY PLAN UPDATE ──────────────────────────
+function applyPlanUpdate(plan, instruction) {
+  const updated = JSON.parse(JSON.stringify(plan)); // deep clone
+
+  if (instruction.type === 'swap_exercise') {
+    // { type: 'swap_exercise', day_index: 0, old_exercise: 'Bench Press', new_exercise: {...} }
+    const day = updated.workout?.days?.find(d => d.day_index === instruction.day_index);
+    if (day) {
+      const exIdx = day.exercises.findIndex(e =>
+        e.name.toLowerCase().includes(instruction.old_exercise.toLowerCase())
+      );
+      if (exIdx !== -1) day.exercises[exIdx] = instruction.new_exercise;
+    }
+  }
+
+  if (instruction.type === 'update_exercise') {
+    // { type: 'update_exercise', day_index: 0, exercise_name: 'Bench Press', changes: {sets:'5', reps:'3-5'} }
+    const day = updated.workout?.days?.find(d => d.day_index === instruction.day_index);
+    if (day) {
+      const ex = day.exercises.find(e =>
+        e.name.toLowerCase().includes(instruction.exercise_name.toLowerCase())
+      );
+      if (ex) Object.assign(ex, instruction.changes);
+    }
+  }
+
+  if (instruction.type === 'update_nutrition') {
+    // { type: 'update_nutrition', changes: { calories: 3100, protein_g: 200 } }
+    Object.assign(updated.nutrition, instruction.changes);
+  }
+
+  if (instruction.type === 'update_meal') {
+    // { type: 'update_meal', meal_index: 0, changes: { foods: [...] } }
+    if (updated.nutrition?.meals?.[instruction.meal_index]) {
+      Object.assign(updated.nutrition.meals[instruction.meal_index], instruction.changes);
+    }
+  }
+
+  if (instruction.type === 'update_day') {
+    // Full day replacement: { type: 'update_day', day_index: 0, exercises: [...] }
+    const day = updated.workout?.days?.find(d => d.day_index === instruction.day_index);
+    if (day) day.exercises = instruction.exercises;
+  }
+
+  return updated;
+}
+
+// ── POST-WORKOUT CHECK-IN ──────────────────────
+app.post('/api/checkin', requireAuth, async (req, res) => {
+  try {
+    const { session_summary, feeling, difficulty, messages } = req.body;
+    // feeling: 'great' | 'ok' | 'tired'
+    // difficulty: 'too_easy' | 'just_right' | 'too_hard'
+
+    const [{ data: profile }, { data: planData }] = await Promise.all([
+      supabase.from('profiles').select('*').eq('id', req.user.id).single(),
+      supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single()
+    ]);
+
+    const { data: recentHistory } = await supabase
+      .from('exercise_history').select('*').eq('user_id', req.user.id)
+      .order('logged_at', { ascending: false }).limit(10);
+
+    const systemPrompt = buildCheckinPrompt(profile, planData, recentHistory, session_summary, feeling, difficulty);
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1500,
+      system: systemPrompt,
+      messages: messages || [{ role: 'user', content: `I just finished training. Feeling: ${feeling}. Difficulty: ${difficulty}.` }]
+    });
+
+    const rawReply = response.content[0].text;
+    const planUpdateMatch = rawReply.match(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/);
+    let planUpdate = null;
+    let cleanReply = rawReply.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
+
+    if (planUpdateMatch && planData) {
+      try {
+        const updateInstruction = JSON.parse(planUpdateMatch[1].trim());
+        const currentPlan = { workout: planData.workout_plan, nutrition: planData.nutrition_plan };
+        const updatedPlan = applyPlanUpdate(currentPlan, updateInstruction);
+        await supabase.from('plans').update({
+          workout_plan: updatedPlan.workout,
+          nutrition_plan: updatedPlan.nutrition,
+          generated_at: new Date().toISOString()
+        }).eq('id', planData.id);
+        planUpdate = { type: updateInstruction.type, summary: updateInstruction.summary };
+      } catch(e) {
+        console.error('Checkin plan update error:', e.message);
+      }
+    }
+
+    res.json({ reply: cleanReply, plan_update: planUpdate });
+  } catch (err) {
+    console.error('Checkin error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -475,7 +608,7 @@ Respond ONLY with valid JSON in exactly this structure (no markdown, no explanat
 }`;
 }
 
-function buildCoachPrompt(profile, planData, recentHistory) {
+function buildCoachPrompt(profile, planData, recentHistory, context) {
   const plan = planData?.workout_plan;
   const nutrition = planData?.nutrition_plan;
 
@@ -483,7 +616,13 @@ function buildCoachPrompt(profile, planData, recentHistory) {
     ? recentHistory.map(h => `${h.exercise_name}: ${h.sets}×${h.reps} @ ${h.weight_kg}kg (${h.logged_at})`).join('\n')
     : 'No sessions logged yet.';
 
-  return `You are a world-class personal trainer and nutrition coach embedded in the FORGE fitness app. You are coaching a specific client. Be direct, specific, and actionable. No fluff. Use their exact numbers when relevant.
+  const fullPlanStr = plan?.days
+    ? plan.days.map(d => `${d.day_name} (${d.label}): ${d.exercises?.map(e => `${e.name} ${e.sets}×${e.reps}`).join(', ')}`).join('\n')
+    : 'Not generated';
+
+  const contextStr = context ? `\nCURRENT CONTEXT: ${context}` : '';
+
+  return `You are a world-class personal trainer and nutrition coach embedded in the FORGE fitness app. You are coaching a specific client. Be direct, specific, and actionable. No fluff. Use their exact numbers when relevant.${contextStr}
 
 CLIENT PROFILE:
 - Name: ${profile?.name || 'User'}
@@ -495,9 +634,8 @@ CLIENT PROFILE:
 - Diet: ${profile?.diet_style} — restrictions: ${profile?.diet_restrictions || 'none'}
 - Injuries: ${profile?.injuries || 'none'}
 
-THEIR PROGRAMME:
-Split: ${plan?.split_name || 'Not yet generated'}
-${plan?.days ? plan.days.map(d => `${d.day_name}: ${d.label} (${d.muscles?.join(', ')})`).join('\n') : ''}
+FULL WORKOUT PROGRAMME:
+${fullPlanStr}
 
 NUTRITION TARGETS:
 ${nutrition ? `${nutrition.calories} kcal — ${nutrition.protein_g}g protein, ${nutrition.carbs_g}g carbs, ${nutrition.fat_g}g fat` : 'Not yet generated'}
@@ -505,8 +643,68 @@ ${nutrition ? `${nutrition.calories} kcal — ${nutrition.protein_g}g protein, $
 RECENT TRAINING HISTORY:
 ${historyStr}
 
-YOUR ROLE: Be their coach. Give specific, personalised advice based on their exact profile and history. Reference their actual numbers. Sound like someone who's fully invested in this person's progress.`;
+YOUR ROLE: Be their coach. Give specific, personalised advice. Reference their actual numbers. Sound like someone who's fully invested in this person's progress.
+
+PLAN EDITING CAPABILITY:
+If the user asks you to change their workout or nutrition plan (swap an exercise, change sets/reps, adjust calories, update a meal etc.), you MUST make the change by including a <PLAN_UPDATE> tag in your response.
+
+The <PLAN_UPDATE> tag must contain ONLY valid JSON with no extra text. Choose the appropriate type:
+
+Swap an exercise:
+<PLAN_UPDATE>{"type":"swap_exercise","day_index":0,"old_exercise":"Bench Press","new_exercise":{"name":"Dumbbell Press","note":"coaching cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8},"summary":"Swapped Bench Press for Dumbbell Press on Monday"}</PLAN_UPDATE>
+
+Change sets/reps/note of an exercise:
+<PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Bench Press","changes":{"sets":"5","reps":"3-5"},"summary":"Updated Bench Press to 5×3-5 on Monday"}</PLAN_UPDATE>
+
+Update nutrition macros:
+<PLAN_UPDATE>{"type":"update_nutrition","changes":{"calories":3100,"protein_g":200},"summary":"Increased calories to 3100 and protein to 200g"}</PLAN_UPDATE>
+
+IMPORTANT: Always tell the user what you changed in plain text AFTER the tag. The tag itself will be hidden — only your text response is shown. If you can't determine the exact day_index from context, ask the user which day before making the change.`;
 }
+
+function buildCheckinPrompt(profile, planData, recentHistory, sessionSummary, feeling, difficulty) {
+  const plan = planData?.workout_plan;
+  const nutrition = planData?.nutrition_plan;
+
+  const historyStr = recentHistory?.length
+    ? recentHistory.map(h => `${h.exercise_name}: ${h.sets}×${h.reps} @ ${h.weight_kg}kg (${h.logged_at})`).join('\n')
+    : 'No sessions logged yet.';
+
+  const fullPlanStr = plan?.days
+    ? plan.days.map(d => `${d.day_name} (${d.label}): ${d.exercises?.map(e => `${e.name} ${e.sets}×${e.reps}`).join(', ')}`).join('\n')
+    : 'Not generated';
+
+  return `You are a world-class personal trainer doing a post-workout check-in with your client. Be warm but direct. Acknowledge how they felt, give specific feedback on their session, and adapt their plan if needed.
+
+CLIENT: ${profile?.name || 'User'}, ${profile?.age}yo ${profile?.sex}, Goal: ${profile?.goal}
+
+TODAY'S SESSION:
+${sessionSummary}
+
+HOW THEY FELT: ${feeling}
+DIFFICULTY: ${difficulty}
+
+RECENT HISTORY:
+${historyStr}
+
+FULL PROGRAMME:
+${fullPlanStr}
+
+NUTRITION: ${nutrition ? `${nutrition.calories} kcal — ${nutrition.protein_g}g protein` : 'N/A'}
+
+YOUR TASK:
+1. Acknowledge how the session went specifically (reference the actual exercises and weights)
+2. Give one sharp insight or observation about their performance
+3. If difficulty was 'too_easy' — suggest adding weight or sets next session. If 'too_hard' — suggest reducing weight or volume. If 'just_right' — confirm they're on track.
+4. If the pattern across multiple sessions suggests a plan change is needed, make it using the PLAN_UPDATE tag below.
+5. End with one motivating but real closing line.
+
+PLAN EDITING: If you decide to adapt the plan based on their feedback, include a <PLAN_UPDATE> tag:
+<PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Exercise Name","changes":{"sets":"4","reps":"8-10"},"summary":"Brief description of change"}</PLAN_UPDATE>
+
+The tag will be hidden from the user — only your text is shown. Always explain any changes you make in your text response.`;
+}
+
 
 // ── GET CONVERSATIONS LIST ─────────────────────────────
 app.get('/api/conversations', requireAuth, async (req, res) => {
