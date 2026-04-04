@@ -792,23 +792,38 @@ app.delete('/api/conversations/:id', requireAuth, async (req, res) => {
 // ── ADMIN — Get all users ──────────────────────────────
 app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { data: profiles, error } = await supabase
+    const { data: profiles, error: profileErr } = await supabase
       .from('profiles')
       .select('*')
       .order('created_at', { ascending: false });
 
-    if (error) throw error;
+    if (profileErr) {
+      console.error('Profile fetch error:', profileErr);
+      throw profileErr;
+    }
 
-    const { data: { users: authUsers }, error: authErr } = await supabase.auth.admin.listUsers();
-    if (authErr) throw authErr;
+    // listUsers is paginated — fetch all pages
+    let allAuthUsers = [];
+    let page = 1;
+    const perPage = 1000;
+    while (true) {
+      const { data, error: authErr } = await supabase.auth.admin.listUsers({ page, perPage });
+      if (authErr) {
+        console.error('Auth listUsers error:', authErr);
+        throw authErr;
+      }
+      allAuthUsers = allAuthUsers.concat(data.users || []);
+      if (!data.users || data.users.length < perPage) break;
+      page++;
+    }
 
     const emailMap = {};
-    authUsers.forEach(u => emailMap[u.id] = u.email);
+    allAuthUsers.forEach(u => emailMap[u.id] = u.email);
 
-    const users = profiles.map(p => ({ ...p, email: emailMap[p.id] || '—' }));
+    const users = (profiles || []).map(p => ({ ...p, email: emailMap[p.id] || '—' }));
     res.json({ users });
   } catch (err) {
-    console.error('Admin users error:', err);
+    console.error('Admin users error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
