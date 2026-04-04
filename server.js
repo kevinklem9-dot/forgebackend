@@ -341,35 +341,40 @@ function applyPlanUpdate(plan, instruction) {
     if (instruction.mapping && updated.workout?.days) {
       const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 
-      // Take a snapshot of day_index values BEFORE making any changes
-      const snapshot = {};
-      updated.workout.days.forEach(d => { snapshot[d.day_index] = { day_index: d.day_index, day_name: d.day_name }; });
+      // Validate: no double-booking — check for conflicts first
+      const finalPositions = {};
+      updated.workout.days.forEach(d => { finalPositions[d.day_index] = d.label; });
 
-      // Build complete new index map from snapshot
-      const newIndexMap = {};
-      // Start with identity mapping
-      updated.workout.days.forEach(d => { newIndexMap[d.day_index] = d.day_index; });
-      // Apply the requested moves
-      instruction.mapping.forEach(m => {
-        // Find which original day was at from_day_index
-        newIndexMap[m.from_day_index] = m.to_day_index;
-        // If something was already at to_day_index and it hasn't been explicitly moved, swap it back
-        const alreadyMapped = instruction.mapping.find(x => x.from_day_index === m.to_day_index);
-        if (!alreadyMapped) {
-          newIndexMap[m.to_day_index] = m.from_day_index;
+      // Apply moves to finalPositions map
+      const moves = instruction.mapping;
+      const movedFrom = new Set(moves.map(m => m.from_day_index));
+      
+      moves.forEach(m => {
+        const label = finalPositions[m.from_day_index];
+        if (label) {
+          // Vacate the from slot
+          delete finalPositions[m.from_day_index];
+          // If something is already at to_day_index and it wasn't moved, swap it back
+          if (finalPositions[m.to_day_index] && !movedFrom.has(m.to_day_index)) {
+            finalPositions[m.from_day_index] = finalPositions[m.to_day_index];
+          }
+          finalPositions[m.to_day_index] = label;
         }
       });
 
-      // Apply all changes at once using snapshot values
-      updated.workout.days.forEach(d => {
-        const origIndex = d.day_index;
-        if (newIndexMap[origIndex] !== undefined && newIndexMap[origIndex] !== origIndex) {
-          d.day_index = newIndexMap[origIndex];
-          d.day_name = dayNames[d.day_index] || d.day_name;
+      // Apply finalPositions back to the days array
+      const labelToDay = {};
+      updated.workout.days.forEach(d => { labelToDay[d.label] = d; });
+
+      Object.entries(finalPositions).forEach(([idx, label]) => {
+        const day = labelToDay[label];
+        if (day) {
+          day.day_index = parseInt(idx);
+          day.day_name = dayNames[parseInt(idx)] || day.day_name;
         }
       });
 
-      // Re-sort by day_index
+      // Sort by new day_index
       updated.workout.days.sort((a, b) => a.day_index - b.day_index);
     }
   }
@@ -709,8 +714,11 @@ YOUR ROLE: Be their coach. Give specific, personalised advice. Reference their a
 
 FULL PLAN EDITING ACCESS — You can change ANYTHING in the plan. Never say you don't have access. Use the <PLAN_UPDATE> tag to make changes. The tag is processed automatically — only your text response is shown to the user.
 
-CURRENT WORKOUT SCHEDULE (use these exact day_index values):
-${plan?.days ? plan.days.map(d => `  day_index:${d.day_index} = ${d.day_name} → ${d.label || 'Rest'}`).join('\n') : 'Not generated'}
+CURRENT WORKOUT SCHEDULE — LIVE FROM DATABASE (these are the ONLY training days that exist):
+${plan?.days ? plan.days.map(d => `  day_index:${d.day_index} = ${d.day_name} → ${d.label || 'Rest'} (${d.exercises?.length || 0} exercises)`).join('\n') : 'Not generated'}
+
+OCCUPIED day_index values: ${plan?.days ? plan.days.filter(d => d.exercises?.length > 0).map(d => d.day_index).join(', ') : 'none'}
+FREE day_index values (no workout): ${plan?.days ? [0,1,2,3,4,5,6].filter(i => !plan.days.find(d => d.day_index === i && d.exercises?.length > 0)).join(', ') : '0,1,2,3,4,5,6'}
 
 FULL MEAL PLAN:
 ${nutrition?.meals ? nutrition.meals.map((m, i) => `  meal_index:${i} = ${m.name} (${m.time}) — ${(m.foods || []).map(f => `${f.name} ${f.amount}`).join(', ')}`).join('\n') : 'Not generated'}
@@ -737,8 +745,10 @@ Always check the schedule above first. Use the actual day_index values shown abo
 <PLAN_UPDATE>{"type":"update_day","day_index":0,"exercises":[{"name":"Exercise","note":"cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8}],"summary":"Replaced Monday workout"}</PLAN_UPDATE>
 
 RULES:
-- ALWAYS check the current schedule above before rescheduling — if a workout is already on day_index:4 (Friday), tell the user and ask what to do instead
-- NEVER guess day_index values — always use the exact values from the schedule above
+- ALWAYS use the OCCUPIED and FREE day_index lists above — never guess
+- NEVER move a workout to an OCCUPIED day_index unless the user specifically asks to swap two days
+- If the user asks to move to an occupied day, tell them what's already there and ask if they want to swap
+- If the user asks to move to a FREE day, just do it with reschedule_days
 - NEVER say you don't have access to something — you have full access to change workouts, meals, macros, and schedules
 - Always confirm what you changed in plain text after the tag`;
 }
