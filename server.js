@@ -332,27 +332,34 @@ function applyPlanUpdate(plan, instruction) {
   }
 
   if (instruction.type === 'update_day') {
-    // Full day replacement: { type: 'update_day', day_index: 0, exercises: [...] }
+    // Full day replacement
     const day = updated.workout?.days?.find(d => d.day_index === instruction.day_index);
     if (day) day.exercises = instruction.exercises;
   }
 
   if (instruction.type === 'reschedule_days') {
-    // Remap day names: { type: 'reschedule_days', mapping: [
-    //   { old_day_name: 'Monday', new_day_name: 'Thursday', new_day_index: 3 },
-    //   ...
-    // ], summary: '...' }
+    // Move workout sessions to different days of the week
+    // mapping: [{ from_day_index: 0, to_day_index: 3 }, ...]
+    // Strategy: collect all current training days, reassign their day_name and day_index
     if (instruction.mapping && updated.workout?.days) {
+      const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+      
+      // Build a map of old_index -> new_index
+      const indexMap = {};
       instruction.mapping.forEach(m => {
-        const day = updated.workout.days.find(d =>
-          d.day_name?.toLowerCase() === m.old_day_name?.toLowerCase()
-        );
-        if (day) {
-          day.day_name = m.new_day_name;
-          day.day_index = m.new_day_index;
+        indexMap[m.from_day_index] = m.to_day_index;
+      });
+
+      // Apply remapping
+      updated.workout.days.forEach(d => {
+        if (indexMap[d.day_index] !== undefined) {
+          const newIdx = indexMap[d.day_index];
+          d.day_index = newIdx;
+          d.day_name = dayNames[newIdx] || d.day_name;
         }
       });
-      // Re-sort days by day_index
+
+      // Sort by new day_index
       updated.workout.days.sort((a, b) => a.day_index - b.day_index);
     }
   }
@@ -662,7 +669,7 @@ function buildCoachPrompt(profile, planData, recentHistory, context) {
     : 'No sessions logged yet.';
 
   const fullPlanStr = plan?.days
-    ? plan.days.map(d => `${d.day_name} (${d.label}): ${d.exercises?.map(e => `${e.name} ${e.sets}×${e.reps}`).join(', ')}`).join('\n')
+    ? plan.days.map(d => `[day_index:${d.day_index}] ${d.day_name} — ${d.label}: ${d.exercises?.map(e => `${e.name} ${e.sets}x${e.reps}`).join(', ') || 'Rest'}`).join('\n')
     : 'Not generated';
 
   const contextStr = context ? `\nCURRENT CONTEXT: ${context}` : '';
@@ -701,11 +708,15 @@ Swap an exercise:
 Change sets/reps/note of an exercise:
 <PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Bench Press","changes":{"sets":"5","reps":"3-5"},"summary":"Updated Bench Press to 5x3-5 on Monday"}</PLAN_UPDATE>
 
-Reschedule training days (e.g. move Monday to Thursday):
-<PLAN_UPDATE>{"type":"reschedule_days","mapping":[{"old_day_name":"Monday","new_day_name":"Thursday","new_day_index":3},{"old_day_name":"Tuesday","new_day_name":"Saturday","new_day_index":5}],"summary":"Moved training days from Mon/Tue to Thu/Sat"}</PLAN_UPDATE>
+Move workouts to different days of the week (e.g. move Monday session to Thursday, Tuesday to Saturday):
+The day_index values are: Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6
+<PLAN_UPDATE>{"type":"reschedule_days","mapping":[{"from_day_index":0,"to_day_index":3},{"from_day_index":1,"to_day_index":5}],"summary":"Moved workouts from Mon/Tue to Thu/Sat"}</PLAN_UPDATE>
 
 Update nutrition macros:
 <PLAN_UPDATE>{"type":"update_nutrition","changes":{"calories":3100,"protein_g":200},"summary":"Increased calories to 3100 and protein to 200g"}</PLAN_UPDATE>
+
+Update a specific meal (e.g. change breakfast foods):
+<PLAN_UPDATE>{"type":"update_meal","meal_index":0,"changes":{"foods":[{"name":"Greek yogurt","amount":"200g"},{"name":"Banana","amount":"1 large"}]},"summary":"Updated breakfast to Greek yogurt and banana"}</PLAN_UPDATE>
 
 IMPORTANT: Always tell the user what you changed in plain text AFTER the tag. The tag itself will be hidden — only your text response is shown. If you can't determine the exact day_index from context, ask the user which day before making the change.`;
 }
