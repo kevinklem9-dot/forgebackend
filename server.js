@@ -338,28 +338,31 @@ function applyPlanUpdate(plan, instruction) {
   }
 
   if (instruction.type === 'reschedule_days') {
-    // Move workout sessions to different days of the week
-    // mapping: [{ from_day_index: 0, to_day_index: 3 }, ...]
-    // Strategy: collect all current training days, reassign their day_name and day_index
     if (instruction.mapping && updated.workout?.days) {
       const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
-      
-      // Build a map of old_index -> new_index
-      const indexMap = {};
-      instruction.mapping.forEach(m => {
-        indexMap[m.from_day_index] = m.to_day_index;
-      });
 
-      // Apply remapping
-      updated.workout.days.forEach(d => {
-        if (indexMap[d.day_index] !== undefined) {
-          const newIdx = indexMap[d.day_index];
-          d.day_index = newIdx;
-          d.day_name = dayNames[newIdx] || d.day_name;
+      instruction.mapping.forEach(m => {
+        const movingDay = updated.workout.days.find(d => d.day_index === m.from_day_index);
+        const targetDay = updated.workout.days.find(d => d.day_index === m.to_day_index);
+
+        if (movingDay) {
+          if (targetDay && targetDay !== movingDay) {
+            // Swap the two days
+            const tempIndex = movingDay.day_index;
+            const tempName = movingDay.day_name;
+            movingDay.day_index = targetDay.day_index;
+            movingDay.day_name = dayNames[targetDay.day_index] || targetDay.day_name;
+            targetDay.day_index = tempIndex;
+            targetDay.day_name = dayNames[tempIndex] || tempName;
+          } else if (!targetDay) {
+            // No conflict — just move
+            movingDay.day_index = m.to_day_index;
+            movingDay.day_name = dayNames[m.to_day_index] || movingDay.day_name;
+          }
         }
       });
 
-      // Sort by new day_index
+      // Re-sort by day_index
       updated.workout.days.sort((a, b) => a.day_index - b.day_index);
     }
   }
@@ -697,28 +700,40 @@ ${historyStr}
 
 YOUR ROLE: Be their coach. Give specific, personalised advice. Reference their actual numbers. Sound like someone who's fully invested in this person's progress.
 
-PLAN EDITING CAPABILITY:
-If the user asks you to change their workout or nutrition plan (swap an exercise, change sets/reps, adjust calories, update a meal etc.), you MUST make the change by including a <PLAN_UPDATE> tag in your response.
+FULL PLAN EDITING ACCESS — You can change ANYTHING in the plan. Never say you don't have access. Use the <PLAN_UPDATE> tag to make changes. The tag is processed automatically — only your text response is shown to the user.
 
-The <PLAN_UPDATE> tag must contain ONLY valid JSON with no extra text. Choose the appropriate type:
+CURRENT WORKOUT SCHEDULE (use these exact day_index values):
+${plan?.days ? plan.days.map(d => `  day_index:${d.day_index} = ${d.day_name} → ${d.label || 'Rest'}`).join('\n') : 'Not generated'}
 
-Swap an exercise:
-<PLAN_UPDATE>{"type":"swap_exercise","day_index":0,"old_exercise":"Bench Press","new_exercise":{"name":"Dumbbell Press","note":"coaching cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8},"summary":"Swapped Bench Press for Dumbbell Press on Monday"}</PLAN_UPDATE>
+FULL MEAL PLAN:
+${nutrition?.meals ? nutrition.meals.map((m, i) => `  meal_index:${i} = ${m.name} (${m.time}) — ${(m.foods || []).map(f => `${f.name} ${f.amount}`).join(', ')}`).join('\n') : 'Not generated'}
 
-Change sets/reps/note of an exercise:
-<PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Bench Press","changes":{"sets":"5","reps":"3-5"},"summary":"Updated Bench Press to 5x3-5 on Monday"}</PLAN_UPDATE>
+PLAN UPDATE TYPES — use exactly as shown:
 
-Move workouts to different days of the week (e.g. move Monday session to Thursday, Tuesday to Saturday):
-The day_index values are: Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6
-<PLAN_UPDATE>{"type":"reschedule_days","mapping":[{"from_day_index":0,"to_day_index":3},{"from_day_index":1,"to_day_index":5}],"summary":"Moved workouts from Mon/Tue to Thu/Sat"}</PLAN_UPDATE>
+1. MOVE A WORKOUT TO A DIFFERENT DAY:
+Always check the schedule above first. Use the actual day_index values shown above.
+<PLAN_UPDATE>{"type":"reschedule_days","mapping":[{"from_day_index":0,"to_day_index":4}],"summary":"Moved Monday workout to Friday"}</PLAN_UPDATE>
 
-Update nutrition macros:
-<PLAN_UPDATE>{"type":"update_nutrition","changes":{"calories":3100,"protein_g":200},"summary":"Increased calories to 3100 and protein to 200g"}</PLAN_UPDATE>
+2. SWAP AN EXERCISE:
+<PLAN_UPDATE>{"type":"swap_exercise","day_index":0,"old_exercise":"Bench Press","new_exercise":{"name":"Dumbbell Press","note":"Full ROM","sets":"4","reps":"8-10","rest":"2 min","rpe":8},"summary":"Swapped Bench Press for Dumbbell Press on Monday"}</PLAN_UPDATE>
 
-Update a specific meal (e.g. change breakfast foods):
-<PLAN_UPDATE>{"type":"update_meal","meal_index":0,"changes":{"foods":[{"name":"Greek yogurt","amount":"200g"},{"name":"Banana","amount":"1 large"}]},"summary":"Updated breakfast to Greek yogurt and banana"}</PLAN_UPDATE>
+3. CHANGE EXERCISE SETS/REPS:
+<PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Bench Press","changes":{"sets":"5","reps":"3-5"},"summary":"Updated Bench Press to 5x3-5"}</PLAN_UPDATE>
 
-IMPORTANT: Always tell the user what you changed in plain text AFTER the tag. The tag itself will be hidden — only your text response is shown. If you can't determine the exact day_index from context, ask the user which day before making the change.`;
+4. CHANGE NUTRITION MACROS:
+<PLAN_UPDATE>{"type":"update_nutrition","changes":{"calories":3100,"protein_g":200,"carbs_g":360,"fat_g":90},"summary":"Updated macros to 3100 kcal"}</PLAN_UPDATE>
+
+5. CHANGE A MEAL'S FOODS:
+<PLAN_UPDATE>{"type":"update_meal","meal_index":0,"changes":{"name":"Meal 1 Breakfast","time":"7:00-8:00 AM","kcal":700,"protein_g":50,"carbs_g":70,"fat_g":20,"foods":[{"name":"Greek yogurt","amount":"200g"},{"name":"Oats","amount":"80g"},{"name":"Banana","amount":"1 large"}]},"summary":"Updated breakfast to Greek yogurt, oats and banana"}</PLAN_UPDATE>
+
+6. REPLACE ALL EXERCISES ON A DAY:
+<PLAN_UPDATE>{"type":"update_day","day_index":0,"exercises":[{"name":"Exercise","note":"cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8}],"summary":"Replaced Monday workout"}</PLAN_UPDATE>
+
+RULES:
+- ALWAYS check the current schedule above before rescheduling — if a workout is already on day_index:4 (Friday), tell the user and ask what to do instead
+- NEVER guess day_index values — always use the exact values from the schedule above
+- NEVER say you don't have access to something — you have full access to change workouts, meals, macros, and schedules
+- Always confirm what you changed in plain text after the tag`;
 }
 
 function buildCheckinPrompt(profile, planData, recentHistory, sessionSummary, feeling, difficulty) {
