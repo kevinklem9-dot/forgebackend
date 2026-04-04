@@ -341,24 +341,31 @@ function applyPlanUpdate(plan, instruction) {
     if (instruction.mapping && updated.workout?.days) {
       const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 
-      instruction.mapping.forEach(m => {
-        const movingDay = updated.workout.days.find(d => d.day_index === m.from_day_index);
-        const targetDay = updated.workout.days.find(d => d.day_index === m.to_day_index);
+      // Take a snapshot of day_index values BEFORE making any changes
+      const snapshot = {};
+      updated.workout.days.forEach(d => { snapshot[d.day_index] = { day_index: d.day_index, day_name: d.day_name }; });
 
-        if (movingDay) {
-          if (targetDay && targetDay !== movingDay) {
-            // Swap the two days
-            const tempIndex = movingDay.day_index;
-            const tempName = movingDay.day_name;
-            movingDay.day_index = targetDay.day_index;
-            movingDay.day_name = dayNames[targetDay.day_index] || targetDay.day_name;
-            targetDay.day_index = tempIndex;
-            targetDay.day_name = dayNames[tempIndex] || tempName;
-          } else if (!targetDay) {
-            // No conflict — just move
-            movingDay.day_index = m.to_day_index;
-            movingDay.day_name = dayNames[m.to_day_index] || movingDay.day_name;
-          }
+      // Build complete new index map from snapshot
+      const newIndexMap = {};
+      // Start with identity mapping
+      updated.workout.days.forEach(d => { newIndexMap[d.day_index] = d.day_index; });
+      // Apply the requested moves
+      instruction.mapping.forEach(m => {
+        // Find which original day was at from_day_index
+        newIndexMap[m.from_day_index] = m.to_day_index;
+        // If something was already at to_day_index and it hasn't been explicitly moved, swap it back
+        const alreadyMapped = instruction.mapping.find(x => x.from_day_index === m.to_day_index);
+        if (!alreadyMapped) {
+          newIndexMap[m.to_day_index] = m.from_day_index;
+        }
+      });
+
+      // Apply all changes at once using snapshot values
+      updated.workout.days.forEach(d => {
+        const origIndex = d.day_index;
+        if (newIndexMap[origIndex] !== undefined && newIndexMap[origIndex] !== origIndex) {
+          d.day_index = newIndexMap[origIndex];
+          d.day_name = dayNames[d.day_index] || d.day_name;
         }
       });
 
@@ -814,7 +821,56 @@ app.get('/api/conversations/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ── SAVE / UPDATE CONVERSATION ─────────────────────────
+// ── VIEW RAW PLAN DAYS (for debugging) ────────
+app.get('/api/plan/days', requireAuth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('plans').select('workout_plan').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single();
+    const days = data?.workout_plan?.days?.map(d => ({
+      day_index: d.day_index,
+      day_name: d.day_name,
+      label: d.label,
+      exercise_count: d.exercises?.length || 0
+    })) || [];
+    res.json({ days });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── REPAIR PLAN DAYS (fix corrupted day_index values) ──
+app.post('/api/plan/repair-days', requireAuth, async (req, res) => {
+  try {
+    const { data: planData } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single();
+    if (!planData) return res.status(404).json({ error: 'No plan found' });
+
+    const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+    const plan = JSON.parse(JSON.stringify(planData.workout_plan));
+
+    // req.body.assignments: [{ label: 'Push A', day_index: 0 }, ...]
+    // OR just renumber them sequentially if no assignments given
+    if (req.body.assignments) {
+      req.body.assignments.forEach(a => {
+        const day = plan.days.find(d => d.label === a.label);
+        if (day) {
+          day.day_index = a.day_index;
+          day.day_name = dayNames[a.day_index];
+        }
+      });
+    } else {
+      // Sequential repair: sort by current index, then reassign cleanly
+      plan.days.sort((a, b) => (a.day_index || 0) - (b.day_index || 0));
+    }
+
+    plan.days.sort((a, b) => a.day_index - b.day_index);
+
+    await supabase.from('plans').update({ workout_plan: plan }).eq('id', planData.id);
+    res.json({ success: true, days: plan.days.map(d => ({ day_index: d.day_index, day_name: d.day_name, label: d.label })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 app.post('/api/conversations', requireAuth, async (req, res) => {
   try {
     const { id, title, messages } = req.body;
@@ -939,3 +995,9 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
 
 // ── START ──────────────────────────────────────
 app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
+
+// ── DEBUG — View raw plan (admin only) ────────
+app.get('/api/debug/plan', requireAuth, requireAdmin, async (req, res) => {
+  const { data } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single();
+  res.json(data);
+});
