@@ -248,35 +248,53 @@ app.post('/api/log', requireAuth, async (req, res) => {
     const { day_index, day_label, exercises } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
-    // Upsert session log
-    const { error: logError } = await supabase
-      .from('session_logs')
-      .upsert({
-        user_id: req.user.id,
-        day_index,
-        day_label,
-        logged_at: today,
-        exercises
-      }, { onConflict: 'user_id,day_index,logged_at' });
+    // Save session log — delete today's existing log first then insert fresh
+    await supabase.from('session_logs')
+      .delete()
+      .eq('user_id', req.user.id)
+      .eq('day_index', day_index)
+      .eq('logged_at', today);
+
+    const { error: logError } = await supabase.from('session_logs').insert({
+      user_id: req.user.id,
+      day_index,
+      day_label,
+      logged_at: today,
+      exercises
+    });
 
     if (logError) throw logError;
 
-    // Upsert exercise history + PRs
     const prUpdates = [];
     for (const ex of exercises) {
-      const vol = ex.weight * ex.reps * ex.sets;
-      const est1rm = Math.round(ex.weight * (1 + ex.reps / 30));
+      // exercises now have a sets_data array: [{weight, reps}, ...]
+      // Use best set for PR calculation, total volume across all sets
+      const setsData = ex.sets_data || [{ weight: ex.weight, reps: ex.reps }];
+      const totalVol = setsData.reduce((sum, s) => sum + (s.weight * s.reps), 0);
+      const bestSet = setsData.reduce((best, s) => {
+        const e1rm = s.weight * (1 + s.reps / 30);
+        return e1rm > (best.weight * (1 + best.reps / 30)) ? s : best;
+      }, setsData[0]);
+      const est1rm = Math.round(bestSet.weight * (1 + bestSet.reps / 30));
 
-      await supabase.from('exercise_history').upsert({
+      // Delete existing history entry for today then insert fresh
+      await supabase.from('exercise_history')
+        .delete()
+        .eq('user_id', req.user.id)
+        .eq('exercise_name', ex.name)
+        .eq('logged_at', today);
+
+      await supabase.from('exercise_history').insert({
         user_id: req.user.id,
         exercise_name: ex.name,
         logged_at: today,
-        weight_kg: ex.weight,
-        reps: ex.reps,
-        sets: ex.sets,
-        volume: vol,
-        est_1rm: est1rm
-      }, { onConflict: 'user_id,exercise_name,logged_at' });
+        weight_kg: bestSet.weight,
+        reps: bestSet.reps,
+        sets: setsData.length,
+        volume: totalVol,
+        est_1rm: est1rm,
+        sets_data: setsData // store full per-set breakdown
+      });
 
       // Check & update PR
       const { data: existingPR } = await supabase
@@ -286,13 +304,13 @@ app.post('/api/log', requireAuth, async (req, res) => {
         .eq('exercise_name', ex.name)
         .single();
 
-      if (!existingPR || est1rm > existingPR.est_1rm) {
+      if (!existingPR || est1rm > (existingPR.est_1rm || 0)) {
         await supabase.from('personal_records').upsert({
           user_id: req.user.id,
           exercise_name: ex.name,
-          weight_kg: ex.weight,
-          reps: ex.reps,
-          sets: ex.sets,
+          weight_kg: bestSet.weight,
+          reps: bestSet.reps,
+          sets: setsData.length,
           est_1rm: est1rm,
           achieved_at: today
         }, { onConflict: 'user_id,exercise_name' });
