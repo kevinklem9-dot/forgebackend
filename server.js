@@ -246,43 +246,50 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
+      max_tokens: 6000,
       system: systemPrompt,
       messages
     });
 
     const rawReply = response.content[0].text;
 
-    // Check if the reply contains a plan update command
-    // Coach wraps plan changes in <PLAN_UPDATE>...</PLAN_UPDATE> tags
-    const planUpdateMatch = rawReply.match(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/);
+    // Extract ALL plan update tags (there could be multiple)
+    const planUpdateMatches = [...rawReply.matchAll(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/g)];
     let planUpdate = null;
     let cleanReply = rawReply.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
 
-    if (planUpdateMatch && planData) {
-      try {
-        const updateInstruction = JSON.parse(planUpdateMatch[1].trim());
-        const currentPlan = {
-          workout: planData.workout_plan,
-          nutrition: planData.nutrition_plan
-        };
-        const updatedPlan = applyPlanUpdate(currentPlan, updateInstruction);
+    if (planUpdateMatches.length > 0 && planData) {
+      // Fetch the absolute latest plan from DB (not from earlier Promise.all)
+      const { data: freshPlan } = await supabase
+        .from('plans').select('*').eq('user_id', req.user.id)
+        .order('generated_at', { ascending: false }).limit(1).single();
 
-        // Save updated plan
+      const currentPlan = {
+        workout: freshPlan?.workout_plan || planData.workout_plan,
+        nutrition: freshPlan?.nutrition_plan || planData.nutrition_plan
+      };
+
+      for (const match of planUpdateMatches) {
+        try {
+          const updateInstruction = JSON.parse(match[1].trim());
+          const updatedPlan = applyPlanUpdate(currentPlan, updateInstruction);
+          currentPlan.workout = updatedPlan.workout;
+          currentPlan.nutrition = updatedPlan.nutrition;
+          planUpdate = { type: updateInstruction.type, summary: updateInstruction.summary };
+        } catch(e) {
+          console.error('Plan update parse error:', e.message);
+          console.error('Raw tag content:', match[1].substring(0, 300));
+        }
+      }
+
+      if (planUpdate) {
         await supabase.from('plans')
           .update({
-            workout_plan: updatedPlan.workout,
-            nutrition_plan: updatedPlan.nutrition,
+            workout_plan: currentPlan.workout,
+            nutrition_plan: currentPlan.nutrition,
             generated_at: new Date().toISOString()
           })
-          .eq('id', planData.id);
-
-        planUpdate = {
-          type: updateInstruction.type,
-          summary: updateInstruction.summary
-        };
-      } catch(e) {
-        console.error('Plan update parse error:', e.message);
+          .eq('id', (freshPlan || planData).id);
       }
     }
 
@@ -320,14 +327,28 @@ function applyPlanUpdate(plan, instruction) {
   }
 
   if (instruction.type === 'update_nutrition') {
-    // { type: 'update_nutrition', changes: { calories: 3100, protein_g: 200 } }
     Object.assign(updated.nutrition, instruction.changes);
   }
 
   if (instruction.type === 'update_meal') {
-    // { type: 'update_meal', meal_index: 0, changes: { foods: [...] } }
+    // Update a meal in the default meal plan
     if (updated.nutrition?.meals?.[instruction.meal_index]) {
       Object.assign(updated.nutrition.meals[instruction.meal_index], instruction.changes);
+    }
+  }
+
+  if (instruction.type === 'update_weekly_meals') {
+    // Set different meals for specific days of the week
+    // instruction.weekly_meals: { "0": [...meals], "1": [...meals], ... } keyed by day_index
+    // instruction.day_index + instruction.meals: set meals for a single day
+    if (!updated.nutrition.weekly_meals) updated.nutrition.weekly_meals = {};
+
+    if (instruction.weekly_meals) {
+      // Bulk update multiple days at once
+      Object.assign(updated.nutrition.weekly_meals, instruction.weekly_meals);
+    } else if (instruction.day_index !== undefined && instruction.meals) {
+      // Single day update
+      updated.nutrition.weekly_meals[String(instruction.day_index)] = instruction.meals;
     }
   }
 
@@ -720,13 +741,20 @@ ${plan?.days ? plan.days.map(d => `  day_index:${d.day_index} = ${d.day_name} �
 OCCUPIED day_index values: ${plan?.days ? plan.days.filter(d => d.exercises?.length > 0).map(d => d.day_index).join(', ') : 'none'}
 FREE day_index values (no workout): ${plan?.days ? [0,1,2,3,4,5,6].filter(i => !plan.days.find(d => d.day_index === i && d.exercises?.length > 0)).join(', ') : '0,1,2,3,4,5,6'}
 
-FULL MEAL PLAN:
+FULL MEAL PLAN (default — same every day unless overridden below):
 ${nutrition?.meals ? nutrition.meals.map((m, i) => `  meal_index:${i} = ${m.name} (${m.time}) — ${(m.foods || []).map(f => `${f.name} ${f.amount}`).join(', ')}`).join('\n') : 'Not generated'}
+
+PER-DAY MEAL OVERRIDES (these override the default for specific days):
+${nutrition?.weekly_meals && Object.keys(nutrition.weekly_meals).length
+  ? Object.entries(nutrition.weekly_meals).map(([dayIdx, meals]) =>
+      `  Day ${dayIdx} (${['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][parseInt(dayIdx)] || dayIdx}):\n` +
+      meals.map((m, i) => `    meal_index:${i} = ${m.name} — ${(m.foods || []).map(f => `${f.name} ${f.amount}`).join(', ')}`).join('\n')
+    ).join('\n')
+  : '  None set — all days use the default above'}
 
 PLAN UPDATE TYPES — use exactly as shown:
 
 1. MOVE A WORKOUT TO A DIFFERENT DAY:
-Always check the schedule above first. Use the actual day_index values shown above.
 <PLAN_UPDATE>{"type":"reschedule_days","mapping":[{"from_day_index":0,"to_day_index":4}],"summary":"Moved Monday workout to Friday"}</PLAN_UPDATE>
 
 2. SWAP AN EXERCISE:
@@ -738,10 +766,17 @@ Always check the schedule above first. Use the actual day_index values shown abo
 4. CHANGE NUTRITION MACROS:
 <PLAN_UPDATE>{"type":"update_nutrition","changes":{"calories":3100,"protein_g":200,"carbs_g":360,"fat_g":90},"summary":"Updated macros to 3100 kcal"}</PLAN_UPDATE>
 
-5. CHANGE A MEAL'S FOODS:
-<PLAN_UPDATE>{"type":"update_meal","meal_index":0,"changes":{"name":"Meal 1 Breakfast","time":"7:00-8:00 AM","kcal":700,"protein_g":50,"carbs_g":70,"fat_g":20,"foods":[{"name":"Greek yogurt","amount":"200g"},{"name":"Oats","amount":"80g"},{"name":"Banana","amount":"1 large"}]},"summary":"Updated breakfast to Greek yogurt, oats and banana"}</PLAN_UPDATE>
+5. CHANGE THE DEFAULT MEAL PLAN (affects all days that don't have overrides):
+<PLAN_UPDATE>{"type":"update_meal","meal_index":0,"changes":{"name":"Meal 1 Breakfast","time":"7:00 AM","kcal":700,"protein_g":50,"carbs_g":70,"fat_g":20,"foods":[{"name":"Greek yogurt","amount":"200g"},{"name":"Oats","amount":"80g"}]},"summary":"Updated default breakfast"}</PLAN_UPDATE>
 
-6. REPLACE ALL EXERCISES ON A DAY:
+6. SET DIFFERENT MEALS FOR A SPECIFIC DAY (use this when user wants different food on certain days):
+<PLAN_UPDATE>{"type":"update_weekly_meals","day_index":0,"meals":[{"name":"Meal 1 Breakfast","time":"7:00 AM","kcal":600,"protein_g":45,"carbs_g":60,"fat_g":18,"foods":[{"name":"Scrambled eggs","amount":"3 eggs"},{"name":"Toast","amount":"2 slices"}]},{"name":"Meal 2 Lunch","time":"12:00 PM","kcal":700,"protein_g":50,"carbs_g":80,"fat_g":20,"foods":[{"name":"Chicken breast","amount":"150g"},{"name":"Rice","amount":"200g cooked"}]}],"summary":"Set custom meals for Monday"}</PLAN_UPDATE>
+
+7. SET MEALS FOR MULTIPLE DAYS — send ONE tag per day, NOT one big tag:
+<PLAN_UPDATE>{"type":"update_weekly_meals","day_index":0,"meals":[{"name":"Meal 1 Breakfast","time":"7:00 AM","kcal":600,"protein_g":45,"carbs_g":60,"fat_g":18,"foods":[{"name":"Eggs","amount":"3 eggs"},{"name":"Toast","amount":"2 slices"}]},{"name":"Meal 2 Lunch","time":"12:30 PM","kcal":700,"protein_g":50,"carbs_g":80,"fat_g":20,"foods":[{"name":"Chicken","amount":"150g"},{"name":"Rice","amount":"200g"}]}],"summary":"Monday meals"}</PLAN_UPDATE>
+<PLAN_UPDATE>{"type":"update_weekly_meals","day_index":1,"meals":[{"name":"Meal 1 Breakfast","time":"7:00 AM","kcal":550,"protein_g":40,"carbs_g":55,"fat_g":16,"foods":[{"name":"Oats","amount":"80g"},{"name":"Protein powder","amount":"1 scoop"}]},{"name":"Meal 2 Lunch","time":"12:30 PM","kcal":650,"protein_g":48,"carbs_g":75,"fat_g":18,"foods":[{"name":"Tuna","amount":"150g"},{"name":"Pasta","amount":"180g cooked"}]}],"summary":"Tuesday meals"}</PLAN_UPDATE>
+
+8. REPLACE ALL EXERCISES ON A DAY:
 <PLAN_UPDATE>{"type":"update_day","day_index":0,"exercises":[{"name":"Exercise","note":"cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8}],"summary":"Replaced Monday workout"}</PLAN_UPDATE>
 
 RULES:
@@ -749,8 +784,10 @@ RULES:
 - NEVER move a workout to an OCCUPIED day_index unless the user specifically asks to swap two days
 - If the user asks to move to an occupied day, tell them what's already there and ask if they want to swap
 - If the user asks to move to a FREE day, just do it with reschedule_days
-- NEVER say you don't have access to something — you have full access to change workouts, meals, macros, and schedules
-- Always confirm what you changed in plain text after the tag`;
+- NEVER say you don't have access — you have full access to change everything
+- When setting per-day meals, send ONE tag per day — never combine multiple days into one tag
+- Each tag's meals array must include ALL meals for that day, not just changed ones
+- Always confirm what you changed in plain text after the tags`;
 }
 
 function buildCheckinPrompt(profile, planData, recentHistory, sessionSummary, feeling, difficulty) {
