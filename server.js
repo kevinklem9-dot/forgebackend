@@ -633,6 +633,96 @@ app.post('/api/bodyweight', requireAuth, async (req, res) => {
   }
 });
 
+// ── GET STREAK & BADGES ────────────────────────
+app.get('/api/stats', requireAuth, async (req, res) => {
+  try {
+    // Get all session logs to compute streak and monthly counts
+    const { data: sessions } = await supabase
+      .from('session_logs')
+      .select('logged_at')
+      .eq('user_id', req.user.id)
+      .order('logged_at', { ascending: false });
+
+    // Get existing stats row
+    const { data: existingStats } = await supabase
+      .from('user_stats')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+
+    if (!sessions?.length) {
+      return res.json({ streak: 0, longest_streak: 0, badges: [], monthly_counts: {} });
+    }
+
+    // Get unique workout dates sorted descending
+    const uniqueDates = [...new Set(sessions.map(s => s.logged_at))].sort().reverse();
+
+    // Compute current streak
+    const today = new Date().toISOString().split('T')[0];
+    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    let streak = 0;
+    let checkDate = uniqueDates[0] === today || uniqueDates[0] === yesterday ? uniqueDates[0] : null;
+
+    if (checkDate) {
+      for (const date of uniqueDates) {
+        if (date === checkDate) {
+          streak++;
+          const prev = new Date(checkDate);
+          prev.setDate(prev.getDate() - 1);
+          checkDate = prev.toISOString().split('T')[0];
+        } else {
+          break;
+        }
+      }
+    }
+
+    const longest_streak = Math.max(streak, existingStats?.longest_streak || 0);
+
+    // Monthly workout counts — count unique days logged per month
+    const monthly_counts = {};
+    sessions.forEach(s => {
+      const month = s.logged_at.substring(0, 7); // "2025-04"
+      if (!monthly_counts[month]) monthly_counts[month] = new Set();
+      monthly_counts[month].add(s.logged_at);
+    });
+    // Convert sets to counts
+    Object.keys(monthly_counts).forEach(k => {
+      monthly_counts[k] = monthly_counts[k].size;
+    });
+
+    // Compute badges — one per month where workouts >= 6
+    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const badges = Object.entries(monthly_counts)
+      .filter(([, count]) => count >= 6)
+      .map(([month]) => {
+        const [year, m] = month.split('-');
+        return {
+          id: month,
+          month: MONTH_NAMES[parseInt(m) - 1],
+          year: parseInt(year),
+          label: `${MONTH_NAMES[parseInt(m) - 1]} ${year}`,
+          unlocked: true
+        };
+      })
+      .sort((a, b) => a.id.localeCompare(b.id));
+
+    // Upsert stats to DB
+    await supabase.from('user_stats').upsert({
+      user_id: req.user.id,
+      current_streak: streak,
+      longest_streak,
+      last_workout_date: uniqueDates[0],
+      badges,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'user_id' });
+
+    res.json({ streak, longest_streak, badges, monthly_counts });
+  } catch (err) {
+    console.error('Stats error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GET BODYWEIGHT HISTORY ─────────────────────
 app.get('/api/bodyweight', requireAuth, async (req, res) => {
   try {
