@@ -189,11 +189,12 @@ app.get('/api/plan', requireAuth, async (req, res) => {
       .eq('user_id', req.user.id)
       .order('generated_at', { ascending: false })
       .limit(1)
-      .single();
+      .maybeSingle(); // returns null instead of throwing when no rows
 
-    if (error) return res.status(404).json({ error: 'No plan found' });
+    if (!data) return res.json({ plan: null });
     res.json({ plan: data });
   } catch (err) {
+    console.error('Get plan error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
