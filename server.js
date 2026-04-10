@@ -853,7 +853,7 @@ function buildCoachPrompt(profile, planData, recentHistory, context, language) {
 
   const contextStr = context ? `\nCURRENT CONTEXT: ${context}` : '';
 
-  const langNames = { en:'English', es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese', nl:'Dutch', ar:'Arabic', zh:'Chinese', ja:'Japanese' };
+  const langNames = { en:'English', es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese', nl:'Dutch', uk:'Ukrainian', fi:'Finnish', ar:'Arabic', zh:'Chinese', ja:'Japanese' };
   const langStr = language && language !== 'en'
     ? `\nLANGUAGE: You MUST respond entirely in ${langNames[language] || language}. Every word of your response must be in ${langNames[language] || language}. Do not switch to English under any circumstances.`
     : '';
@@ -950,7 +950,7 @@ function buildCheckinPrompt(profile, planData, recentHistory, sessionSummary, fe
     ? plan.days.map(d => `${d.day_name} (${d.label}): ${d.exercises?.map(e => `${e.name} ${e.sets}×${e.reps}`).join(', ')}`).join('\n')
     : 'Not generated';
 
-  const langNames = { en:'English', es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese', nl:'Dutch', ar:'Arabic', zh:'Chinese', ja:'Japanese' };
+  const langNames = { en:'English', es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese', nl:'Dutch', uk:'Ukrainian', fi:'Finnish', ar:'Arabic', zh:'Chinese', ja:'Japanese' };
   const langStr = language && language !== 'en'
     ? `\nLANGUAGE: You MUST respond entirely in ${langNames[language] || language}. Every word must be in ${langNames[language] || language}.`
     : '';
