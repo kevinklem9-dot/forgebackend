@@ -1,313 +1,211 @@
+/**
+ * FORGE — Retention Feature Routes
+ * Mounted in server.js as: app.use('/api', requireAuth, retentionRoutes)
+ */
+
 const express = require('express');
-const router = express.Router();
 
-// These are injected via module.exports factory
-module.exports = function(supabase, anthropic) {
+module.exports = function (supabase, anthropic) {
+  const router = express.Router();
 
-  // ════════════════════════════════════════════════
-  // STREAK SYSTEM (with 1 forgiveness/week)
-  // ════════════════════════════════════════════════
-
-  // GET current streak
+  // ── STREAK ────────────────────────────────────
   router.get('/streak', async (req, res) => {
     try {
       const { data, error } = await supabase
         .from('streaks')
         .select('*')
         .eq('user_id', req.user.id)
-        .single();
+        .maybeSingle();
 
-      if (error && error.code === 'PGRST116') {
-        // No streak record yet
-        return res.json({ current_streak: 0, longest_streak: 0, forgiveness_available: true });
+      if (!data) {
+        return res.json({ current_streak: 0, longest_streak: 0, last_workout_date: null });
       }
-      if (error) throw error;
-
-      // Reset forgiveness weekly (Monday)
-      const now = new Date();
-      const resetDate = new Date(data.forgiveness_reset_at);
-      const daysSinceReset = Math.floor((now - resetDate) / 86400000);
-      const forgivenessAvailable = daysSinceReset >= 7 ? true : !data.forgiveness_used_this_week;
-
-      res.json({
-        current_streak: data.current_streak,
-        longest_streak: data.longest_streak,
-        last_workout_date: data.last_workout_date,
-        forgiveness_available: forgivenessAvailable
-      });
+      res.json(data);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // POST update streak (called after workout log)
   router.post('/streak/update', async (req, res) => {
     try {
-      const userId = req.user.id;
       const today = new Date().toISOString().split('T')[0];
+      const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
 
       const { data: existing } = await supabase
         .from('streaks')
         .select('*')
-        .eq('user_id', userId)
-        .single();
+        .eq('user_id', req.user.id)
+        .maybeSingle();
 
-      if (!existing) {
-        // First workout ever
-        const { data, error } = await supabase
-          .from('streaks')
-          .insert({
-            user_id: userId,
-            current_streak: 1,
-            longest_streak: 1,
-            last_workout_date: today,
-            forgiveness_reset_at: today
-          })
-          .select()
-          .single();
-        if (error) throw error;
-        return res.json({ streak: data, milestone: 1 });
+      let current_streak = 1;
+      let forgiveness_used = existing?.forgiveness_used_this_week || false;
+      let forgiveness_reset = existing?.forgiveness_reset_at || today;
+
+      if (existing?.last_workout_date) {
+        const last = existing.last_workout_date;
+
+        // Reset forgiveness weekly
+        const daysSinceReset = Math.floor((new Date(today) - new Date(forgiveness_reset)) / 86400000);
+        if (daysSinceReset >= 7) {
+          forgiveness_used = false;
+          forgiveness_reset = today;
+        }
+
+        if (last === today) {
+          // Already logged today — keep streak as is
+          return res.json({ current_streak: existing.current_streak, already_logged: true });
+        } else if (last === yesterday) {
+          // Consecutive — extend streak
+          current_streak = (existing.current_streak || 0) + 1;
+        } else {
+          // Gap — check forgiveness
+          const daysSinceLast = Math.floor((new Date(today) - new Date(last)) / 86400000);
+          if (daysSinceLast === 2 && !forgiveness_used) {
+            // One missed day — forgiveness applies
+            current_streak = (existing.current_streak || 0) + 1;
+            forgiveness_used = true;
+          } else {
+            // Streak broken
+            current_streak = 1;
+          }
+        }
       }
 
-      // Calculate days since last workout
-      const lastDate = new Date(existing.last_workout_date);
-      const todayDate = new Date(today);
-      const daysDiff = Math.floor((todayDate - lastDate) / 86400000);
+      const longest_streak = Math.max(current_streak, existing?.longest_streak || 0);
 
-      let newStreak = existing.current_streak;
-      let forgUsed = existing.forgiveness_used_this_week;
-      let milestone = null;
+      await supabase.from('streaks').upsert({
+        user_id: req.user.id,
+        current_streak,
+        longest_streak,
+        last_workout_date: today,
+        forgiveness_used_this_week: forgiveness_used,
+        forgiveness_reset_at: forgiveness_reset,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id' });
 
-      if (daysDiff === 0) {
-        // Already logged today
-        return res.json({ streak: existing, milestone: null });
-      } else if (daysDiff === 1) {
-        // Consecutive day
-        newStreak += 1;
-      } else if (daysDiff === 2 && !forgUsed) {
-        // Missed one day — use forgiveness
-        newStreak += 1;
-        forgUsed = true;
-      } else {
-        // Streak broken
-        newStreak = 1;
-        forgUsed = false;
-      }
-
-      // Reset forgiveness weekly
-      const resetDate = new Date(existing.forgiveness_reset_at);
-      const daysSinceReset = Math.floor((todayDate - resetDate) / 86400000);
-      if (daysSinceReset >= 7) {
-        forgUsed = false;
-      }
-
-      const longest = Math.max(newStreak, existing.longest_streak);
-
-      // Check milestones
-      const milestones = [3, 7, 14, 30, 60, 100];
-      if (milestones.includes(newStreak)) {
-        milestone = newStreak;
-      }
-
-      const { data, error } = await supabase
-        .from('streaks')
-        .update({
-          current_streak: newStreak,
-          longest_streak: longest,
-          last_workout_date: today,
-          forgiveness_used_this_week: forgUsed,
-          forgiveness_reset_at: daysSinceReset >= 7 ? today : existing.forgiveness_reset_at,
-          updated_at: new Date().toISOString()
-        })
-        .eq('user_id', userId)
-        .select()
-        .single();
-
-      if (error) throw error;
-      res.json({ streak: data, milestone });
+      res.json({ current_streak, longest_streak, is_new_record: current_streak === longest_streak && current_streak > 1 });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // ════════════════════════════════════════════════
-  // PUSH NOTIFICATIONS
-  // ════════════════════════════════════════════════
-
-  // POST subscribe to push
+  // ── PUSH SUBSCRIPTIONS ────────────────────────
   router.post('/push/subscribe', async (req, res) => {
     try {
       const { subscription } = req.body;
-      if (!subscription) return res.status(400).json({ error: 'Subscription required' });
+      if (!subscription) return res.status(400).json({ error: 'No subscription provided' });
 
-      const { error } = await supabase
-        .from('push_subscriptions')
-        .upsert({
-          user_id: req.user.id,
-          subscription
-        }, { onConflict: 'user_id,subscription' });
+      await supabase.from('push_subscriptions').upsert({
+        user_id: req.user.id,
+        subscription
+      }, { onConflict: 'user_id,subscription' });
 
-      if (error) throw error;
-      res.json({ ok: true });
+      res.json({ success: true });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // DELETE unsubscribe
   router.delete('/push/subscribe', async (req, res) => {
     try {
-      const { endpoint } = req.body;
-      const { error } = await supabase
-        .from('push_subscriptions')
+      await supabase.from('push_subscriptions')
         .delete()
-        .eq('user_id', req.user.id)
-        .filter('subscription->>endpoint', 'eq', endpoint);
-
-      if (error) throw error;
-      res.json({ ok: true });
+        .eq('user_id', req.user.id);
+      res.json({ success: true });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // ════════════════════════════════════════════════
-  // PR DETECTION + CELEBRATION
-  // ════════════════════════════════════════════════
-
-  // POST check for new PRs after logging
+  // ── PR CHECK ──────────────────────────────────
   router.post('/pr/check', async (req, res) => {
     try {
       const { exercise_name, weight_kg, reps, sets } = req.body;
-      const userId = req.user.id;
-      const est1rm = weight_kg * (1 + reps / 30); // Epley formula
+      const est_1rm = Math.round(weight_kg * (1 + reps / 30));
 
-      // Get existing PR
-      const { data: existingPR } = await supabase
+      const { data: existing } = await supabase
         .from('personal_records')
         .select('*')
-        .eq('user_id', userId)
+        .eq('user_id', req.user.id)
         .eq('exercise_name', exercise_name)
-        .single();
+        .maybeSingle();
 
-      let isPR = false;
-      let prType = null;
+      const is_pr = !existing || est_1rm > (existing.est_1rm || 0);
 
-      if (!existingPR) {
-        // First ever record for this exercise
-        isPR = true;
-        prType = 'first_record';
-      } else if (est1rm > (existingPR.est_1rm || 0)) {
-        isPR = true;
-        prType = 'new_1rm';
-      } else if (weight_kg > (existingPR.weight_kg || 0)) {
-        isPR = true;
-        prType = 'new_weight';
-      } else if (weight_kg === existingPR.weight_kg && reps > (existingPR.reps || 0)) {
-        isPR = true;
-        prType = 'new_reps';
-      }
-
-      if (isPR) {
-        // Upsert PR
-        await supabase
-          .from('personal_records')
-          .upsert({
-            user_id: userId,
-            exercise_name,
-            weight_kg,
-            reps,
-            sets,
-            est_1rm: est1rm,
-            achieved_at: new Date().toISOString().split('T')[0]
-          }, { onConflict: 'user_id,exercise_name' });
-
-        // Complete onboarding mission if applicable
-        await checkMission(userId, 'first_workout');
+      if (is_pr) {
+        await supabase.from('personal_records').upsert({
+          user_id: req.user.id,
+          exercise_name,
+          weight_kg,
+          reps,
+          sets,
+          est_1rm,
+          achieved_at: new Date().toISOString().split('T')[0]
+        }, { onConflict: 'user_id,exercise_name' });
       }
 
       res.json({
-        is_pr: isPR,
-        pr_type: prType,
-        exercise: exercise_name,
-        est_1rm: isPR ? est1rm : null,
-        previous_1rm: existingPR?.est_1rm || null
+        is_pr,
+        previous_1rm: existing?.est_1rm || null,
+        new_1rm: est_1rm,
+        improvement: existing ? est_1rm - existing.est_1rm : null
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // ════════════════════════════════════════════════
-  // PLAN ADHERENCE TRACKING
-  // ════════════════════════════════════════════════
-
+  // ── PLAN ADHERENCE ────────────────────────────
   router.get('/adherence', async (req, res) => {
     try {
-      const userId = req.user.id;
-      const { weeks = 4 } = req.query;
-
-      // Get user's plan
-      const { data: plan } = await supabase
-        .from('plans')
-        .select('workout_plan')
-        .eq('user_id', userId)
-        .order('generated_at', { ascending: false })
-        .limit(1)
-        .single();
-
-      if (!plan) return res.json({ adherence_pct: null, message: 'No plan generated yet' });
-
-      const plannedDaysPerWeek = Object.keys(plan.workout_plan || {}).length || 0;
-
-      // Get sessions from last N weeks
-      const since = new Date();
-      since.setDate(since.getDate() - (weeks * 7));
+      const weeks = parseInt(req.query.weeks) || 4;
+      const since = new Date(Date.now() - weeks * 7 * 86400000).toISOString().split('T')[0];
 
       const { data: sessions } = await supabase
         .from('session_logs')
         .select('logged_at')
-        .eq('user_id', userId)
-        .gte('logged_at', since.toISOString().split('T')[0]);
+        .eq('user_id', req.user.id)
+        .gte('logged_at', since);
 
+      const { data: plan } = await supabase
+        .from('plans')
+        .select('workout_plan')
+        .eq('user_id', req.user.id)
+        .order('generated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const plannedDaysPerWeek = plan?.workout_plan?.days?.filter(d => d.exercises?.length > 0).length || 4;
       const totalPlanned = plannedDaysPerWeek * weeks;
-      const totalLogged = sessions?.length || 0;
-      const adherencePct = totalPlanned > 0 ? Math.round((totalLogged / totalPlanned) * 100) : 0;
+      const uniqueDaysLogged = new Set((sessions || []).map(s => s.logged_at)).size;
+      const adherence_pct = totalPlanned > 0 ? Math.round((uniqueDaysLogged / totalPlanned) * 100) : 0;
 
       res.json({
-        adherence_pct: Math.min(adherencePct, 100),
-        workouts_logged: totalLogged,
+        adherence_pct: Math.min(100, adherence_pct),
+        workouts_completed: uniqueDaysLogged,
         workouts_planned: totalPlanned,
-        weeks_tracked: parseInt(weeks)
+        weeks
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // ════════════════════════════════════════════════
-  // BODY METRICS + AI INSIGHTS
-  // ════════════════════════════════════════════════
-
+  // ── BODY METRICS ──────────────────────────────
   router.post('/metrics', async (req, res) => {
     try {
       const { weight_kg, body_fat_pct, chest_cm, waist_cm, hips_cm, arm_cm, thigh_cm, notes } = req.body;
+      const today = new Date().toISOString().split('T')[0];
 
-      const { data, error } = await supabase
-        .from('body_metrics')
-        .insert({
-          user_id: req.user.id,
-          weight_kg, body_fat_pct, chest_cm, waist_cm, hips_cm, arm_cm, thigh_cm, notes
-        })
-        .select()
-        .single();
+      const { data, error } = await supabase.from('body_metrics').insert({
+        user_id: req.user.id,
+        logged_at: today,
+        weight_kg, body_fat_pct, chest_cm, waist_cm,
+        hips_cm, arm_cm, thigh_cm, notes
+      }).select().single();
 
       if (error) throw error;
-
-      // Complete onboarding mission
-      await checkMission(req.user.id, 'log_bodyweight');
-
-      res.json(data);
+      res.json({ metric: data });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -320,10 +218,10 @@ module.exports = function(supabase, anthropic) {
         .select('*')
         .eq('user_id', req.user.id)
         .order('logged_at', { ascending: false })
-        .limit(30);
+        .limit(52);
 
       if (error) throw error;
-      res.json(data);
+      res.json({ metrics: data });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -331,125 +229,113 @@ module.exports = function(supabase, anthropic) {
 
   router.get('/metrics/insights', async (req, res) => {
     try {
-      const userId = req.user.id;
-
       const { data: metrics } = await supabase
         .from('body_metrics')
         .select('*')
-        .eq('user_id', userId)
+        .eq('user_id', req.user.id)
         .order('logged_at', { ascending: false })
-        .limit(10);
+        .limit(8);
 
       const { data: profile } = await supabase
         .from('profiles')
-        .select('goal, target_weight_kg')
-        .eq('id', userId)
+        .select('goal, name')
+        .eq('id', req.user.id)
         .single();
 
-      if (!metrics || metrics.length < 2) {
-        return res.json({ insights: 'Log at least 2 body metrics entries to get AI insights.' });
-      }
+      if (!metrics?.length) return res.json({ insights: 'Log some body metrics first to get insights.' });
 
-      const message = await anthropic.messages.create({
+      const latest = metrics[0];
+      const oldest = metrics[metrics.length - 1];
+      const weightChange = latest.weight_kg && oldest.weight_kg
+        ? (latest.weight_kg - oldest.weight_kg).toFixed(1)
+        : null;
+
+      const prompt = `You are a fitness coach. Analyse these body metrics and give brief, direct insights.
+Client: ${profile?.name}, Goal: ${profile?.goal}
+Latest metrics: weight ${latest.weight_kg}kg, body fat ${latest.body_fat_pct || 'N/A'}%, waist ${latest.waist_cm || 'N/A'}cm
+Change over ${metrics.length} entries: weight ${weightChange !== null ? weightChange + 'kg' : 'N/A'}
+Give 2-3 sentences of specific, actionable insight. No fluff.`;
+
+      const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 500,
-        messages: [{
-          role: 'user',
-          content: `You are a fitness coach. Analyse these body metrics and give 3 brief, actionable insights.
-Goal: ${profile?.goal || 'general fitness'}
-Target weight: ${profile?.target_weight_kg || 'not set'}kg
-Metrics (newest first): ${JSON.stringify(metrics.map(m => ({
-  date: m.logged_at, weight: m.weight_kg, bf: m.body_fat_pct,
-  waist: m.waist_cm, chest: m.chest_cm
-})))}
-Keep it under 150 words. Be direct. No fluff.`
-        }]
+        max_tokens: 200,
+        messages: [{ role: 'user', content: prompt }]
       });
 
-      res.json({ insights: message.content[0].text });
+      res.json({ insights: response.content[0].text });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // ════════════════════════════════════════════════
-  // DELOAD DETECTION
-  // ════════════════════════════════════════════════
-
+  // ── DELOAD DETECTION ──────────────────────────
   router.get('/deload/check', async (req, res) => {
     try {
-      const userId = req.user.id;
-
-      // Get last 4 weeks of exercise history
-      const since = new Date();
-      since.setDate(since.getDate() - 28);
+      const fourWeeksAgo = new Date(Date.now() - 28 * 86400000).toISOString().split('T')[0];
 
       const { data: history } = await supabase
         .from('exercise_history')
-        .select('logged_at, volume, est_1rm')
-        .eq('user_id', userId)
-        .gte('logged_at', since.toISOString().split('T')[0])
+        .select('*')
+        .eq('user_id', req.user.id)
+        .gte('logged_at', fourWeeksAgo)
         .order('logged_at', { ascending: true });
 
-      if (!history || history.length < 8) {
-        return res.json({ needs_deload: false, reason: 'Not enough data yet' });
+      if (!history?.length || history.length < 6) {
+        return res.json({ needs_deload: false, reason: null });
       }
 
-      // Split into weeks
-      const weeks = [[], [], [], []];
+      // Group by exercise, check for volume plateau or drops
+      const byExercise = {};
       history.forEach(h => {
-        const weekIdx = Math.floor((new Date(h.logged_at) - since) / (7 * 86400000));
-        if (weekIdx >= 0 && weekIdx < 4) weeks[weekIdx].push(h);
+        if (!byExercise[h.exercise_name]) byExercise[h.exercise_name] = [];
+        byExercise[h.exercise_name].push(h);
       });
 
-      const weeklyVolumes = weeks.map(w =>
-        w.reduce((sum, e) => sum + (e.volume || 0), 0)
-      );
+      let stalledCount = 0;
+      let droppingCount = 0;
 
-      const weeklyAvg1rm = weeks.map(w => {
-        const rms = w.filter(e => e.est_1rm).map(e => e.est_1rm);
-        return rms.length ? rms.reduce((a, b) => a + b, 0) / rms.length : 0;
+      Object.values(byExercise).forEach(sessions => {
+        if (sessions.length < 3) return;
+        const recent = sessions.slice(-3);
+        const volumes = recent.map(s => s.volume || 0);
+        const isStalled = volumes.every(v => Math.abs(v - volumes[0]) < volumes[0] * 0.05);
+        const isDropping = volumes[2] < volumes[0] * 0.9;
+        if (isStalled) stalledCount++;
+        if (isDropping) droppingCount++;
       });
 
-      let needsDeload = false;
-      let reason = null;
+      const totalExercises = Object.keys(byExercise).length;
+      const needs_deload = stalledCount >= totalExercises * 0.5 || droppingCount >= 2;
 
-      // Check: 3+ weeks of declining or stagnant 1RM
-      if (weeklyAvg1rm[3] > 0 && weeklyAvg1rm[2] > 0 && weeklyAvg1rm[1] > 0) {
-        if (weeklyAvg1rm[3] <= weeklyAvg1rm[2] && weeklyAvg1rm[2] <= weeklyAvg1rm[1]) {
-          needsDeload = true;
-          reason = 'performance_plateau';
-        }
-      }
+      // Check existing unacknowledged flag
+      const { data: existingFlag } = await supabase
+        .from('deload_flags')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .eq('acknowledged', false)
+        .maybeSingle();
 
-      // Check: volume dropping while effort stays high
-      if (weeklyVolumes[3] > 0 && weeklyVolumes[3] < weeklyVolumes[1] * 0.85) {
-        needsDeload = true;
-        reason = reason || 'volume_decline';
-      }
-
-      if (needsDeload) {
-        // Flag it
-        await supabase
-          .from('deload_flags')
-          .insert({ user_id: userId, reason });
+      if (needs_deload && !existingFlag) {
+        const reason = droppingCount >= 2 ? 'performance_drop' : 'volume_plateau';
+        await supabase.from('deload_flags').insert({
+          user_id: req.user.id,
+          reason,
+          flagged_at: new Date().toISOString().split('T')[0]
+        });
+        return res.json({ needs_deload: true, reason });
       }
 
       res.json({
-        needs_deload: needsDeload,
-        reason,
-        weekly_volumes: weeklyVolumes,
-        weekly_avg_1rm: weeklyAvg1rm
+        needs_deload,
+        reason: existingFlag?.reason || (needs_deload ? 'volume_plateau' : null),
+        flag: existingFlag || null
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // ════════════════════════════════════════════════
-  // ONBOARDING MISSIONS (Day 1–7)
-  // ════════════════════════════════════════════════
-
+  // ── ONBOARDING MISSIONS ───────────────────────
   router.get('/missions', async (req, res) => {
     try {
       const { data, error } = await supabase
@@ -459,14 +345,7 @@ Keep it under 150 words. Be direct. No fluff.`
         .order('created_at', { ascending: true });
 
       if (error) throw error;
-
-      const completed = (data || []).filter(m => m.completed).length;
-      const total = (data || []).length;
-
-      res.json({
-        missions: data,
-        progress: { completed, total, pct: total > 0 ? Math.round((completed / total) * 100) : 0 }
-      });
+      res.json({ missions: data || [] });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -475,80 +354,66 @@ Keep it under 150 words. Be direct. No fluff.`
   router.post('/missions/:key/complete', async (req, res) => {
     try {
       const { key } = req.params;
-      const userId = req.user.id;
+      const now = new Date().toISOString();
 
       const { data, error } = await supabase
         .from('onboarding_missions')
-        .update({ completed: true, completed_at: new Date().toISOString() })
-        .eq('user_id', userId)
+        .update({ completed: true, completed_at: now })
+        .eq('user_id', req.user.id)
         .eq('mission_key', key)
-        .eq('completed', false)
         .select()
         .single();
 
       if (error) throw error;
 
-      // Update onboarding score
-      await supabase
-        .from('profiles')
-        .update({ onboarding_score: supabase.rpc ? undefined : undefined })
-        .eq('id', userId);
-
-      // Count completed
-      const { count } = await supabase
+      // Update onboarding score on profile
+      const { data: missions } = await supabase
         .from('onboarding_missions')
-        .select('*', { count: 'exact', head: true })
-        .eq('user_id', userId)
-        .eq('completed', true);
+        .select('completed')
+        .eq('user_id', req.user.id);
 
-      await supabase
-        .from('profiles')
-        .update({ onboarding_score: count })
-        .eq('id', userId);
+      const completedCount = (missions || []).filter(m => m.completed).length;
+      await supabase.from('profiles')
+        .update({ onboarding_score: completedCount })
+        .eq('id', req.user.id);
 
-      res.json({ mission: data, total_completed: count });
+      res.json({ mission: data, score: completedCount });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // ════════════════════════════════════════════════
-  // WEEKLY REVIEW (endpoint for cron to hit)
-  // ════════════════════════════════════════════════
+  // ── DELOAD ACKNOWLEDGE ────────────────────────────────
+  router.post('/deload/acknowledge', async (req, res) => {
+    try {
+      await supabase
+        .from('deload_flags')
+        .update({ acknowledged: true })
+        .eq('user_id', req.user.id)
+        .eq('acknowledged', false);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
 
+  // ── WEEKLY REVIEW ─────────────────────────────
   router.get('/review/latest', async (req, res) => {
     try {
       const { data, error } = await supabase
         .from('weekly_reviews')
         .select('*')
         .eq('user_id', req.user.id)
-        .order('week_start', { ascending: false })
+        .order('created_at', { ascending: false })
         .limit(1)
-        .single();
+        .maybeSingle();
 
-      if (error && error.code === 'PGRST116') {
-        return res.json({ review: null });
-      }
       if (error) throw error;
-      res.json({ review: data });
+      res.json({ review: data || null });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
-
-  // Helper: check and complete onboarding mission
-  async function checkMission(userId, missionKey) {
-    try {
-      await supabase
-        .from('onboarding_missions')
-        .update({ completed: true, completed_at: new Date().toISOString() })
-        .eq('user_id', userId)
-        .eq('mission_key', missionKey)
-        .eq('completed', false);
-    } catch (e) {
-      // Non-critical, don't throw
-    }
-  }
 
   return router;
 };
