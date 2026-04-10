@@ -130,7 +130,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       try {
         const message = await anthropic.messages.create({
           model: 'claude-sonnet-4-20250514',
-          max_tokens: 8000,
+          max_tokens: 12000,
           messages: [{ role: 'user', content: prompt }]
         });
 
@@ -814,12 +814,31 @@ Use EXACTLY this JSON structure:
         "carbs_g": 72,
         "fat_g": 22,
         "foods": [
-          { "name": "Whole eggs", "amount": "4 eggs" }
+          { "name": "Whole eggs", "amount": "4 eggs" },
+          { "name": "Oats", "amount": "80g" }
         ]
       }
-    ]
+    ],
+    "weekly_meals": {
+      "0": [
+        { "name": "Meal 1 Breakfast", "time": "7:00 AM", "kcal": 680, "protein_g": 47, "carbs_g": 72, "fat_g": 22, "foods": [{ "name": "Whole eggs", "amount": "4 eggs" }, { "name": "Oats", "amount": "80g" }] },
+        { "name": "Meal 2 Lunch", "time": "12:30 PM", "kcal": 750, "protein_g": 55, "carbs_g": 85, "fat_g": 20, "foods": [{ "name": "Chicken breast", "amount": "200g" }, { "name": "Rice", "amount": "200g cooked" }] }
+      ],
+      "1": [
+        { "name": "Meal 1 Breakfast", "time": "7:00 AM", "kcal": 650, "protein_g": 45, "carbs_g": 70, "fat_g": 20, "foods": [{ "name": "Greek yogurt", "amount": "250g" }, { "name": "Banana", "amount": "1 large" }] },
+        { "name": "Meal 2 Lunch", "time": "12:30 PM", "kcal": 720, "protein_g": 52, "carbs_g": 80, "fat_g": 18, "foods": [{ "name": "Salmon fillet", "amount": "180g" }, { "name": "Sweet potato", "amount": "200g" }] }
+      ]
+    }
   }
-}`;
+}
+
+CRITICAL NUTRITION INSTRUCTION:
+You MUST generate a full weekly_meals object with 7 different daily meal plans (keys "0" through "6" for Monday through Sunday).
+Each day must have ALL meals for that day (breakfast, lunch, dinner, snacks as appropriate).
+Make each day DIFFERENT — vary the protein sources, carb sources, and meal types throughout the week.
+Do NOT repeat the same meals on consecutive days.
+The "meals" array is just a fallback — the "weekly_meals" object is what gets displayed.
+Keep total daily macros consistent across all 7 days but vary the actual foods.`;
 }
 
 function buildCoachPrompt(profile, planData, recentHistory, context) {
