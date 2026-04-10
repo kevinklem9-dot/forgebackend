@@ -1156,6 +1156,10 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
   }
 });
 
+// ── RETENTION FEATURES ────────────────────────
+const retentionRoutes = require('./routes/retention')(supabase, anthropic);
+app.use('/api', requireAuth, retentionRoutes);
+
 // ── START ──────────────────────────────────────
 app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 
