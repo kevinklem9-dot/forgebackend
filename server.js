@@ -67,29 +67,39 @@ app.post('/api/signup', async (req, res) => {
       return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
     }
 
-    // Create the account via admin (auto-confirms email)
+    // Create account — email_confirm: false so Supabase sends confirmation email
     const { data, error } = await supabase.auth.admin.createUser({
       email,
       password,
-      email_confirm: true,
+      email_confirm: false,
       user_metadata: { name }
     });
     if (error) throw error;
 
-    // Sign them in to get a session token
-    const { data: signInData, error: signInErr } = await supabase.auth.signInWithPassword({ email, password });
-    if (signInErr) throw signInErr;
-
-    // Save name to profile
+    // Save name to profile immediately (profile row created by trigger)
     await supabase.from('profiles').update({ name }).eq('id', data.user.id);
 
-    res.json({
-      access_token: signInData.session.access_token,
-      refresh_token: signInData.session.refresh_token,
-      user: { ...signInData.user, email }
-    });
+    // Return success but no session — user must confirm email first
+    res.json({ requires_confirmation: true, email });
   } catch (err) {
     console.error('Signup error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PASSWORD RESET REQUEST ──────────────────────
+app.post('/api/reset-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email required.' });
+
+  try {
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: process.env.FRONTEND_URL + '?reset=true'
+    });
+    // Always return success — don't reveal if email exists or not
+    if (error) console.error('Reset password error:', error.message);
+    res.json({ success: true });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
