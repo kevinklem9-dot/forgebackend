@@ -263,7 +263,7 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
 // ── AI CHAT (with plan editing capability) ─────
 app.post('/api/chat', requireAuth, async (req, res) => {
   try {
-    const { messages, context } = req.body;
+    const { messages, context, language } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'No messages' });
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
@@ -278,7 +278,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       .order('logged_at', { ascending: false })
       .limit(20);
 
-    const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context);
+    const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context, language);
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -442,9 +442,7 @@ function applyPlanUpdate(plan, instruction) {
 // ── POST-WORKOUT CHECK-IN ──────────────────────
 app.post('/api/checkin', requireAuth, async (req, res) => {
   try {
-    const { session_summary, feeling, difficulty, messages } = req.body;
-    // feeling: 'great' | 'ok' | 'tired'
-    // difficulty: 'too_easy' | 'just_right' | 'too_hard'
+    const { session_summary, feeling, difficulty, messages, language } = req.body;
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
       supabase.from('profiles').select('*').eq('id', req.user.id).single(),
@@ -455,7 +453,7 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
       .from('exercise_history').select('*').eq('user_id', req.user.id)
       .order('logged_at', { ascending: false }).limit(10);
 
-    const systemPrompt = buildCheckinPrompt(profile, planData, recentHistory, session_summary, feeling, difficulty);
+    const systemPrompt = buildCheckinPrompt(profile, planData, recentHistory, session_summary, feeling, difficulty, language);
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -841,7 +839,7 @@ The "meals" array is just a fallback — the "weekly_meals" object is what gets 
 Keep total daily macros consistent across all 7 days but vary the actual foods.`;
 }
 
-function buildCoachPrompt(profile, planData, recentHistory, context) {
+function buildCoachPrompt(profile, planData, recentHistory, context, language) {
   const plan = planData?.workout_plan;
   const nutrition = planData?.nutrition_plan;
 
@@ -855,7 +853,12 @@ function buildCoachPrompt(profile, planData, recentHistory, context) {
 
   const contextStr = context ? `\nCURRENT CONTEXT: ${context}` : '';
 
-  return `You are a world-class personal trainer and nutrition coach embedded in the FORGE fitness app. You are coaching a specific client. Be direct, specific, and actionable. No fluff. Use their exact numbers when relevant.${contextStr}
+  const langNames = { en:'English', es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese', nl:'Dutch', ar:'Arabic', zh:'Chinese', ja:'Japanese' };
+  const langStr = language && language !== 'en'
+    ? `\nLANGUAGE: You MUST respond entirely in ${langNames[language] || language}. Every word of your response must be in ${langNames[language] || language}. Do not switch to English under any circumstances.`
+    : '';
+
+  return `You are a world-class personal trainer and nutrition coach embedded in the FORGE fitness app. You are coaching a specific client. Be direct, specific, and actionable. No fluff. Use their exact numbers when relevant.${contextStr}${langStr}
 
 CLIENT PROFILE:
 - Name: ${profile?.name || 'User'}
@@ -935,7 +938,7 @@ RULES:
 - Always confirm what you changed in plain text after the tags`;
 }
 
-function buildCheckinPrompt(profile, planData, recentHistory, sessionSummary, feeling, difficulty) {
+function buildCheckinPrompt(profile, planData, recentHistory, sessionSummary, feeling, difficulty, language) {
   const plan = planData?.workout_plan;
   const nutrition = planData?.nutrition_plan;
 
@@ -947,7 +950,12 @@ function buildCheckinPrompt(profile, planData, recentHistory, sessionSummary, fe
     ? plan.days.map(d => `${d.day_name} (${d.label}): ${d.exercises?.map(e => `${e.name} ${e.sets}×${e.reps}`).join(', ')}`).join('\n')
     : 'Not generated';
 
-  return `You are a world-class personal trainer doing a post-workout check-in with your client. Be warm but direct. Acknowledge how they felt, give specific feedback on their session, and adapt their plan if needed.
+  const langNames = { en:'English', es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese', nl:'Dutch', ar:'Arabic', zh:'Chinese', ja:'Japanese' };
+  const langStr = language && language !== 'en'
+    ? `\nLANGUAGE: You MUST respond entirely in ${langNames[language] || language}. Every word must be in ${langNames[language] || language}.`
+    : '';
+
+  return `You are a world-class personal trainer doing a post-workout check-in with your client. Be warm but direct. Acknowledge how they felt, give specific feedback on their session, and adapt their plan if needed.${langStr}
 
 CLIENT: ${profile?.name || 'User'}, ${profile?.age}yo ${profile?.sex}, Goal: ${profile?.goal}
 
