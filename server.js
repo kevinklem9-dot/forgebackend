@@ -18,7 +18,17 @@ const supabase = createClient(
 
 // ── MIDDLEWARE ─────────────────────────────────
 app.use(cors({
-  origin: process.env.FRONTEND_URL || '*',
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    const allowed = [
+      process.env.FRONTEND_URL,
+      'https://kevinklem9-dot.github.io',
+      'http://localhost:3000',
+      'http://localhost:5173'
+    ].filter(Boolean);
+    if (allowed.some(o => origin.startsWith(o))) return callback(null, true);
+    callback(new Error('Not allowed by CORS'));
+  },
   credentials: true
 }));
 app.use(express.json());
