@@ -51,6 +51,11 @@ function requireAdmin(req, res, next) {
 // ── HEALTH CHECK ───────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', app: 'FORGE' }));
 
+// Public VAPID key — safe to expose, needed by frontend for push subscription
+app.get('/api/vapid-public-key', (req, res) => {
+  res.json({ key: process.env.VAPID_PUBLIC_KEY || '' });
+});
+
 // ── SIGNUP — Check email + create account ──────
 app.post('/api/signup', async (req, res) => {
   const { email, password, name } = req.body;
