@@ -35,13 +35,17 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all preflight requests
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
 
 // Rate limiting — protect against abuse
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
 const chatLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
+const planLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many plan generations — try again in an hour.' } });
+const checkinLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, message: { error: 'Too many check-ins — slow down.' } });
 app.use('/api/', limiter);
 app.use('/api/chat', chatLimiter);
+app.use('/api/generate-plan', planLimiter);
+app.use('/api/checkin', checkinLimiter);
 
 // ── AUTH MIDDLEWARE ────────────────────────────
 async function requireAuth(req, res, next) {
@@ -77,23 +81,19 @@ app.post('/api/signup', async (req, res) => {
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
 
   try {
-    // Check if email already exists
-    const { data: { users }, error: listErr } = await supabase.auth.admin.listUsers();
-    if (listErr) throw listErr;
-
-    const exists = users.some(u => u.email?.toLowerCase() === email.toLowerCase());
-    if (exists) {
-      return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
-    }
-
-    // Create account — email_confirm: false so Supabase sends confirmation email
+    // Create account — Supabase enforces unique email constraint
     const { data, error } = await supabase.auth.admin.createUser({
       email,
       password,
       email_confirm: false,
       user_metadata: { name }
     });
-    if (error) throw error;
+    if (error) {
+      if (error.message?.toLowerCase().includes('already') || error.message?.toLowerCase().includes('duplicate') || error.code === 'email_exists') {
+        return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
+      }
+      throw error;
+    }
 
     // Save name to profile immediately (profile row created by trigger)
     await supabase.from('profiles').update({ name }).eq('id', data.user.id);
@@ -288,7 +288,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
       supabase.from('profiles').select('*').eq('id', req.user.id).single(),
-      supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single()
+      supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
     const { data: recentHistory } = await supabase
@@ -466,7 +466,7 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
       supabase.from('profiles').select('*').eq('id', req.user.id).single(),
-      supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single()
+      supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
     const { data: recentHistory } = await supabase
@@ -514,6 +514,17 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
 app.post('/api/log', requireAuth, async (req, res) => {
   try {
     const { day_index, day_label, exercises } = req.body;
+    // Input validation
+    if (!Array.isArray(exercises) || exercises.length === 0) return res.status(400).json({ error: 'No exercises provided' });
+    if (exercises.length > 30) return res.status(400).json({ error: 'Too many exercises' });
+    for (const ex of exercises) {
+      const sets = ex.sets_data || [];
+      for (const s of sets) {
+        if (s.weight < 0 || s.weight > 1000) return res.status(400).json({ error: 'Invalid weight value' });
+        if (s.reps < 0 || s.reps > 200) return res.status(400).json({ error: 'Invalid reps value' });
+      }
+      if (sets.length > 20) return res.status(400).json({ error: 'Too many sets' });
+    }
     const today = new Date().toISOString().split('T')[0];
 
     // Save session log — delete today's existing log first then insert fresh
@@ -1200,6 +1211,14 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
       supabase.from('personal_records').delete().eq('user_id', userId),
       supabase.from('bodyweight_log').delete().eq('user_id', userId),
       supabase.from('plans').delete().eq('user_id', userId),
+      supabase.from('chat_conversations').delete().eq('user_id', userId),
+      supabase.from('push_subscriptions').delete().eq('user_id', userId),
+      supabase.from('streaks').delete().eq('user_id', userId),
+      supabase.from('user_stats').delete().eq('user_id', userId),
+      supabase.from('weekly_reviews').delete().eq('user_id', userId),
+      supabase.from('body_metrics').delete().eq('user_id', userId),
+      supabase.from('deload_flags').delete().eq('user_id', userId),
+      supabase.from('onboarding_missions').delete().eq('user_id', userId),
     ]);
 
     // Delete profile row
