@@ -45,7 +45,8 @@ async function generateWeeklyReviews() {
         .from('profiles')
         .select('goal, experience, name')
         .eq('id', userId)
-        .single();
+        .maybeSingle();
+      if (!profile) { console.log(`No profile for ${userId}, skipping`); continue; }
 
       const { data: plan } = await supabase
         .from('plans')
@@ -53,14 +54,14 @@ async function generateWeeklyReviews() {
         .eq('user_id', userId)
         .order('generated_at', { ascending: false })
         .limit(1)
-        .single();
+        .maybeSingle();
 
       // Get streak
       const { data: streak } = await supabase
         .from('streaks')
         .select('current_streak')
         .eq('user_id', userId)
-        .single();
+        .maybeSingle();
 
       const totalVolume = (sessions || []).reduce((sum, s) => {
         const exVol = (s.exercises || []).reduce((v, e) => v + (e.vol || 0), 0);
@@ -160,7 +161,7 @@ async function sendPushReminders() {
         .from('streaks')
         .select('current_streak')
         .eq('user_id', sub.user_id)
-        .single();
+        .maybeSingle();
 
       const streakCount = streak?.current_streak || 0;
       let message = "Time to train. Your future self will thank you.";

@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 const Anthropic = require('@anthropic-ai/sdk').default;
 const { createClient } = require('@supabase/supabase-js');
 
@@ -33,6 +34,7 @@ const corsOptions = {
   methods: ['GET','POST','PUT','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization']
 };
+app.use(helmet({ contentSecurityPolicy: false })); // Security headers
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all preflight requests
 app.use(express.json({ limit: '100kb' }));
@@ -42,6 +44,8 @@ const limiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
 const chatLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 const planLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many plan generations — try again in an hour.' } });
 const checkinLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, message: { error: 'Too many check-ins — slow down.' } });
+const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, message: { error: 'Too many signups — try again later.' } });
+const resetLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many reset attempts — try again later.' } });
 app.use('/api/', limiter);
 app.use('/api/chat', chatLimiter);
 app.use('/api/generate-plan', planLimiter);
@@ -53,7 +57,10 @@ async function requireAuth(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Unauthorised' });
 
   const { data: { user }, error } = await supabase.auth.getUser(token);
-  if (error || !user) return res.status(401).json({ error: 'Invalid token' });
+  if (error || !user) {
+    console.warn(`Auth failed: ${req.ip} — ${error?.message || 'invalid token'}`);
+    return res.status(401).json({ error: 'Invalid token' });
+  }
 
   req.user = user; // user.email is available here directly
   next();
@@ -75,9 +82,10 @@ app.get('/api/vapid-public-key', (req, res) => {
 });
 
 // ── SIGNUP — Check email + create account ──────
-app.post('/api/signup', async (req, res) => {
+app.post('/api/signup', signupLimiter, async (req, res) => {
   const { email, password, name } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'All fields required.' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address.' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
 
   try {
@@ -107,7 +115,7 @@ app.post('/api/signup', async (req, res) => {
 });
 
 // ── PASSWORD RESET REQUEST ──────────────────────
-app.post('/api/reset-password', async (req, res) => {
+app.post('/api/reset-password', resetLimiter, async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email required.' });
 
@@ -130,7 +138,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       .from('profiles')
       .select('*')
       .eq('id', req.user.id)
-      .single();
+      .maybeSingle();
 
     if (profileErr || !profile) {
       console.error('Profile fetch error:', profileErr?.message);
@@ -192,7 +200,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       .from('plans')
       .insert({ user_id: req.user.id, workout_plan: plan.workout, nutrition_plan: plan.nutrition })
       .select()
-      .single();
+      .maybeSingle();
 
     if (error) {
       console.error('DB insert error:', error.message);
@@ -236,7 +244,7 @@ app.get('/api/profile', requireAuth, async (req, res) => {
       .from('profiles')
       .select('*')
       .eq('id', req.user.id)
-      .single();
+      .maybeSingle();
 
     if (error) throw error;
     res.json({ profile: data });
@@ -260,14 +268,14 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
       .update(update)
       .eq('id', req.user.id)
       .select()
-      .single();
+      .maybeSingle();
 
     if (error) {
       // If error is about missing column (preferred_days not migrated yet), retry without it
       if (error.message?.includes('preferred_days')) {
         delete update.preferred_days;
         const { data: data2, error: err2 } = await supabase
-          .from('profiles').update(update).eq('id', req.user.id).select().single();
+          .from('profiles').update(update).eq('id', req.user.id).select().maybeSingle();
         if (err2) throw err2;
         return res.json({ profile: data2 });
       }
@@ -285,9 +293,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   try {
     const { messages, context, language } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'No messages' });
+    // Cap message content length to prevent abuse
+    const sanitised = messages.slice(-20).map(m => ({ ...m, content: String(m.content || '').slice(0, 2000) }));
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', req.user.id).single(),
+      supabase.from('profiles').select('*').eq('id', req.user.id).maybeSingle(),
       supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
@@ -304,7 +314,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       model: 'claude-sonnet-4-20250514',
       max_tokens: 6000,
       system: systemPrompt,
-      messages
+      messages: sanitised
     });
 
     const rawReply = response.content[0].text;
@@ -318,7 +328,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       // Fetch the absolute latest plan from DB (not from earlier Promise.all)
       const { data: freshPlan } = await supabase
         .from('plans').select('*').eq('user_id', req.user.id)
-        .order('generated_at', { ascending: false }).limit(1).single();
+        .order('generated_at', { ascending: false }).limit(1).maybeSingle();
 
       const currentPlan = {
         workout: freshPlan?.workout_plan || planData.workout_plan,
@@ -446,8 +456,8 @@ function applyPlanUpdate(plan, instruction) {
       Object.entries(finalPositions).forEach(([idx, label]) => {
         const day = labelToDay[label];
         if (day) {
-          day.day_index = parseInt(idx);
-          day.day_name = dayNames[parseInt(idx)] || day.day_name;
+          day.day_index = parseInt(idx, 10);
+          day.day_name = dayNames[parseInt(idx, 10)] || day.day_name;
         }
       });
 
@@ -465,7 +475,7 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
     const { session_summary, feeling, difficulty, messages, language } = req.body;
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', req.user.id).single(),
+      supabase.from('profiles').select('*').eq('id', req.user.id).maybeSingle(),
       supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
@@ -581,7 +591,7 @@ app.post('/api/log', requireAuth, async (req, res) => {
         .select('*')
         .eq('user_id', req.user.id)
         .eq('exercise_name', ex.name)
-        .single();
+        .maybeSingle();
 
       if (!existingPR || est1rm > (existingPR.est_1rm || 0)) {
         await supabase.from('personal_records').upsert({
@@ -1046,7 +1056,7 @@ app.get('/api/conversations/:id', requireAuth, async (req, res) => {
       .select('*')
       .eq('id', req.params.id)
       .eq('user_id', req.user.id)
-      .single();
+      .maybeSingle();
 
     if (error) throw error;
     res.json({ conversation: data });
@@ -1058,7 +1068,7 @@ app.get('/api/conversations/:id', requireAuth, async (req, res) => {
 // ── VIEW RAW PLAN DAYS (for debugging) ────────
 app.get('/api/plan/days', requireAuth, async (req, res) => {
   try {
-    const { data } = await supabase.from('plans').select('workout_plan').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single();
+    const { data } = await supabase.from('plans').select('workout_plan').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle();
     const days = data?.workout_plan?.days?.map(d => ({
       day_index: d.day_index,
       day_name: d.day_name,
@@ -1074,7 +1084,7 @@ app.get('/api/plan/days', requireAuth, async (req, res) => {
 // ── REPAIR PLAN DAYS (fix corrupted day_index values) ──
 app.post('/api/plan/repair-days', requireAuth, async (req, res) => {
   try {
-    const { data: planData } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single();
+    const { data: planData } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle();
     if (!planData) return res.status(404).json({ error: 'No plan found' });
 
     const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
@@ -1117,7 +1127,7 @@ app.post('/api/conversations', requireAuth, async (req, res) => {
         .eq('id', id)
         .eq('user_id', req.user.id)
         .select()
-        .single();
+        .maybeSingle();
 
       if (error) throw error;
       res.json({ conversation: data });
@@ -1127,7 +1137,7 @@ app.post('/api/conversations', requireAuth, async (req, res) => {
         .from('chat_conversations')
         .insert({ user_id: req.user.id, title, messages })
         .select()
-        .single();
+        .maybeSingle();
 
       if (error) throw error;
       res.json({ conversation: data });
@@ -1244,6 +1254,6 @@ app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 
 // ── DEBUG — View raw plan (admin only) ────────
 app.get('/api/debug/plan', requireAuth, requireAdmin, async (req, res) => {
-  const { data } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).single();
+  const { data } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle();
   res.json(data);
 });
