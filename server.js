@@ -139,7 +139,8 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     console.log('Generating plan for:', profile.name, '| goal:', profile.goal, '| injuries:', profile.injuries);
 
-    const prompt = buildPlanPrompt(profile);
+    const language = req.body?.language || 'en';
+    const prompt = buildPlanPrompt(profile, language);
 
     // Try up to 2 times in case of JSON parse failure
     let plan = null;
@@ -767,7 +768,9 @@ app.get('/api/bodyweight', requireAuth, async (req, res) => {
 });
 
 // ── PROMPT BUILDERS ────────────────────────────
-function buildPlanPrompt(profile) {
+function buildPlanPrompt(profile, language) {
+  const langNames = {en:'English',es:'Spanish',fr:'French',de:'German',it:'Italian',pt:'Portuguese',nl:'Dutch',uk:'Ukrainian',fi:'Finnish',ar:'Arabic',zh:'Chinese',ja:'Japanese'};
+  const langName = (language && language !== 'en') ? (langNames[language] || 'English') : 'English';
   // Sanitise all string fields to prevent JSON issues
   const safe = (v, fallback = 'not specified') => String(v || fallback).replace(/["""'']/g, '').substring(0, 200).trim();
 
@@ -789,8 +792,9 @@ PROFILE:
 CRITICAL INSTRUCTIONS:
 1. Respond ONLY with a single valid JSON object. No text before or after it.
 2. Do NOT use special characters like dashes (use to instead), smart quotes, or em dashes inside string values.
-3. Every string value must use only standard ASCII characters.
+3. Every string value must use only standard ASCII or characters native to the target language.
 4. The JSON must be complete and valid - do not truncate it.
+5. LANGUAGE: Write ALL human-readable text (exercise names, notes, meal names, food names, strategy, split names, labels, day names) in ${langName}. Keep units (kg, g, kcal, min, AM, PM) standard.
 
 Use EXACTLY this JSON structure:
 {
