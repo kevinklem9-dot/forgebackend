@@ -362,9 +362,10 @@ Give 2-3 sentences of specific, actionable insight. No fluff.`;
         .eq('user_id', req.user.id)
         .eq('mission_key', key)
         .select()
-        .single();
+        .maybeSingle();
 
       if (error) throw error;
+      if (!data) return res.json({ mission: null, score: 0 }); // mission row doesn't exist yet
 
       // Update onboarding score on profile
       const { data: missions } = await supabase
