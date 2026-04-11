@@ -202,7 +202,7 @@ module.exports = function (supabase, anthropic) {
         logged_at: today,
         weight_kg, body_fat_pct, chest_cm, waist_cm,
         hips_cm, arm_cm, thigh_cm, notes
-      }).select().single();
+      }).select().maybeSingle();
 
       if (error) throw error;
       res.json({ metric: data });
@@ -240,7 +240,7 @@ module.exports = function (supabase, anthropic) {
         .from('profiles')
         .select('goal, name')
         .eq('id', req.user.id)
-        .single();
+        .maybeSingle();
 
       if (!metrics?.length) return res.json({ insights: 'Log some body metrics first to get insights.' });
 
