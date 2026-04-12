@@ -1331,6 +1331,34 @@ app.delete('/api/conversations/:id', requireAuth, async (req, res) => {
   }
 });
 
+
+// ── SUBSCRIPTION — Get current status ─────────────────
+app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => {
+  try {
+    const { tier, accessTier, status, isExempt, trialEndsAt } = req.subscription;
+
+    let trialDaysLeft = 0;
+    if (status === 'trial' && trialEndsAt) {
+      trialDaysLeft = Math.max(0, Math.ceil((new Date(trialEndsAt) - new Date()) / (1000 * 60 * 60 * 24)));
+    }
+
+    const coachUsage = await getCoachUsage(req.user.id);
+
+    res.json({
+      tier,
+      accessTier,
+      status,
+      isExempt,
+      trialDaysLeft,
+      coachUsage,
+      coachLimit: 20,
+      hasUnlimitedCoach: hasAccess('unlimited_coach', accessTier, isExempt),
+    });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── ADMIN — Get all users ──────────────────────────────
 app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   try {
