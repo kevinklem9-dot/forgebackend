@@ -976,7 +976,11 @@ PROFILE:
 - Equipment: ${safe(profile.equipment, 'full_gym')}
 - Diet style: ${safe(profile.diet_style, 'anything')}
 - Diet restrictions: ${safe(profile.diet_restrictions, 'none')}
-- Injuries or limitations: ${safe(profile.injuries, 'none')}
+- Injuries or limitations: ${safe(profile.injuries, 'none')}${
+  profile.injuries && profile.injuries.toLowerCase().includes('sport:')
+  ? `\n\nSPORT PERFORMANCE CONTEXT:\nThis athlete plays a sport. Build their gym programme to COMPLEMENT their sport training — not compete with it.\n- Avoid heavy gym sessions on sport training days\n- Prioritise: strength, power, injury prevention, and sport-specific physical qualities\n- Their sport details are embedded in the injuries/notes field above — extract and use them\n- If they have an upcoming competition, periodise accordingly`
+  : ''
+}
 
 CRITICAL INSTRUCTIONS:
 1. Respond ONLY with a single valid JSON object. No text before or after it.
