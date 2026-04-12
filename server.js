@@ -109,9 +109,14 @@ async function loadSubscription(req, res, next) {
   try {
     const { data: profile } = await supabase
       .from('profiles')
-      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt')
+      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt, is_frozen')
       .eq('id', req.user.id)
       .maybeSingle();
+
+    // Block frozen accounts from accessing the API
+    if (profile?.is_frozen) {
+      return res.status(403).json({ error: 'account_frozen', message: 'Your account has been suspended. Contact support.' });
+    }
 
     const tier = profile?.is_exempt ? 'forge' : (profile?.subscription_tier || 'iron');
     const status = profile?.subscription_status || 'trial';
@@ -1415,6 +1420,24 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     res.json({ users });
   } catch (err) {
     console.error('Admin users error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ADMIN — Freeze/unfreeze user ───────────────────────
+app.patch('/api/admin/users/:userId/freeze', requireAuth, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
+  const { is_frozen } = req.body;
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ is_frozen: is_frozen === true })
+      .eq('id', userId)
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    res.json({ success: true, profile: data });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
