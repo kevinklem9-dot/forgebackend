@@ -66,11 +66,132 @@ async function requireAuth(req, res, next) {
   next();
 }
 
+
 function requireAdmin(req, res, next) {
   const adminEmail = process.env.ADMIN_EMAIL;
   if (!adminEmail) return res.status(500).json({ error: 'ADMIN_EMAIL not configured' });
   if (req.user?.email !== adminEmail) return res.status(403).json({ error: 'Forbidden' });
   next();
+}
+
+
+// ── SUBSCRIPTION HELPERS ───────────────────────
+const TIER_RANK = { iron: 0, steel: 1, forge: 2 };
+
+const TIER_FEATURES = {
+  unlimited_coach:    ['steel', 'forge'],
+  weekly_review:      ['steel', 'forge'],
+  checkin:            ['steel', 'forge'],
+  overload_tracker:   ['steel', 'forge'],
+  body_metrics:       ['steel', 'forge'],
+  plan_editing:       ['steel', 'forge'],
+  deload:             ['steel', 'forge'],
+  shopping_list:      ['steel', 'forge'],
+  multiple_programmes:['steel', 'forge'],
+  export_history:     ['steel', 'forge'],
+  video_demos:        ['forge'],
+  barcode_scanner:    ['forge'],
+  wearable_sync:      ['forge'],
+  monthly_review:     ['forge'],
+  priority_support:   ['forge'],
+  early_access:       ['forge'],
+};
+
+function hasAccess(feature, tier, isExempt) {
+  if (isExempt) return true;
+  const allowed = TIER_FEATURES[feature];
+  if (!allowed) return true; // unknown feature = open
+  return allowed.includes(tier || 'iron');
+}
+
+// Load subscription info onto req.subscription
+async function loadSubscription(req, res, next) {
+  try {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt')
+      .eq('id', req.user.id)
+      .maybeSingle();
+
+    const tier = profile?.is_exempt ? 'forge' : (profile?.subscription_tier || 'iron');
+    const status = profile?.subscription_status || 'trial';
+    const isExempt = profile?.is_exempt || false;
+
+    // Check trial expiry
+    let effectiveTier = tier;
+    let effectiveStatus = status;
+    if (status === 'trial' && profile?.trial_ends_at) {
+      const trialEnd = new Date(profile.trial_ends_at);
+      if (trialEnd < new Date()) {
+        effectiveTier = 'iron';
+        effectiveStatus = 'expired';
+        // Update DB asynchronously
+        supabase.from('profiles')
+          .update({ subscription_status: 'expired' })
+          .eq('id', req.user.id)
+          .then(() => {});
+      }
+    }
+
+    // During trial, full access regardless of tier
+    const accessTier = (effectiveStatus === 'trial' && !isExempt) ? 'forge' : effectiveTier;
+
+    req.subscription = {
+      tier: effectiveTier,
+      accessTier,
+      status: effectiveStatus,
+      isExempt,
+      trialEndsAt: profile?.trial_ends_at || null,
+    };
+    next();
+  } catch(e) {
+    // Don't block request on subscription load failure
+    req.subscription = { tier: 'iron', accessTier: 'iron', status: 'active', isExempt: false };
+    next();
+  }
+}
+
+// ── BILLING MONTH ─────────────────────────────────
+function billingMonth() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+// ── COACH MESSAGE TRACKING ────────────────────────
+async function getCoachUsage(userId) {
+  const month = billingMonth();
+  const { data } = await supabase
+    .from('ai_coach_usage')
+    .select('message_count')
+    .eq('user_id', userId)
+    .eq('month', month)
+    .maybeSingle();
+  return data?.message_count || 0;
+}
+
+async function incrementCoachUsage(userId) {
+  const month = billingMonth();
+  await supabase.from('ai_coach_usage').upsert({
+    user_id: userId,
+    month,
+    message_count: 1,
+    updated_at: new Date().toISOString()
+  }, {
+    onConflict: 'user_id,month',
+    ignoreDuplicates: false
+  });
+  // Increment via RPC or re-fetch and update
+  const { data } = await supabase
+    .from('ai_coach_usage')
+    .select('id, message_count')
+    .eq('user_id', userId)
+    .eq('month', month)
+    .maybeSingle();
+  if (data) {
+    await supabase.from('ai_coach_usage')
+      .update({ message_count: (data.message_count || 0) + 1, updated_at: new Date().toISOString() })
+      .eq('id', data.id);
+  }
 }
 
 // ── HEALTH CHECK ───────────────────────────────
@@ -103,8 +224,14 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       throw error;
     }
 
-    // Save name to profile immediately (profile row created by trigger)
-    await supabase.from('profiles').update({ name }).eq('id', data.user.id);
+    // Save name to profile + set 7-day trial (profile row created by trigger)
+    const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    await supabase.from('profiles').update({
+      name,
+      subscription_tier: 'iron',
+      subscription_status: 'trial',
+      trial_ends_at: trialEndsAt
+    }).eq('id', data.user.id);
 
     // Return success but no session — user must confirm email first
     res.json({ requires_confirmation: true, email });
@@ -207,6 +334,16 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       throw error;
     }
 
+    // Also save to programmes table (deactivate existing, add new active one)
+    const planName = `${profile?.goal || 'My'} Plan — ${new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
+    await supabase.from('programmes').update({ is_active: false }).eq('user_id', req.user.id);
+    await supabase.from('programmes').insert({
+      user_id: req.user.id,
+      name: planName,
+      plan_data: { workout: plan.workout, nutrition: plan.nutrition },
+      is_active: true
+    });
+
     // Mark onboarding complete
     await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
 
@@ -289,10 +426,25 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
 });
 
 // ── AI CHAT (with plan editing capability) ─────
-app.post('/api/chat', requireAuth, async (req, res) => {
+app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
   try {
     const { messages, context, language } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'No messages' });
+
+    // Check Iron message limit (20/month)
+    const { accessTier, isExempt } = req.subscription;
+    if (!hasAccess('unlimited_coach', accessTier, isExempt)) {
+      const usage = await getCoachUsage(req.user.id);
+      if (usage >= 20) {
+        return res.status(403).json({
+          error: 'message_limit_reached',
+          message: 'You have used all 20 AI coach messages this month. Upgrade to Steel for unlimited coaching.',
+          usage,
+          limit: 20
+        });
+      }
+    }
+
     // Cap message content length to prevent abuse
     const sanitised = messages.slice(-20).map(m => ({ ...m, content: String(m.content || '').slice(0, 2000) }));
 
@@ -357,6 +509,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           })
           .eq('id', (freshPlan || planData).id);
       }
+    }
+
+    // Track usage for Iron users
+    if (!hasAccess('unlimited_coach', req.subscription?.accessTier, req.subscription?.isExempt)) {
+      incrementCoachUsage(req.user.id).catch(() => {});
     }
 
     res.json({ reply: cleanReply, plan_update: planUpdate });
@@ -511,6 +668,11 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
       } catch(e) {
         console.error('Checkin plan update error:', e.message);
       }
+    }
+
+    // Track usage for Iron users
+    if (!hasAccess('unlimited_coach', req.subscription?.accessTier, req.subscription?.isExempt)) {
+      incrementCoachUsage(req.user.id).catch(() => {});
     }
 
     res.json({ reply: cleanReply, plan_update: planUpdate });
@@ -1229,6 +1391,9 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
       supabase.from('body_metrics').delete().eq('user_id', userId),
       supabase.from('deload_flags').delete().eq('user_id', userId),
       supabase.from('onboarding_missions').delete().eq('user_id', userId),
+      supabase.from('ai_coach_usage').delete().eq('user_id', userId),
+      supabase.from('programmes').delete().eq('user_id', userId),
+      supabase.from('monthly_reviews').delete().eq('user_id', userId),
     ]);
 
     // Delete profile row
@@ -1241,6 +1406,207 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
     res.json({ success: true });
   } catch (err) {
     console.error('Delete user error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ── ADMIN — Set user tier ──────────────────────
+app.patch('/api/admin/users/:userId/tier', requireAuth, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
+  const { tier, is_exempt } = req.body;
+
+  const validTiers = ['iron', 'steel', 'forge'];
+  if (tier && !validTiers.includes(tier)) {
+    return res.status(400).json({ error: 'Invalid tier. Must be iron, steel, or forge.' });
+  }
+
+  try {
+    const updates = {};
+    if (tier !== undefined) {
+      updates.subscription_tier = tier;
+      updates.subscription_status = 'active';
+    }
+    if (is_exempt !== undefined) updates.is_exempt = is_exempt;
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .update(updates)
+      .eq('id', userId)
+      .select()
+      .maybeSingle();
+
+    if (error) throw error;
+    res.json({ success: true, profile: data });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ── PROGRAMMES — Multiple saved plans ─────────
+app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('programmes')
+      .select('id, name, created_at, is_active')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ programmes: data || [] });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
+  try {
+    const { name, plan_data } = req.body;
+    if (!plan_data) return res.status(400).json({ error: 'No plan data provided' });
+
+    // Check programme limit for Iron users
+    const { accessTier, isExempt } = req.subscription;
+    if (!hasAccess('multiple_programmes', accessTier, isExempt)) {
+      const { count } = await supabase
+        .from('programmes')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', req.user.id);
+      if (count >= 1) {
+        return res.status(403).json({
+          error: 'programme_limit_reached',
+          message: 'Multiple programmes unlock on Steel. Upgrade to save more than one programme.'
+        });
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('programmes')
+      .insert({ user_id: req.user.id, name: name || 'My Programme', plan_data, is_active: false })
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    res.json({ programme: data });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/programmes/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, is_active } = req.body;
+
+    if (is_active) {
+      // Deactivate all other programmes first
+      await supabase.from('programmes')
+        .update({ is_active: false })
+        .eq('user_id', req.user.id);
+    }
+
+    const { data, error } = await supabase
+      .from('programmes')
+      .update({ ...(name && { name }), ...(is_active !== undefined && { is_active }) })
+      .eq('id', id)
+      .eq('user_id', req.user.id)
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    res.json({ programme: data });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/programmes/:id', requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('programmes')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ── EXPORT — Workout history CSV ──────────────
+app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) => {
+  try {
+    const { accessTier, isExempt } = req.subscription;
+    if (!hasAccess('export_history', accessTier, isExempt)) {
+      return res.status(403).json({
+        error: 'feature_locked',
+        message: 'Workout history export is available on Steel and Forge plans.'
+      });
+    }
+
+    const { data: sessions, error } = await supabase
+      .from('session_logs')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('logged_at', { ascending: false });
+
+    if (error) throw error;
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('name')
+      .eq('id', req.user.id)
+      .maybeSingle();
+
+    // Build CSV
+    const rows = ['Date,Exercise,Set,Weight (kg),Reps,Session Rating,Session Difficulty'];
+    for (const session of sessions || []) {
+      const date = session.logged_at?.split('T')[0] || '';
+      const rating = session.feeling || '';
+      const difficulty = session.difficulty || '';
+      const exercises = session.exercises || [];
+      for (const ex of exercises) {
+        const sets = ex.sets_data || [];
+        if (sets.length === 0) {
+          rows.push(`${date},"${ex.name}",—,—,—,${rating},${difficulty}`);
+        } else {
+          sets.forEach((s, i) => {
+            rows.push(`${date},"${ex.name}",${i + 1},${s.weight || 0},${s.reps || 0},${rating},${difficulty}`);
+          });
+        }
+      }
+    }
+
+    const csv = rows.join('\n');
+    const filename = `FORGE_History_${profile?.name || 'User'}_${new Date().toISOString().split('T')[0]}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ── MONTHLY REVIEW — Latest ────────────────────
+app.get('/api/monthly-review/latest', requireAuth, loadSubscription, async (req, res) => {
+  try {
+    const { accessTier, isExempt } = req.subscription;
+    if (!hasAccess('monthly_review', accessTier, isExempt)) {
+      return res.status(403).json({ error: 'feature_locked', message: 'Monthly reviews are available on the Forge plan.' });
+    }
+
+    const month = billingMonth();
+    const { data } = await supabase
+      .from('monthly_reviews')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('generated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    res.json({ review: data || null });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
