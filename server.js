@@ -216,30 +216,47 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
 
   try {
-    // Create account — Supabase enforces unique email constraint
-    const { data, error } = await supabase.auth.admin.createUser({
+    // Use signUp (not admin.createUser) so Supabase sends confirmation email automatically
+    // This respects the "Enable email confirmations" setting in the Supabase dashboard
+    const supabaseAnon = require('@supabase/supabase-js').createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_ANON_KEY
+    );
+
+    const { data, error } = await supabaseAnon.auth.signUp({
       email,
       password,
-      email_confirm: false,
-      user_metadata: { name }
+      options: {
+        data: { name },
+        emailRedirectTo: process.env.FRONTEND_URL
+      }
     });
+
     if (error) {
-      if (error.message?.toLowerCase().includes('already') || error.message?.toLowerCase().includes('duplicate') || error.code === 'email_exists') {
+      if (error.message?.toLowerCase().includes('already') || error.message?.toLowerCase().includes('duplicate') || error.code === 'email_exists' || error.message?.toLowerCase().includes('registered')) {
         return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
       }
       throw error;
     }
 
-    // Save name to profile + set 7-day trial (profile row created by trigger)
-    const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-    await supabase.from('profiles').update({
-      name,
-      subscription_tier: 'iron',
-      subscription_status: 'trial',
-      trial_ends_at: trialEndsAt
-    }).eq('id', data.user.id);
+    // If user already exists and is confirmed, Supabase returns a user with no identities
+    if (data.user && data.user.identities && data.user.identities.length === 0) {
+      return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
+    }
 
-    // Return success but no session — user must confirm email first
+    // Save name to profile + set 7-day trial (profile row created by trigger)
+    // Use admin client here since the user isn't authenticated yet
+    if (data.user?.id) {
+      const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      await supabase.from('profiles').update({
+        name,
+        subscription_tier: 'iron',
+        subscription_status: 'trial',
+        trial_ends_at: trialEndsAt
+      }).eq('id', data.user.id);
+    }
+
+    // Return success — user must confirm email before logging in
     res.json({ requires_confirmation: true, email });
   } catch (err) {
     console.error('Signup error:', err);
