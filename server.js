@@ -117,6 +117,12 @@ async function loadSubscription(req, res, next) {
     const status = profile?.subscription_status || 'trial';
     const isExempt = profile?.is_exempt || false;
 
+    // If trial but no trial_ends_at set (old account), set it now
+    if (status === 'trial' && !profile?.trial_ends_at && profile?.id) {
+      const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      supabase.from('profiles').update({ trial_ends_at: trialEndsAt }).eq('id', req.user.id).then(() => {});
+    }
+
     // Check trial expiry
     let effectiveTier = tier;
     let effectiveStatus = status;
