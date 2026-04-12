@@ -62,7 +62,24 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Invalid token' });
   }
 
-  req.user = user; // user.email is available here directly
+  req.user = user;
+
+  // Check frozen status on every authenticated request
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('is_frozen, subscription_tier, subscription_status, trial_ends_at, is_exempt')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (profile?.is_frozen) {
+    return res.status(403).json({
+      error: 'account_frozen',
+      message: 'Your account has been suspended. Contact support to resolve this.'
+    });
+  }
+
+  // Cache profile data on request so loadSubscription doesn't need to re-fetch
+  req.profileCache = profile || null;
   next();
 }
 
@@ -107,16 +124,12 @@ function hasAccess(feature, tier, isExempt) {
 // Load subscription info onto req.subscription
 async function loadSubscription(req, res, next) {
   try {
-    const { data: profile } = await supabase
+    // Use cached profile from requireAuth if available, otherwise fetch
+    const profile = req.profileCache || (await supabase
       .from('profiles')
       .select('subscription_tier, subscription_status, trial_ends_at, is_exempt, is_frozen')
       .eq('id', req.user.id)
-      .maybeSingle();
-
-    // Block frozen accounts from accessing the API
-    if (profile?.is_frozen) {
-      return res.status(403).json({ error: 'account_frozen', message: 'Your account has been suspended. Contact support.' });
-    }
+      .maybeSingle()).data;
 
     const tier = profile?.is_exempt ? 'forge' : (profile?.subscription_tier || 'iron');
     const status = profile?.subscription_status || 'trial';
@@ -1436,6 +1449,12 @@ app.patch('/api/admin/users/:userId/freeze', requireAuth, requireAdmin, async (r
       .select()
       .maybeSingle();
     if (error) throw error;
+
+    // If freezing, sign out all sessions for this user immediately
+    if (is_frozen) {
+      await supabase.auth.admin.signOut(userId, 'global').catch(() => {});
+    }
+
     res.json({ success: true, profile: data });
   } catch(err) {
     res.status(500).json({ error: err.message });
