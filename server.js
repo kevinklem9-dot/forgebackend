@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const https = require('https');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
@@ -1774,45 +1775,49 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 
 // ── EXERCISE VIDEO PROXY — fetch and buffer with auth header ──
 // Use wildcard to handle filenames with dots (Express strips .ext from :param by default)
-app.get('/api/exercise/video/*', requireAuth, async (req, res) => {
+app.get('/api/exercise/video/*', requireAuth, (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.status(404).json({ error: 'No API key configured' });
 
-  // Reconstruct full filename from wildcard — handles dots in filename
   const filename = req.params[0];
   if (!filename) return res.status(400).json({ error: 'No filename' });
 
-  // Security: only allow alphanumeric, hyphens, underscores, dots
   if (!/^[a-zA-Z0-9._-]+$/.test(filename)) {
     return res.status(400).json({ error: 'Invalid filename' });
   }
 
-  const videoUrl = 'https://api.musclewiki.com/stream/videos/branded/' + filename;
+  const options = {
+    hostname: 'api.musclewiki.com',
+    path: '/stream/videos/branded/' + filename,
+    method: 'GET',
+    headers: { 'X-API-Key': apiKey }
+  };
 
-  try {
-    const videoRes = await fetch(videoUrl, {
-      headers: { 'X-API-Key': apiKey }
-    });
-
-    if (!videoRes.ok) {
-      console.error('MuscleWiki video fetch failed:', videoRes.status, videoUrl);
-      return res.status(videoRes.status).json({ error: 'Video fetch failed: ' + videoRes.status });
+  const proxyReq = https.request(options, (proxyRes) => {
+    if (proxyRes.statusCode !== 200) {
+      console.error('MuscleWiki video failed:', proxyRes.statusCode, filename);
+      res.status(proxyRes.statusCode).json({ error: 'Video fetch failed: ' + proxyRes.statusCode });
+      proxyRes.resume();
+      return;
     }
 
-    const arrayBuf = await videoRes.arrayBuffer();
-    const buffer = Buffer.from(arrayBuf);
-
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', buffer.length);
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-    res.status(200).end(buffer);
+    if (proxyRes.headers['content-length']) {
+      res.setHeader('Content-Length', proxyRes.headers['content-length']);
+    }
+    res.status(200);
+    proxyRes.pipe(res);
+  });
 
-  } catch(err) {
-    console.error('Video proxy error:', filename, err.message);
-    res.status(500).json({ error: 'Video proxy error: ' + err.message });
-  }
+  proxyReq.on('error', (err) => {
+    console.error('Video proxy request error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  });
+
+  proxyReq.end();
 });
 
 // ── EXERCISE DEBUG — see raw MuscleWiki response ───────
