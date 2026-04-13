@@ -10,6 +10,70 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ── MUSCLEWIKI EXERCISE CACHE ─────────────────────────
+// Fetched once at startup, cached in memory
+let mwExerciseCache = null;
+let mwExerciseCacheTime = 0;
+const MW_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+async function getMuscleWikiExercises() {
+  const now = Date.now();
+  if (mwExerciseCache && (now - mwExerciseCacheTime) < MW_CACHE_TTL) {
+    return mwExerciseCache;
+  }
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const res = await fetch('https://api.musclewiki.com/exercises?limit=2000', {
+      headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const exercises = data?.results || (Array.isArray(data) ? data : []);
+    if (!exercises.length) return null;
+    mwExerciseCache = exercises;
+    mwExerciseCacheTime = now;
+    console.log('MuscleWiki exercise cache loaded:', exercises.length, 'exercises');
+    return exercises;
+  } catch(e) {
+    console.error('MuscleWiki cache error:', e.message);
+    return null;
+  }
+}
+
+// Build exercise name lookup map: lowercase name -> exact name
+function buildExerciseLookup(exercises) {
+  const map = {};
+  for (const ex of exercises) {
+    map[ex.name.toLowerCase().trim()] = ex.name;
+  }
+  return map;
+}
+
+// Find closest MuscleWiki exercise name for a given name
+function findMuscleWikiName(name, exercises) {
+  if (!exercises || !name) return null;
+  const nameLower = name.toLowerCase().trim();
+  // Exact match
+  const exact = exercises.find(e => e.name.toLowerCase() === nameLower);
+  if (exact) return exact.name;
+  // All words present
+  const words = nameLower.split(' ').filter(w => w.length >= 3);
+  const allMatch = exercises.filter(e => {
+    const en = e.name.toLowerCase();
+    return words.every(w => en.includes(w));
+  });
+  if (allMatch.length === 1) return allMatch[0].name;
+  if (allMatch.length > 1) {
+    // Pick shortest name (most specific match)
+    return allMatch.sort((a, b) => a.name.length - b.name.length)[0].name;
+  }
+  return null;
+}
+
+// Pre-warm cache on startup
+getMuscleWikiExercises().catch(() => {});
+
 // ── CLIENTS ────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -317,7 +381,10 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     console.log('Generating plan for:', profile.name, '| goal:', profile.goal, '| injuries:', profile.injuries);
 
     const language = req.body?.language || 'en';
-    const prompt = buildPlanPrompt(profile, language);
+
+    // Fetch MuscleWiki exercise list to inject into prompt
+    const mwExercises = await getMuscleWikiExercises();
+    const prompt = buildPlanPrompt(profile, language, mwExercises);
 
     // Try up to 2 times in case of JSON parse failure
     let plan = null;
@@ -348,6 +415,16 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
         // Validate plan has required fields
         if (!plan.workout?.days?.length) throw new Error('Plan missing workout days');
         if (!plan.nutrition?.meals?.length) throw new Error('Plan missing nutrition meals');
+
+        // Remap all exercise names to exact MuscleWiki names
+        if (mwExercises && plan.workout?.days) {
+          for (const day of plan.workout.days) {
+            for (const ex of (day.exercises || [])) {
+              const mwName = findMuscleWikiName(ex.name, mwExercises);
+              if (mwName) ex.name = mwName;
+            }
+          }
+        }
 
         break; // success
       } catch (err) {
@@ -993,7 +1070,7 @@ app.get('/api/bodyweight', requireAuth, async (req, res) => {
 });
 
 // ── PROMPT BUILDERS ────────────────────────────
-function buildPlanPrompt(profile, language) {
+function buildPlanPrompt(profile, language, mwExercises) {
   const langNames = {en:'English',es:'Spanish',fr:'French',de:'German',it:'Italian',pt:'Portuguese',nl:'Dutch',uk:'Ukrainian',fi:'Finnish',ar:'Arabic',zh:'Chinese',ja:'Japanese'};
   const langName = (language && language !== 'en') ? (langNames[language] || 'English') : 'English';
   // Sanitise all string fields to prevent JSON issues
@@ -1017,6 +1094,14 @@ PROFILE:
   ? `\n\nSPORT PERFORMANCE CONTEXT:\nThis athlete plays a sport. Build their gym programme to COMPLEMENT their sport training — not compete with it.\n- Avoid heavy gym sessions on sport training days\n- Prioritise: strength, power, injury prevention, and sport-specific physical qualities\n- Their sport details are embedded in the injuries/notes field above — extract and use them\n- If they have an upcoming competition, periodise accordingly`
   : ''
 }
+
+${mwExercises ? `EXERCISE DATABASE:
+Use ONLY exercise names from this official list. Pick appropriate ones for the user's equipment and goals.
+${['Barbell','Dumbbell','Cable','Machine','Bodyweight','Kettlebell'].map(cat => {
+  const exs = mwExercises.filter(e => e.category === cat).map(e => e.name).slice(0, 40);
+  return exs.length ? cat + ': ' + exs.join(', ') : '';
+}).filter(Boolean).join('\n')}
+IMPORTANT: Use the exact names from this list. Do not invent exercise names.` : ''}
 
 CRITICAL INSTRUCTIONS:
 1. Respond ONLY with a single valid JSON object. No text before or after it.
@@ -1045,12 +1130,7 @@ Use EXACTLY this JSON structure:
             "rest": "3 min",
             "rpe": 8
           }
-        NOTE ON EXERCISE NAMES: Always prefix each exercise name with the exact equipment type:
-        - Free weights: "Barbell Bench Press", "Dumbbell Lateral Raise", "Dumbbell Romanian Deadlift"
-        - Machines: "Machine Chest Press", "Machine Lat Pulldown", "Cable Tricep Pushdown"
-        - Cables: "Cable Fly", "Cable Row", "Cable Lateral Raise"
-        - Bodyweight: "Bodyweight Dip", "Bodyweight Pull-Up"
-        This prefix is critical for matching exercise form videos. Never omit it.
+
         ]
       }
     ]
@@ -1733,6 +1813,29 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   }
 
   try {
+    // First try in-memory cache for instant exact lookup
+    const cachedExercises = await getMuscleWikiExercises();
+    if (cachedExercises) {
+      const exactMatch = cachedExercises.find(e => e.name.toLowerCase() === name.toLowerCase().trim());
+      if (exactMatch) {
+        const videos = exactMatch.videos || [];
+        const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
+        const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
+        const getFilename = v => v?.url ? v.url.split('/branded/')[1] : null;
+        const slug = exactMatch.name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
+        return res.json({ exercise: {
+          name: exactMatch.name,
+          videoFilename: getFilename(maleFront) || getFilename(videos[0]),
+          videoFilename2: getFilename(maleSide) || null,
+          instructions: exactMatch.steps || [],
+          primaryMuscles: exactMatch.primary_muscles || [],
+          category: exactMatch.category || '',
+          difficulty: exactMatch.difficulty || '',
+          muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
+        }});
+      }
+    }
+
     // Try name variants — never fall back to single words (causes wrong matches)
     let results = [];
     const stripped = name.replace(/^(Barbell|Dumbbell|DB|BB|Cable|Machine|Kettlebell|KB|EZ Bar|EZ-Bar)\s+/i, '');
