@@ -795,9 +795,10 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     const { messages, context, language } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'No messages' });
 
-    // Check Iron message limit (20/month)
-    const { accessTier, isExempt } = req.subscription;
-    if (!hasAccess('unlimited_coach', accessTier, isExempt)) {
+    // Check Iron message limit (20/month) — use actual tier not accessTier
+    const { isExempt } = req.subscription;
+    const checkTier = req.subscription?.tier || 'iron';
+    if (!isExempt && !hasAccess('unlimited_coach', checkTier, false)) {
       const usage = await getCoachUsage(req.user.id);
       if (usage >= 20) {
         return res.status(403).json({
@@ -889,9 +890,12 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
       }
     }
 
-    // Track usage for Iron users
-    if (!hasAccess('unlimited_coach', req.subscription?.accessTier, req.subscription?.isExempt)) {
-      incrementCoachUsage(req.user.id).catch(() => {});
+    // Track usage for Iron tier users — use actual tier not accessTier
+    // accessTier is 'forge' during trial which would skip tracking entirely
+    const actualTier = req.subscription?.tier || 'iron';
+    const isExemptUser = req.subscription?.isExempt || false;
+    if (!isExemptUser && !hasAccess('unlimited_coach', actualTier, false)) {
+      await incrementCoachUsage(req.user.id);
     }
 
     res.json({ reply: cleanReply, plan_update: planUpdate });
@@ -1049,9 +1053,12 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
       }
     }
 
-    // Track usage for Iron users
-    if (!hasAccess('unlimited_coach', req.subscription?.accessTier, req.subscription?.isExempt)) {
-      incrementCoachUsage(req.user.id).catch(() => {});
+    // Track usage for Iron tier users — use actual tier not accessTier
+    // accessTier is 'forge' during trial which would skip tracking entirely
+    const actualTier = req.subscription?.tier || 'iron';
+    const isExemptUser = req.subscription?.isExempt || false;
+    if (!isExemptUser && !hasAccess('unlimited_coach', actualTier, false)) {
+      await incrementCoachUsage(req.user.id);
     }
 
     res.json({ reply: cleanReply, plan_update: planUpdate });
