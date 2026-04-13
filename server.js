@@ -1746,10 +1746,15 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     const nameLower = name.toLowerCase();
     const best = results.find(r => r.name?.toLowerCase() === nameLower) || results[0];
 
-    // Get male front video filename for proxy
+    // Get both male front and side video filenames
     const videos = best.videos || [];
-    const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front') || videos[0];
-    const videoFilename = maleFront?.url ? maleFront.url.split('/branded/')[1] : null;
+    const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
+    const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
+    const fallback  = videos[0];
+
+    const getFilename = v => v?.url ? v.url.split('/branded/')[1] : null;
+    const frontFilename = getFilename(maleFront) || getFilename(fallback);
+    const sideFilename  = getFilename(maleSide);
 
     // Build slug for musclewiki.com page URL
     const slug = best.name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
@@ -1757,7 +1762,8 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     res.json({
       exercise: {
         name: best.name,
-        videoFilename: videoFilename || null,
+        videoFilename: frontFilename || null,
+        videoFilename2: sideFilename || null,
         instructions: best.steps || [],
         primaryMuscles: best.primary_muscles || [],
         secondaryMuscles: [],
