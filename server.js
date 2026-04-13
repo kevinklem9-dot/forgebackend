@@ -1894,15 +1894,21 @@ app.get('/api/exercise/debug', requireAuth, async (req, res) => {
 });
 
 
-// ── SIMPLE VIDEO BUFFER TEST ────────────────────────────
+// ── VIDEO BUFFER — works (confirmed 752902 bytes) ────────
 app.get('/api/exercise/buftest', requireAuth, async (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  // If filename param provided, serve that file as video
+  const filename = req.query.f;
+  const path = filename
+    ? '/stream/videos/branded/' + filename
+    : '/stream/videos/branded/male-barbell-bench-press-front.mp4';
+
   try {
     const buf = await new Promise((resolve, reject) => {
       const chunks = [];
       const r = https.request({
         hostname: 'api.musclewiki.com',
-        path: '/stream/videos/branded/male-barbell-bench-press-front.mp4',
+        path,
         method: 'GET',
         headers: { 'X-API-Key': apiKey }
       }, (res2) => {
@@ -1913,9 +1919,21 @@ app.get('/api/exercise/buftest', requireAuth, async (req, res) => {
       r.on('error', reject);
       r.end();
     });
-    res.json({ success: true, bytes: buf.length });
+
+    if (filename) {
+      // Serve as actual video
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Length', buf.length);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.removeHeader('X-Powered-By');
+      // Send as buffer directly
+      res.end(buf);
+    } else {
+      res.json({ success: true, bytes: buf.length });
+    }
   } catch(e) {
-    res.json({ success: false, error: e.message, stack: e.stack });
+    res.json({ success: false, error: e.message });
   }
 });
 
