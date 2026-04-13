@@ -1847,137 +1847,110 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   const mwSearchUrl = 'https://musclewiki.com/search?q=' + encodeURIComponent(name);
 
+  const buildResponse = (ex) => {
+    const videos = ex.videos || [];
+    const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
+    const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
+    const getFilename = v => v?.url ? v.url.split('/branded/')[1] : null;
+    const slug = (ex.name || name).toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
+    return {
+      name: ex.name || name,
+      videoFilename: getFilename(maleFront) || getFilename(videos[0]) || null,
+      videoFilename2: getFilename(maleSide) || null,
+      instructions: ex.steps || [],
+      primaryMuscles: ex.primary_muscles || [],
+      category: ex.category || '',
+      difficulty: ex.difficulty || '',
+      muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
+    };
+  };
+
+  // ── STEP 1: Check in-memory cache for instant exact match ──
+  const cachedExercises = await getMuscleWikiExercises();
+  if (cachedExercises) {
+    const nameLower = name.toLowerCase().trim();
+
+    // Try exact match first
+    const exact = cachedExercises.find(e => e.name.toLowerCase() === nameLower);
+    if (exact) return res.json({ exercise: buildResponse(exact) });
+
+    // Strip equipment prefix and try again
+    const stripped = nameLower.replace(/^(barbell|dumbbell|cable|machine|kettlebell|ez bar|ez-bar|bodyweight|bw|db|bb|kb)\s+/i, '');
+
+    // Score all exercises by word overlap
+    const words = nameLower.split(' ').filter(w => w.length >= 3);
+    const strippedWords = stripped.split(' ').filter(w => w.length >= 3);
+
+    const scored = cachedExercises.map(e => {
+      const en = e.name.toLowerCase();
+      // Exact stripped match
+      if (en === stripped) return { e, score: 95 };
+      // All full-name words present
+      if (words.length >= 2 && words.every(w => en.includes(w))) return { e, score: 85 };
+      // All stripped words present
+      if (strippedWords.length >= 2 && strippedWords.every(w => en.includes(w))) return { e, score: 75 };
+      // Most words present (>=75%)
+      if (words.length >= 2) {
+        const matchCount = words.filter(w => en.includes(w)).length;
+        const ratio = matchCount / words.length;
+        if (ratio >= 0.75) return { e, score: Math.round(ratio * 65) };
+      }
+      return { e, score: 0 };
+    }).filter(s => s.score > 0).sort((a, b) => b.score - a.score || a.e.name.length - b.e.name.length);
+
+    if (scored.length > 0) {
+      return res.json({ exercise: buildResponse(scored[0].e) });
+    }
+  }
+
+  // ── STEP 2: Fall back to API search if cache miss or no match ──
   if (!apiKey) {
-    return res.json({ exercise: { name, videoUrl: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
+    return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
   }
 
   try {
-    // First try in-memory cache for instant exact lookup
-    const cachedExercises = await getMuscleWikiExercises();
-    if (cachedExercises) {
-      const exactMatch = cachedExercises.find(e => e.name.toLowerCase() === name.toLowerCase().trim());
-      if (exactMatch) {
-        const videos = exactMatch.videos || [];
-        const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
-        const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
-        const getFilename = v => v?.url ? v.url.split('/branded/')[1] : null;
-        const slug = exactMatch.name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
-        return res.json({ exercise: {
-          name: exactMatch.name,
-          videoFilename: getFilename(maleFront) || getFilename(videos[0]),
-          videoFilename2: getFilename(maleSide) || null,
-          instructions: exactMatch.steps || [],
-          primaryMuscles: exactMatch.primary_muscles || [],
-          category: exactMatch.category || '',
-          difficulty: exactMatch.difficulty || '',
-          muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
-        }});
-      }
-    }
+    const stripped2 = name.replace(/^(Barbell|Dumbbell|Cable|Machine|Kettlebell|EZ Bar|EZ-Bar|Bodyweight|DB|BB|KB)\s+/i, '');
+    const attempts = [name, stripped2].filter((v, i, a) => v && v.split(' ').length >= 2 && a.indexOf(v) === i);
 
-    // Try name variants — never fall back to single words (causes wrong matches)
     let results = [];
-    const stripped = name.replace(/^(Barbell|Dumbbell|DB|BB|Cable|Machine|Kettlebell|KB|EZ Bar|EZ-Bar)\s+/i, '');
-    const withDumbbell = stripped !== name ? stripped : 'Dumbbell ' + name;
-    const withCable    = stripped !== name ? stripped : 'Cable ' + name;
-
-    const attempts = [
-      name,            // "Dumbbell Lateral Raise" — exact AI name first
-      withDumbbell,    // "Lateral Raise" or "Dumbbell Lateral Raise"
-      withCable,       // "Cable Lateral Raise" as alternative
-      stripped,        // bare name without any prefix
-    ].filter((v, i, a) => v && v.split(' ').length >= 2 && a.indexOf(v) === i); // minimum 2 words — no single word fallbacks
-
     for (const attempt of attempts) {
-      const searchRes = await fetch(
+      const r = await fetch(
         'https://api.musclewiki.com/search?q=' + encodeURIComponent(attempt) + '&limit=5',
         { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
       );
-      if (!searchRes.ok) continue;
-      const data = await searchRes.json();
-      if (Array.isArray(data) && data.length > 0) {
-        results = data;
-        break;
-      }
+      if (!r.ok) continue;
+      const data = await r.json();
+      if (Array.isArray(data) && data.length > 0) { results = data; break; }
     }
 
     if (!results.length) {
       return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
-    // Score matches — exact name wins, then equipment-aware matching
-    const nameLower = name.toLowerCase().trim();
-    const strippedLower = stripped.toLowerCase().trim();
-
-    const scored = results.map(r => {
-      const rName = (r.name || '').toLowerCase().trim();
-
-      // Exact match — highest priority
-      if (rName === nameLower) return { r, score: 100 };
-
-      // Stripped name exact match (e.g. "Lateral Raise" == "Lateral Raise")
-      if (rName === strippedLower) return { r, score: 90 };
-
-      // All meaningful words from search must be present in result name
-      // "Dumbbell Lateral Raise" words: ["dumbbell","lateral","raise"]
-      // Reject if ANY key word is missing
-      const searchWords = nameLower.split(' ').filter(w => w.length >= 3);
-      const allPresent = searchWords.every(w => rName.includes(w));
-      if (allPresent && searchWords.length >= 2) return { r, score: 85 };
-
-      // Stripped words all present
-      const strippedWords = strippedLower.split(' ').filter(w => w.length >= 3);
-      const strippedAllPresent = strippedWords.every(w => rName.includes(w));
-      if (strippedAllPresent && strippedWords.length >= 2) return { r, score: 75 };
-
-      // Partial — at least 2 key words match AND result name doesn't have extra unrelated words
-      const matchCount = strippedWords.filter(w => rName.includes(w)).length;
-      if (matchCount >= 2 && matchCount >= strippedWords.length * 0.75) {
-        return { r, score: 50 };
-      }
-
+    const nameLower2 = name.toLowerCase().trim();
+    const words2 = nameLower2.split(' ').filter(w => w.length >= 3);
+    const apiScored = results.map(r => {
+      const rn = r.name.toLowerCase();
+      if (rn === nameLower2) return { r, score: 100 };
+      if (words2.length >= 2 && words2.every(w => rn.includes(w))) return { r, score: 85 };
+      const matchCount = words2.filter(w => rn.includes(w)).length;
+      const ratio = words2.length > 0 ? matchCount / words2.length : 0;
+      if (ratio >= 0.75) return { r, score: Math.round(ratio * 65) };
       return { r, score: 0 };
-    }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+    }).filter(s => s.score > 0).sort((a, b) => b.score - a.score || a.r.name.length - b.r.name.length);
 
-    if (!scored.length) {
-      // No confident match — return nothing rather than wrong exercise
+    if (!apiScored.length) {
       return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
-    const best = scored[0].r;
-
-    // Get both male front and side video filenames
-    const videos = best.videos || [];
-    const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
-    const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
-    const fallback  = videos[0];
-
-    const getFilename = v => v?.url ? v.url.split('/branded/')[1] : null;
-    const frontFilename = getFilename(maleFront) || getFilename(fallback);
-    const sideFilename  = getFilename(maleSide);
-
-    // Build slug for musclewiki.com page URL
-    const slug = best.name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
-
-    res.json({
-      exercise: {
-        name: best.name,
-        videoFilename: frontFilename || null,
-        videoFilename2: sideFilename || null,
-        instructions: best.steps || [],
-        primaryMuscles: best.primary_muscles || [],
-        secondaryMuscles: [],
-        category: best.category || '',
-        difficulty: best.difficulty || '',
-        muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
-      }
-    });
+    return res.json({ exercise: buildResponse(apiScored[0].r) });
 
   } catch(err) {
-    console.error('MuscleWiki API error:', err.message);
-    res.json({ exercise: { name, videoUrl: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
+    console.error('Exercise search error:', err.message);
+    res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
   }
 });
+
 
 // ── EXERCISE VIDEO PROXY ────────────────────────────────
 app.get('/api/exercise/video/*', requireAuth, (req, res) => {
@@ -2140,6 +2113,40 @@ app.get('/api/exercise/buftest', requireAuth, async (req, res) => {
     }
   } catch(e) {
     res.json({ success: false, error: e.message });
+  }
+});
+
+
+// ── EXERCISE NAME REMAP — fix existing plans to use MuscleWiki names ──
+app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
+  try {
+    const exercises = await getMuscleWikiExercises();
+    if (!exercises) return res.json({ success: false, error: 'Cache not ready' });
+
+    const { data: planRow } = await supabase
+      .from('plans').select('plan_data').eq('user_id', req.user.id).maybeSingle();
+
+    if (!planRow?.plan_data) return res.json({ success: false, error: 'No plan found' });
+
+    let changed = 0;
+    const plan = planRow.plan_data;
+    for (const day of (plan.workout_plan?.days || [])) {
+      for (const ex of (day.exercises || [])) {
+        const mwName = findMuscleWikiName(ex.name, exercises);
+        if (mwName && mwName !== ex.name) {
+          ex.name = mwName;
+          changed++;
+        }
+      }
+    }
+
+    if (changed > 0) {
+      await supabase.from('plans').update({ plan_data: plan }).eq('user_id', req.user.id);
+    }
+
+    res.json({ success: true, remapped: changed });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
