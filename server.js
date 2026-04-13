@@ -1927,6 +1927,32 @@ app.get('/api/exercise/debug', requireAuth, async (req, res) => {
   }
 });
 
+
+// ── SIMPLE VIDEO BUFFER TEST ────────────────────────────
+app.get('/api/exercise/buftest', requireAuth, async (req, res) => {
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  try {
+    const buf = await new Promise((resolve, reject) => {
+      const chunks = [];
+      const r = https.request({
+        hostname: 'api.musclewiki.com',
+        path: '/stream/videos/branded/male-barbell-bench-press-front.mp4',
+        method: 'GET',
+        headers: { 'X-API-Key': apiKey }
+      }, (res2) => {
+        res2.on('data', c => chunks.push(c));
+        res2.on('end', () => resolve(Buffer.concat(chunks)));
+        res2.on('error', reject);
+      });
+      r.on('error', reject);
+      r.end();
+    });
+    res.json({ success: true, bytes: buf.length });
+  } catch(e) {
+    res.json({ success: false, error: e.message, stack: e.stack });
+  }
+});
+
 app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 
 // ── DEBUG — View raw plan (admin only) ────────
