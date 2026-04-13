@@ -1763,24 +1763,42 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
-    // Score matches — require meaningful word overlap, not just any match
-    const nameLower = name.toLowerCase();
-    const strippedLower = stripped.toLowerCase();
+    // Score matches — exact name wins, then equipment-aware matching
+    const nameLower = name.toLowerCase().trim();
+    const strippedLower = stripped.toLowerCase().trim();
+
     const scored = results.map(r => {
-      const rName = (r.name || '').toLowerCase();
+      const rName = (r.name || '').toLowerCase().trim();
+
+      // Exact match — highest priority
       if (rName === nameLower) return { r, score: 100 };
-      if (rName === strippedLower) return { r, score: 95 };
-      if (rName.includes(strippedLower) && strippedLower.length > 5) return { r, score: 85 };
-      if (strippedLower.includes(rName) && rName.length > 5) return { r, score: 80 };
-      // Word overlap — only count meaningful words (4+ chars), require >50% match
-      const searchWords = strippedLower.split(' ').filter(w => w.length >= 4);
-      const matchCount = searchWords.filter(w => rName.includes(w)).length;
-      const ratio = searchWords.length > 0 ? matchCount / searchWords.length : 0;
-      if (ratio >= 0.5) return { r, score: Math.round(ratio * 70) };
-      return { r, score: 0 }; // No meaningful match
+
+      // Stripped name exact match (e.g. "Lateral Raise" == "Lateral Raise")
+      if (rName === strippedLower) return { r, score: 90 };
+
+      // All meaningful words from search must be present in result name
+      // "Dumbbell Lateral Raise" words: ["dumbbell","lateral","raise"]
+      // Reject if ANY key word is missing
+      const searchWords = nameLower.split(' ').filter(w => w.length >= 3);
+      const allPresent = searchWords.every(w => rName.includes(w));
+      if (allPresent && searchWords.length >= 2) return { r, score: 85 };
+
+      // Stripped words all present
+      const strippedWords = strippedLower.split(' ').filter(w => w.length >= 3);
+      const strippedAllPresent = strippedWords.every(w => rName.includes(w));
+      if (strippedAllPresent && strippedWords.length >= 2) return { r, score: 75 };
+
+      // Partial — at least 2 key words match AND result name doesn't have extra unrelated words
+      const matchCount = strippedWords.filter(w => rName.includes(w)).length;
+      if (matchCount >= 2 && matchCount >= strippedWords.length * 0.75) {
+        return { r, score: 50 };
+      }
+
+      return { r, score: 0 };
     }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
 
     if (!scored.length) {
+      // No confident match — return nothing rather than wrong exercise
       return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
