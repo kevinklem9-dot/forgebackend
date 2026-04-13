@@ -1727,24 +1727,43 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   }
 
   try {
-    const searchRes = await fetch(
-      'https://api.musclewiki.com/search?q=' + encodeURIComponent(name) + '&limit=5',
-      { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
-    );
+    // Try full name first, then key words if no exact match
+    let results = [];
+    const attempts = [
+      name,                                                          // "Dumbbell Lateral Raise"
+      name.replace(/^(Barbell|Dumbbell|DB|BB|Cable|Machine|Kettlebell|KB|EZ)\s+/i, ''), // "Lateral Raise"
+      name.split(' ').slice(-2).join(' '),                          // last 2 words
+    ].filter((v, i, a) => v && a.indexOf(v) === i);
 
-    if (!searchRes.ok) {
-      console.error('MuscleWiki search failed:', searchRes.status);
-      return res.json({ exercise: { name, videoUrl: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
+    for (const attempt of attempts) {
+      const searchRes = await fetch(
+        'https://api.musclewiki.com/search?q=' + encodeURIComponent(attempt) + '&limit=5',
+        { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
+      );
+      if (!searchRes.ok) continue;
+      const data = await searchRes.json();
+      if (Array.isArray(data) && data.length > 0) {
+        results = data;
+        break;
+      }
     }
 
-    const results = await searchRes.json();
-    if (!Array.isArray(results) || !results.length) {
-      return res.json({ exercise: { name, videoUrl: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
+    if (!results.length) {
+      return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
-    // Pick best match — exact name first, then first result
+    // Score matches — prefer exact name, then name contains original, then first result
     const nameLower = name.toLowerCase();
-    const best = results.find(r => r.name?.toLowerCase() === nameLower) || results[0];
+    const scored = results.map(r => {
+      const rName = (r.name || '').toLowerCase();
+      if (rName === nameLower) return { r, score: 100 };
+      if (nameLower.includes(rName) || rName.includes(nameLower)) return { r, score: 80 };
+      const words = nameLower.split(' ').filter(w => w.length > 3);
+      const matches = words.filter(w => rName.includes(w));
+      return { r, score: Math.round((matches.length / Math.max(words.length, 1)) * 60) };
+    }).sort((a, b) => b.score - a.score);
+
+    const best = scored[0].r;
 
     // Get both male front and side video filenames
     const videos = best.videos || [];
