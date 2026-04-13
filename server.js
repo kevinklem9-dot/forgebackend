@@ -1782,14 +1782,20 @@ app.get('/api/exercise/video/:filename', requireAuth, async (req, res) => {
 
   try {
     const range = req.headers.range;
-    const headers = { 'X-API-Key': apiKey };
-    if (range) headers['Range'] = range;
+    const fetchHeaders = { 'X-API-Key': apiKey };
+    if (range) fetchHeaders['Range'] = range;
 
-    const videoRes = await fetch(videoUrl, { headers });
+    const videoRes = await fetch(videoUrl, { headers: fetchHeaders });
 
+    // CORS + streaming headers
+    const origin = req.headers.origin;
+    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+
     if (videoRes.headers.get('content-length')) {
       res.setHeader('Content-Length', videoRes.headers.get('content-length'));
     }
