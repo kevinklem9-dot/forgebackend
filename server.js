@@ -1821,7 +1821,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 
 
 // ── EXERCISE DEBUG — see raw MuscleWiki response ───────
-app.get('/api/exercise/debug', requireAuth, requireAdmin, async (req, res) => {
+app.get('/api/exercise/debug', requireAuth, async (req, res) => {
   const { name } = req.query;
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.json({ error: 'No MUSCLEWIKI_API_KEY set' });
