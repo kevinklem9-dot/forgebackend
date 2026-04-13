@@ -1847,10 +1847,27 @@ app.get('/api/exercise/debug', requireAuth, async (req, res) => {
       try { detailData = JSON.parse(detailRaw); } catch(e) { detailData = detailRaw; }
     }
 
+    // Also simulate what the main route would build
+    let builtGifUrl = null;
+    if (detailData) {
+      const videos = detailData.videos || detailData.video_list || [];
+      if (videos.length > 0) {
+        const v = videos[0];
+        const filename = v.filename || v.file || v;
+        if (typeof filename === 'string') {
+          builtGifUrl = 'https://api.musclewiki.com/stream/videos/branded/' + filename;
+        } else if (v.url) {
+          builtGifUrl = v.url;
+        }
+      }
+    }
+
     res.json({
       status: searchRes.status,
       searchResponse: searchData,
+      firstResultKeys: detailData ? Object.keys(detailData) : null,
       firstResultDetail: detailData,
+      builtGifUrl,
       apiKeyPresent: !!apiKey,
     });
   } catch(err) {
