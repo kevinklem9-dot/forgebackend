@@ -1718,69 +1718,110 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name required' });
 
+  // Build normalised slug for MuscleWiki URL
+  // e.g. "Barbell Bench Press" -> "barbell-bench-press"
+  const slug = name.toLowerCase()
+    .replace(/[^a-z0-9 ]/g, '')
+    .replace(/\s+/g, '-')
+    .trim();
+
   try {
-    // Use free-exercise-db — public domain JSON on GitHub Pages
-    // Full dataset ~800 exercises with GIF images hosted on GitHub
-    const response = await fetch(
+    // Try MuscleWiki unofficial scraper first (has GIFs + instructions)
+    const mwRes = await fetch(
+      'https://workoutapi.vercel.app/exercises?name=' + encodeURIComponent(name),
+      { headers: { 'Accept': 'application/json' } }
+    );
+
+    if (mwRes.ok) {
+      const mwData = await mwRes.json();
+      const exercises = Array.isArray(mwData) ? mwData : (mwData.exercises || []);
+
+      if (exercises.length > 0) {
+        const ex = exercises[0];
+        return res.json({
+          exercise: {
+            name: ex.name || name,
+            gifUrl: ex.gifUrl || ex.videoUrl || null,
+            instructions: ex.instructions || ex.steps || [],
+            primaryMuscles: ex.target ? [ex.target] : (ex.primaryMuscles || []),
+            secondaryMuscles: ex.secondaryMuscles || [],
+            category: ex.category || ex.bodyPart || '',
+            level: ex.level || ex.difficulty || '',
+            muscleWikiSlug: slug,
+            muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
+          }
+        });
+      }
+    }
+  } catch(e) {
+    // Fall through to next source
+  }
+
+  try {
+    // Fallback: free-exercise-db (public domain, GitHub hosted)
+    const dbRes = await fetch(
       'https://yuhonas.github.io/free-exercise-db/dist/exercises.json',
       { headers: { 'Accept': 'application/json' } }
     );
 
-    if (!response.ok) throw new Error('Exercise DB fetch failed');
-    const exercises = await response.json();
+    if (dbRes.ok) {
+      const exercises = await dbRes.json();
 
-    // Normalise search term
-    const search = name.toLowerCase()
-      .replace(/[^a-z0-9 ]/g, ' ')
-      .replace(/\b(barbell|dumbbell|db|bb|cable|machine|ez bar|ez-bar|kettlebell|kb|resistance band|bodyweight|bw|weighted|assisted)\b/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
+      const search = name.toLowerCase()
+        .replace(/\b(barbell|dumbbell|db|bb|cable|machine|kettlebell|kb|bodyweight|bw|weighted|assisted|ez.bar)\b/gi, '')
+        .replace(/[^a-z0-9 ]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
 
-    // Score each exercise
-    const scored = exercises
-      .map(ex => {
+      const scored = exercises.map(ex => {
         const exName = (ex.name || '').toLowerCase();
-        // Exact match
-        if (exName === search) return { ex, score: 100 };
-        // Full search term contained
-        if (exName.includes(search)) return { ex, score: 80 };
-        // Original name contained
+        if (exName === name.toLowerCase()) return { ex, score: 100 };
+        if (exName === search) return { ex, score: 95 };
+        if (exName.includes(search) && search.length > 3) return { ex, score: 80 };
         if (exName.includes(name.toLowerCase())) return { ex, score: 75 };
-        // Word overlap score
         const searchWords = search.split(' ').filter(w => w.length > 2);
         const exWords = exName.split(' ');
         const overlap = searchWords.filter(w => exWords.some(ew => ew.includes(w) || w.includes(ew)));
-        if (overlap.length > 0) return { ex, score: (overlap.length / searchWords.length) * 60 };
+        if (overlap.length > 0) return { ex, score: Math.round((overlap.length / Math.max(searchWords.length, 1)) * 60) };
         return { ex, score: 0 };
-      })
-      .filter(s => s.score > 0)
-      .sort((a, b) => b.score - a.score);
+      }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
 
-    if (!scored.length) return res.json({ exercise: null });
+      if (scored.length > 0) {
+        const ex = scored[0].ex;
+        const imageBase = 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/' + ex.id + '/';
+        const images = (ex.images || []).map(img => imageBase + img);
 
-    const ex = scored[0].ex;
-
-    // Build GIF URLs — free-exercise-db hosts images on GitHub
-    const imageBase = 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/' + ex.id + '/';
-    const images = (ex.images || []).map(img => imageBase + img);
-
-    res.json({
-      exercise: {
-        name: ex.name,
-        gifUrl: images[0] || null,
-        images: images.slice(0, 2),
-        instructions: ex.instructions || [],
-        primaryMuscles: ex.primaryMuscles || [],
-        secondaryMuscles: ex.secondaryMuscles || [],
-        equipment: ex.equipment || [],
-        category: ex.category || '',
-        level: ex.level || '',
+        return res.json({
+          exercise: {
+            name: ex.name,
+            gifUrl: images[0] || null,
+            instructions: ex.instructions || [],
+            primaryMuscles: ex.primaryMuscles || [],
+            secondaryMuscles: ex.secondaryMuscles || [],
+            category: ex.category || '',
+            level: ex.level || '',
+            muscleWikiSlug: slug,
+            muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
+          }
+        });
       }
-    });
+    }
   } catch(err) {
-    console.error('Exercise search error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Exercise fallback error:', err.message);
   }
+
+  // Return slug only — frontend can show MuscleWiki link as fallback
+  res.json({
+    exercise: {
+      name,
+      gifUrl: null,
+      instructions: [],
+      primaryMuscles: [],
+      secondaryMuscles: [],
+      muscleWikiSlug: slug,
+      muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
+    }
+  });
 });
 
 
