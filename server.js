@@ -1746,11 +1746,10 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     const nameLower = name.toLowerCase();
     const best = results.find(r => r.name?.toLowerCase() === nameLower) || results[0];
 
-    // Get male front video URL
+    // Get male front video filename for proxy
     const videos = best.videos || [];
     const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front') || videos[0];
-    // Return direct MuscleWiki URL + API key so frontend can fetch with header
-    const videoUrl = maleFront?.url || null;
+    const videoFilename = maleFront?.url ? maleFront.url.split('/branded/')[1] : null;
 
     // Build slug for musclewiki.com page URL
     const slug = best.name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
@@ -1758,8 +1757,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     res.json({
       exercise: {
         name: best.name,
-        videoUrl,
-        videoApiKey: process.env.MUSCLEWIKI_API_KEY,
+        videoFilename: videoFilename || null,
         instructions: best.steps || [],
         primaryMuscles: best.primary_muscles || [],
         secondaryMuscles: [],
@@ -1775,101 +1773,65 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   }
 });
 
-// ── EXERCISE VIDEO PROXY — fetch and buffer with auth header ──
-// In-memory token store for short-lived video access tokens
-const videoTokens = new Map(); // token -> { filename, expires }
-
-// ── EXERCISE VIDEO TOKEN — get a short-lived token ─────
-app.get('/api/exercise/video-token', requireAuth, (req, res) => {
+// ── EXERCISE VIDEO PROXY — buffers video server-side, sends to client ──────
+// Uses exact same approach as /buftest which confirmed works (752902 bytes)
+app.get('/api/exercise/video/*', requireAuth, (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
-  if (!apiKey) return res.status(404).json({ error: 'No API key' });
+  if (!apiKey) return res.status(404).json({ error: 'No API key configured' });
 
-  const { filename } = req.query;
+  const filename = req.params[0];
   if (!filename || !/^[a-zA-Z0-9._-]+$/.test(filename)) {
     return res.status(400).json({ error: 'Invalid filename' });
   }
 
-  // Generate random token
-  const token = require('crypto').randomBytes(16).toString('hex');
-  videoTokens.set(token, { filename, expires: Date.now() + 60000 }); // 60s TTL
+  const chunks = [];
 
-  // Cleanup expired tokens
-  for (const [k, v] of videoTokens) {
-    if (v.expires < Date.now()) videoTokens.delete(k);
-  }
-
-  res.json({ token });
-});
-
-// ── EXERCISE VIDEO STREAM — stream using token (no auth header needed) ─
-app.get('/api/exercise/video-stream/:token', (req, res) => {
-  const apiKey = process.env.MUSCLEWIKI_API_KEY;
-  if (!apiKey) return res.status(404).send('No API key');
-
-  const entry = videoTokens.get(req.params.token);
-  if (!entry || entry.expires < Date.now()) {
-    return res.status(403).send('Token expired or invalid');
-  }
-
-  // Delete token after use (one-time)
-  videoTokens.delete(req.params.token);
-
-  const options = {
+  const proxyReq = https.request({
     hostname: 'api.musclewiki.com',
-    path: '/stream/videos/branded/' + entry.filename,
+    path: '/stream/videos/branded/' + filename,
     method: 'GET',
     headers: { 'X-API-Key': apiKey }
-  };
-
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Cache-Control', 'public, max-age=3600');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-
-  const proxyReq = https.request(options, (proxyRes) => {
+  }, (proxyRes) => {
     if (proxyRes.statusCode !== 200) {
-      res.status(proxyRes.statusCode).end();
+      console.error('MuscleWiki video upstream error:', proxyRes.statusCode);
+      if (!res.headersSent) res.status(proxyRes.statusCode).json({ error: 'upstream ' + proxyRes.statusCode });
       proxyRes.resume();
       return;
     }
-    if (proxyRes.headers['content-length']) {
-      res.setHeader('Content-Length', proxyRes.headers['content-length']);
-    }
-    proxyRes.pipe(res);
+
+    proxyRes.on('data', chunk => chunks.push(chunk));
+
+    proxyRes.on('end', () => {
+      if (res.headersSent) return;
+      const buf = Buffer.concat(chunks);
+      res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Content-Length': buf.length,
+        'Cache-Control': 'public, max-age=3600',
+        'Access-Control-Allow-Origin': '*',
+        'Cross-Origin-Resource-Policy': 'cross-origin',
+      });
+      res.end(buf);
+    });
+
+    proxyRes.on('error', (e) => {
+      console.error('proxyRes error:', e.message);
+      if (!res.headersSent) res.status(500).json({ error: e.message });
+    });
   });
 
-  proxyReq.on('error', (err) => {
-    console.error('Video stream error:', err.message);
-    if (!res.headersSent) res.status(500).end();
+  proxyReq.on('error', (e) => {
+    console.error('proxyReq error:', e.message);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  });
+
+  proxyReq.setTimeout(30000, () => {
+    console.error('Video proxy timeout:', filename);
+    proxyReq.destroy();
+    if (!res.headersSent) res.status(504).json({ error: 'timeout' });
   });
 
   proxyReq.end();
-});
-
-// ── EXERCISE VIDEO TEST — check API key works ───────────
-app.get('/api/exercise/video-test', requireAuth, (req, res) => {
-  const apiKey = process.env.MUSCLEWIKI_API_KEY;
-  if (!apiKey) return res.json({ error: 'No API key set' });
-
-  const options = {
-    hostname: 'api.musclewiki.com',
-    path: '/stream/videos/branded/male-barbell-bench-press-front.mp4',
-    method: 'HEAD',
-    headers: { 'X-API-Key': apiKey }
-  };
-
-  const testReq = https.request(options, (testRes) => {
-    res.json({
-      status: testRes.statusCode,
-      headers: testRes.headers,
-      apiKeyLength: apiKey.length,
-      message: testRes.statusCode === 200 ? 'API key works' : 'API key rejected — status ' + testRes.statusCode
-    });
-    testRes.resume();
-  });
-
-  testReq.on('error', (err) => res.json({ error: err.message }));
-  testReq.end();
 });
 
 // ── EXERCISE DEBUG — see raw MuscleWiki response ───────
