@@ -826,12 +826,26 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
 
     const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context, language);
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 6000,
-      system: systemPrompt,
-      messages: sanitised
-    });
+    // Retry up to 3 times on 529 overloaded errors
+    let response;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        response = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 6000,
+          system: systemPrompt,
+          messages: sanitised
+        });
+        break; // success
+      } catch(apiErr) {
+        const is529 = apiErr.status === 529 || apiErr.message?.includes('529') || apiErr.message?.includes('overloaded');
+        if (is529 && attempt < 3) {
+          await new Promise(r => setTimeout(r, 1500 * attempt)); // 1.5s, 3s
+          continue;
+        }
+        throw apiErr; // rethrow if not 529 or final attempt
+      }
+    }
 
     const rawReply = response.content[0].text;
 
