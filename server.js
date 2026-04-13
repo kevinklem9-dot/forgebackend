@@ -55,6 +55,9 @@ function findMuscleWikiName(name, exercises) {
   if (!exercises || !name) return null;
   const nameLower = name.toLowerCase().trim();
 
+  // 0. Manual mapping table
+  if (EXERCISE_NAME_MAP[nameLower]) return EXERCISE_NAME_MAP[nameLower];
+
   // 1. Exact match
   const exact = exercises.find(e => e.name.toLowerCase() === nameLower);
   if (exact) return exact.name;
@@ -90,8 +93,232 @@ function findMuscleWikiName(name, exercises) {
   return null; // No confident match — don't remap
 }
 
-// Pre-warm cache on startup
-getMuscleWikiExercises().catch(() => {});
+// Async version that also tries AI normalisation
+async function findMuscleWikiNameAsync(name, exercises) {
+  const sync = findMuscleWikiName(name, exercises);
+  if (sync) return sync;
+  return await normaliseExerciseNameWithAI(name, exercises);
+}
+
+
+// ── EXERCISE NAME MANUAL MAPPING TABLE ───────────────────
+// Common AI-generated names → exact MuscleWiki names
+// Add to this as you spot mismatches
+const EXERCISE_NAME_MAP = {
+  // Legs
+  'leg curl': 'Dumbbell Leg Curl',
+  'leg curls': 'Dumbbell Leg Curl',
+  'hamstring curl': 'Dumbbell Leg Curl',
+  'lying leg curl': 'Dumbbell Leg Curl',
+  'machine leg curl': 'Machine Leg Curl',
+  'seated leg curl': 'Machine Seated Leg Curl',
+  'leg press': 'Machine Leg Press',
+  'leg extension': 'Machine Leg Extension',
+  'leg extensions': 'Machine Leg Extension',
+  'calf raise': 'Dumbbell Calf Raise',
+  'calf raises': 'Dumbbell Calf Raise',
+  'standing calf raise': 'Dumbbell Calf Raise',
+  'seated calf raise': 'Machine Seated Calf Raise',
+  'bulgarian split squat': 'Dumbbell Bulgarian Split Squat',
+  'split squat': 'Dumbbell Bulgarian Split Squat',
+  'goblet squat': 'Dumbbell Goblet Squat',
+  'hack squat': 'Machine Hack Squat',
+  'rdl': 'Barbell Romanian Deadlift',
+  'romanian deadlift': 'Barbell Romanian Deadlift',
+  'dumbbell rdl': 'Dumbbell Romanian Deadlift',
+  'stiff leg deadlift': 'Barbell Romanian Deadlift',
+  'sumo deadlift': 'Barbell Sumo Deadlift',
+  // Chest
+  'bench press': 'Barbell Bench Press',
+  'incline bench press': 'Barbell Incline Bench Press',
+  'decline bench press': 'Barbell Decline Bench Press',
+  'dumbbell press': 'Dumbbell Bench Press',
+  'incline dumbbell press': 'Dumbbell Incline Bench Press',
+  'chest fly': 'Dumbbell Fly',
+  'cable fly': 'Cable Fly',
+  'cable crossover': 'Cable Fly',
+  'push up': 'Bodyweight Push-Up',
+  'push ups': 'Bodyweight Push-Up',
+  'dip': 'Bodyweight Dip',
+  'dips': 'Bodyweight Dip',
+  'chest dip': 'Bodyweight Dip',
+  // Back
+  'pull up': 'Bodyweight Pull-Up',
+  'pull ups': 'Bodyweight Pull-Up',
+  'chin up': 'Bodyweight Chin-Up',
+  'chin ups': 'Bodyweight Chin-Up',
+  'lat pulldown': 'Cable Lat Pulldown',
+  'pull down': 'Cable Lat Pulldown',
+  'seated row': 'Cable Seated Row',
+  'cable row': 'Cable Seated Row',
+  'bent over row': 'Barbell Bent-Over Row',
+  'barbell row': 'Barbell Bent-Over Row',
+  'dumbbell row': 'Dumbbell Single-Arm Row',
+  'single arm row': 'Dumbbell Single-Arm Row',
+  'one arm row': 'Dumbbell Single-Arm Row',
+  't-bar row': 'Barbell T-Bar Row',
+  'face pull': 'Cable Face Pull',
+  'face pulls': 'Cable Face Pull',
+  'deadlift': 'Barbell Deadlift',
+  // Shoulders
+  'overhead press': 'Barbell Overhead Press',
+  'shoulder press': 'Dumbbell Shoulder Press',
+  'military press': 'Barbell Overhead Press',
+  'lateral raise': 'Dumbbell Lateral Raise',
+  'lateral raises': 'Dumbbell Lateral Raise',
+  'side lateral raise': 'Dumbbell Lateral Raise',
+  'front raise': 'Dumbbell Front Raise',
+  'front raises': 'Dumbbell Front Raise',
+  'rear delt fly': 'Dumbbell Rear Delt Fly',
+  'reverse fly': 'Dumbbell Rear Delt Fly',
+  'upright row': 'Barbell Upright Row',
+  'arnold press': 'Dumbbell Arnold Press',
+  // Arms
+  'bicep curl': 'Dumbbell Bicep Curl',
+  'bicep curls': 'Dumbbell Bicep Curl',
+  'curl': 'Dumbbell Bicep Curl',
+  'barbell curl': 'Barbell Bicep Curl',
+  'hammer curl': 'Dumbbell Hammer Curl',
+  'hammer curls': 'Dumbbell Hammer Curl',
+  'preacher curl': 'Barbell Preacher Curl',
+  'concentration curl': 'Dumbbell Concentration Curl',
+  'tricep pushdown': 'Cable Tricep Pushdown',
+  'tricep extension': 'Dumbbell Tricep Extension',
+  'overhead tricep extension': 'Dumbbell Overhead Tricep Extension',
+  'skull crusher': 'Barbell Skull Crusher',
+  'skull crushers': 'Barbell Skull Crusher',
+  'close grip bench press': 'Barbell Close Grip Bench Press',
+  // Core
+  'plank': 'Bodyweight Plank',
+  'crunch': 'Bodyweight Crunch',
+  'crunches': 'Bodyweight Crunch',
+  'sit up': 'Bodyweight Sit-Up',
+  'sit ups': 'Bodyweight Sit-Up',
+  'leg raise': 'Bodyweight Leg Raise',
+  'leg raises': 'Bodyweight Leg Raise',
+  'russian twist': 'Bodyweight Russian Twist',
+  'ab rollout': 'Ab Wheel Rollout',
+};
+
+// AI-assisted normalisation cache — maps unknown names to MuscleWiki names
+const aiExerciseNameCache = new Map();
+
+async function normaliseExerciseNameWithAI(name, exercises) {
+  if (!exercises || !name) return null;
+
+  // Check AI cache first
+  const cached = aiExerciseNameCache.get(name.toLowerCase().trim());
+  if (cached !== undefined) return cached; // cached null = confirmed no match
+
+  try {
+    const exerciseList = exercises.slice(0, 500).map(e => e.name).join(', ');
+    const Anthropic = require('@anthropic-ai/sdk').default;
+    const ai = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const msg = await ai.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 50,
+      messages: [{
+        role: 'user',
+        content: 'From this exercise database list, find the EXACT name that matches "' + name + '". Reply with ONLY the exact name from the list, or "NONE" if no match exists. List: ' + exerciseList
+      }]
+    });
+
+    const result = msg.content[0].text.trim();
+    const matched = result === 'NONE' ? null : (exercises.find(e => e.name === result)?.name || null);
+    aiExerciseNameCache.set(name.toLowerCase().trim(), matched);
+    return matched;
+  } catch(e) {
+    console.error('AI exercise normalisation error:', e.message);
+    return null;
+  }
+}
+
+// ── MANUAL EXERCISE NAME MAP ─────────────────────────
+const MANUAL_EXERCISE_MAP = {
+  'leg curl':'Dumbbell Leg Curl','leg curls':'Dumbbell Leg Curl',
+  'lying leg curl':'Machine Lying Leg Curl','seated leg curl':'Machine Seated Leg Curl',
+  'hamstring curl':'Dumbbell Leg Curl','hamstring curls':'Dumbbell Leg Curl',
+  'nordic curl':'Bodyweight Nordic Hamstring Curl',
+  'romanian deadlift':'Barbell Romanian Deadlift','rdl':'Barbell Romanian Deadlift',
+  'dumbbell rdl':'Dumbbell Romanian Deadlift','dumbbell romanian deadlift':'Dumbbell Romanian Deadlift',
+  'single leg rdl':'Dumbbell Single Leg Romanian Deadlift',
+  'lateral raise':'Dumbbell Lateral Raise','lateral raises':'Dumbbell Lateral Raise',
+  'side lateral raise':'Dumbbell Lateral Raise','side raise':'Dumbbell Lateral Raise',
+  'cable lateral raise':'Cable Lateral Raise','machine lateral raise':'Machine Lateral Raise',
+  'bench press':'Barbell Bench Press','flat bench press':'Barbell Bench Press',
+  'incline press':'Barbell Incline Bench Press','incline bench press':'Barbell Incline Bench Press',
+  'decline bench press':'Barbell Decline Bench Press',
+  'dumbbell press':'Dumbbell Bench Press','dumbbell bench press':'Dumbbell Bench Press',
+  'chest fly':'Dumbbell Fly','cable fly':'Cable Fly','pec deck':'Machine Fly',
+  'pull up':'Bodyweight Pull Up','pull ups':'Bodyweight Pull Up','pullup':'Bodyweight Pull Up',
+  'chin up':'Bodyweight Chin Up','chin ups':'Bodyweight Chin Up',
+  'lat pulldown':'Cable Lat Pulldown','cable pulldown':'Cable Lat Pulldown',
+  'seated row':'Cable Seated Row','cable row':'Cable Seated Row',
+  'bent over row':'Barbell Bent Over Row','barbell row':'Barbell Bent Over Row',
+  'dumbbell row':'Dumbbell Bent Over Row','one arm row':'Dumbbell Single Arm Row',
+  'single arm row':'Dumbbell Single Arm Row','t-bar row':'Barbell T-Bar Row',
+  'face pull':'Cable Face Pull','face pulls':'Cable Face Pull',
+  'overhead press':'Barbell Overhead Press','shoulder press':'Barbell Overhead Press',
+  'military press':'Barbell Overhead Press','ohp':'Barbell Overhead Press',
+  'dumbbell shoulder press':'Dumbbell Shoulder Press','arnold press':'Dumbbell Arnold Press',
+  'front raise':'Dumbbell Front Raise','rear delt fly':'Dumbbell Rear Delt Fly',
+  'rear delt raise':'Dumbbell Rear Delt Fly','rear lateral raise':'Dumbbell Rear Delt Fly',
+  'bicep curl':'Dumbbell Bicep Curl','bicep curls':'Dumbbell Bicep Curl',
+  'barbell curl':'Barbell Curl','ez bar curl':'EZ Bar Curl','ez curl':'EZ Bar Curl',
+  'hammer curl':'Dumbbell Hammer Curl','hammer curls':'Dumbbell Hammer Curl',
+  'preacher curl':'Barbell Preacher Curl','concentration curl':'Dumbbell Concentration Curl',
+  'tricep pushdown':'Cable Tricep Pushdown','cable pushdown':'Cable Tricep Pushdown',
+  'tricep dip':'Bodyweight Tricep Dip','dips':'Bodyweight Tricep Dip','dip':'Bodyweight Tricep Dip',
+  'skull crusher':'EZ Bar Skull Crusher','skull crushers':'EZ Bar Skull Crusher',
+  'overhead tricep extension':'Dumbbell Overhead Tricep Extension',
+  'tricep extension':'Cable Tricep Extension','tricep extensions':'Cable Tricep Extension',
+  'squat':'Barbell Squat','back squat':'Barbell Squat','front squat':'Barbell Front Squat',
+  'goblet squat':'Dumbbell Goblet Squat','bulgarian split squat':'Dumbbell Bulgarian Split Squat',
+  'split squat':'Dumbbell Bulgarian Split Squat','lunge':'Dumbbell Lunge','lunges':'Dumbbell Lunge',
+  'walking lunge':'Dumbbell Walking Lunge','leg press':'Machine Leg Press',
+  'leg extension':'Machine Leg Extension','leg extensions':'Machine Leg Extension',
+  'calf raise':'Machine Calf Raise','calf raises':'Machine Calf Raise',
+  'standing calf raise':'Machine Calf Raise','seated calf raise':'Machine Seated Calf Raise',
+  'hip thrust':'Barbell Hip Thrust','glute bridge':'Bodyweight Glute Bridge',
+  'deadlift':'Barbell Deadlift','conventional deadlift':'Barbell Deadlift',
+  'sumo deadlift':'Barbell Sumo Deadlift','trap bar deadlift':'Trap Bar Deadlift',
+  'plank':'Bodyweight Plank','crunch':'Bodyweight Crunch','crunches':'Bodyweight Crunch',
+  'sit up':'Bodyweight Sit Up','sit ups':'Bodyweight Sit Up',
+  'leg raise':'Bodyweight Leg Raise','leg raises':'Bodyweight Leg Raise',
+  'russian twist':'Bodyweight Russian Twist','cable crunch':'Cable Crunch',
+  'ab wheel':'Ab Wheel Rollout','ab wheel rollout':'Ab Wheel Rollout',
+  'push up':'Bodyweight Push Up','push ups':'Bodyweight Push Up','pushup':'Bodyweight Push Up',
+  'dumbbell fly':'Dumbbell Fly','incline dumbbell fly':'Dumbbell Incline Fly',
+  'cable crossover':'Cable Crossover','upright row':'Barbell Upright Row',
+  'shrug':'Barbell Shrug','dumbbell shrug':'Dumbbell Shrug','barbell shrug':'Barbell Shrug',
+  'good morning':'Barbell Good Morning','back extension':'Machine Back Extension',
+  'hyperextension':'Machine Back Extension','reverse fly':'Dumbbell Rear Delt Fly',
+  'incline dumbbell curl':'Dumbbell Incline Curl','cable curl':'Cable Bicep Curl',
+  'rope pushdown':'Cable Rope Tricep Pushdown','overhead cable extension':'Cable Overhead Tricep Extension',
+};
+
+// Resolve AI exercise name -> exact MuscleWiki name
+// Priority: manual map -> fuzzy cache match -> AI normalisation
+async function resolveExerciseName(name, exercises) {
+  if (!name) return null;
+  const lower = name.toLowerCase().trim();
+
+  // 1. Manual map (instant)
+  if (MANUAL_EXERCISE_MAP[lower]) return MANUAL_EXERCISE_MAP[lower];
+
+  // 2. Stripped manual map (remove equipment prefix)
+  const stripped = lower.replace(/^(barbell|dumbbell|cable|machine|kettlebell|ez bar|ez-bar|bodyweight|bw|db|bb|kb)\s+/i, '');
+  if (stripped !== lower && MANUAL_EXERCISE_MAP[stripped]) return MANUAL_EXERCISE_MAP[stripped];
+
+  // 3. AI cache
+  const aiCached = aiExerciseNameCache.get(lower);
+  if (aiCached !== undefined) return aiCached;
+
+  // 4. AI normalisation (async, uses claude-haiku)
+  const aiResult = await normaliseExerciseNameWithAI(name, exercises);
+  return aiResult;
+}
 
 // ── CLIENTS ────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -439,7 +666,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
         if (mwExercises && plan.workout?.days) {
           for (const day of plan.workout.days) {
             for (const ex of (day.exercises || [])) {
-              const mwName = findMuscleWikiName(ex.name, mwExercises);
+              const mwName = await resolveExerciseName(ex.name, mwExercises);
               if (mwName) ex.name = mwName;
             }
           }
@@ -1865,31 +2092,27 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     };
   };
 
-  // ── STEP 1: Check in-memory cache for instant exact match ──
+  // ── STEP 1: Resolve name via manual map, cache, or AI ──
   const cachedExercises = await getMuscleWikiExercises();
+  const resolvedName = await resolveExerciseName(name, cachedExercises);
+  if (resolvedName && cachedExercises) {
+    const match = cachedExercises.find(e => e.name.toLowerCase() === resolvedName.toLowerCase());
+    if (match) return res.json({ exercise: buildResponse(match) });
+  }
+
+  // ── STEP 2: Fuzzy match against cache ──
   if (cachedExercises) {
     const nameLower = name.toLowerCase().trim();
-
-    // Try exact match first
-    const exact = cachedExercises.find(e => e.name.toLowerCase() === nameLower);
-    if (exact) return res.json({ exercise: buildResponse(exact) });
-
-    // Strip equipment prefix and try again
     const stripped = nameLower.replace(/^(barbell|dumbbell|cable|machine|kettlebell|ez bar|ez-bar|bodyweight|bw|db|bb|kb)\s+/i, '');
-
-    // Score all exercises by word overlap
     const words = nameLower.split(' ').filter(w => w.length >= 3);
     const strippedWords = stripped.split(' ').filter(w => w.length >= 3);
 
     const scored = cachedExercises.map(e => {
       const en = e.name.toLowerCase();
-      // Exact stripped match
+      if (en === nameLower) return { e, score: 100 };
       if (en === stripped) return { e, score: 95 };
-      // All full-name words present
       if (words.length >= 2 && words.every(w => en.includes(w))) return { e, score: 85 };
-      // All stripped words present
       if (strippedWords.length >= 2 && strippedWords.every(w => en.includes(w))) return { e, score: 75 };
-      // Most words present (>=75%)
       if (words.length >= 2) {
         const matchCount = words.filter(w => en.includes(w)).length;
         const ratio = matchCount / words.length;
@@ -1898,8 +2121,13 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       return { e, score: 0 };
     }).filter(s => s.score > 0).sort((a, b) => b.score - a.score || a.e.name.length - b.e.name.length);
 
-    if (scored.length > 0) {
-      return res.json({ exercise: buildResponse(scored[0].e) });
+    if (scored.length > 0) return res.json({ exercise: buildResponse(scored[0].e) });
+
+    // ── STEP 1b: Try manual map + AI normalisation ──
+    const aiName = await normaliseExerciseNameWithAI(name, cachedExercises);
+    if (aiName) {
+      const aiMatch = cachedExercises.find(e => e.name === aiName);
+      if (aiMatch) return res.json({ exercise: buildResponse(aiMatch) });
     }
   }
 
@@ -2132,7 +2360,7 @@ app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
     const plan = planRow.plan_data;
     for (const day of (plan.workout_plan?.days || [])) {
       for (const ex of (day.exercises || [])) {
-        const mwName = findMuscleWikiName(ex.name, exercises);
+        const mwName = await resolveExerciseName(ex.name, exercises);
         if (mwName && mwName !== ex.name) {
           ex.name = mwName;
           changed++;
