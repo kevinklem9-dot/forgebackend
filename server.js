@@ -1756,7 +1756,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     res.json({
       exercise: {
         name: best.name,
-        videoProxyPath: videoFilename ? '/api/exercise/video/' + encodeURIComponent(videoFilename) : null,
+        videoProxyPath: videoFilename ? '/api/exercise/video/' + videoFilename : null,
         instructions: best.steps || [],
         primaryMuscles: best.primary_muscles || [],
         secondaryMuscles: [],
@@ -1773,11 +1773,20 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 });
 
 // ── EXERCISE VIDEO PROXY — fetch and buffer with auth header ──
-app.get('/api/exercise/video/:filename', requireAuth, async (req, res) => {
+// Use wildcard to handle filenames with dots (Express strips .ext from :param by default)
+app.get('/api/exercise/video/*', requireAuth, async (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
-  if (!apiKey) return res.status(404).send('No API key');
+  if (!apiKey) return res.status(404).json({ error: 'No API key configured' });
 
-  const filename = decodeURIComponent(req.params.filename);
+  // Reconstruct full filename from wildcard — handles dots in filename
+  const filename = req.params[0];
+  if (!filename) return res.status(400).json({ error: 'No filename' });
+
+  // Security: only allow alphanumeric, hyphens, underscores, dots
+  if (!/^[a-zA-Z0-9._-]+$/.test(filename)) {
+    return res.status(400).json({ error: 'Invalid filename' });
+  }
+
   const videoUrl = 'https://api.musclewiki.com/stream/videos/branded/' + filename;
 
   try {
@@ -1786,22 +1795,23 @@ app.get('/api/exercise/video/:filename', requireAuth, async (req, res) => {
     });
 
     if (!videoRes.ok) {
-      return res.status(videoRes.status).send('Video fetch failed: ' + videoRes.status);
+      console.error('MuscleWiki video fetch failed:', videoRes.status, videoUrl);
+      return res.status(videoRes.status).json({ error: 'Video fetch failed: ' + videoRes.status });
     }
 
-    // Buffer the entire video then send — avoids pipe() issues with fetch Response
-    const buffer = Buffer.from(await videoRes.arrayBuffer());
+    const arrayBuf = await videoRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuf);
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', buffer.length);
-    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-    res.status(200).send(buffer);
+    res.status(200).end(buffer);
 
   } catch(err) {
-    console.error('Video proxy error:', err.message);
-    res.status(500).send('Video proxy error: ' + err.message);
+    console.error('Video proxy error:', filename, err.message);
+    res.status(500).json({ error: 'Video proxy error: ' + err.message });
   }
 });
 
