@@ -1772,7 +1772,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   }
 });
 
-// ── EXERCISE VIDEO PROXY — stream with auth header ──────
+// ── EXERCISE VIDEO PROXY — fetch and buffer with auth header ──
 app.get('/api/exercise/video/:filename', requireAuth, async (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.status(404).send('No API key');
@@ -1781,31 +1781,26 @@ app.get('/api/exercise/video/:filename', requireAuth, async (req, res) => {
   const videoUrl = 'https://api.musclewiki.com/stream/videos/branded/' + filename;
 
   try {
-    const range = req.headers.range;
-    const fetchHeaders = { 'X-API-Key': apiKey };
-    if (range) fetchHeaders['Range'] = range;
+    const videoRes = await fetch(videoUrl, {
+      headers: { 'X-API-Key': apiKey }
+    });
 
-    const videoRes = await fetch(videoUrl, { headers: fetchHeaders });
+    if (!videoRes.ok) {
+      return res.status(videoRes.status).send('Video fetch failed: ' + videoRes.status);
+    }
 
-    // CORS + streaming headers
-    const origin = req.headers.origin;
-    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    // Buffer the entire video then send — avoids pipe() issues with fetch Response
+    const buffer = Buffer.from(await videoRes.arrayBuffer());
+
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Length', buffer.length);
     res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.status(200).send(buffer);
 
-    if (videoRes.headers.get('content-length')) {
-      res.setHeader('Content-Length', videoRes.headers.get('content-length'));
-    }
-    if (videoRes.headers.get('content-range')) {
-      res.setHeader('Content-Range', videoRes.headers.get('content-range'));
-    }
-
-    res.status(videoRes.status);
-    videoRes.body.pipe(res);
   } catch(err) {
+    console.error('Video proxy error:', err.message);
     res.status(500).send('Video proxy error: ' + err.message);
   }
 });
