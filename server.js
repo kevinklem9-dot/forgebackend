@@ -1819,6 +1819,45 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 });
 
 
+
+// ── EXERCISE DEBUG — see raw MuscleWiki response ───────
+app.get('/api/exercise/debug', requireAuth, requireAdmin, async (req, res) => {
+  const { name } = req.query;
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  if (!apiKey) return res.json({ error: 'No MUSCLEWIKI_API_KEY set' });
+
+  try {
+    const searchRes = await fetch(
+      'https://api.musclewiki.com/search?q=' + encodeURIComponent(name || 'bench press') + '&limit=3',
+      { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
+    );
+    const searchRaw = await searchRes.text();
+    let searchData;
+    try { searchData = JSON.parse(searchRaw); } catch(e) { searchData = searchRaw; }
+
+    // If we got results, fetch detail for first one
+    const results = searchData?.results || searchData?.exercises || (Array.isArray(searchData) ? searchData : []);
+    let detailData = null;
+    if (results.length > 0 && results[0].id !== undefined) {
+      const detailRes = await fetch(
+        'https://api.musclewiki.com/exercises/' + results[0].id,
+        { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
+      );
+      const detailRaw = await detailRes.text();
+      try { detailData = JSON.parse(detailRaw); } catch(e) { detailData = detailRaw; }
+    }
+
+    res.json({
+      status: searchRes.status,
+      searchResponse: searchData,
+      firstResultDetail: detailData,
+      apiKeyPresent: !!apiKey,
+    });
+  } catch(err) {
+    res.json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 
 // ── DEBUG — View raw plan (admin only) ────────
