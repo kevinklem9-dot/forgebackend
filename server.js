@@ -1722,103 +1722,87 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   const mwSearchUrl = 'https://musclewiki.com/search?q=' + encodeURIComponent(name);
 
   if (!apiKey) {
-    return res.json({ exercise: { name, gifUrl: null, instructions: [], primaryMuscles: [], secondaryMuscles: [], muscleWikiUrl: mwSearchUrl } });
+    return res.json({ exercise: { name, videoUrl: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
   }
 
   try {
-    // Search MuscleWiki API
     const searchRes = await fetch(
-      'https://api.musclewiki.com/search?q=' + encodeURIComponent(name) + '&limit=3',
+      'https://api.musclewiki.com/search?q=' + encodeURIComponent(name) + '&limit=5',
       { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
     );
 
     if (!searchRes.ok) {
-      console.error('MuscleWiki search failed:', searchRes.status, await searchRes.text());
-      return res.json({ exercise: { name, gifUrl: null, instructions: [], primaryMuscles: [], secondaryMuscles: [], muscleWikiUrl: mwSearchUrl } });
+      console.error('MuscleWiki search failed:', searchRes.status);
+      return res.json({ exercise: { name, videoUrl: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
-    const searchData = await searchRes.json();
-    const results = searchData?.results || searchData?.exercises || (Array.isArray(searchData) ? searchData : []);
-
-    if (!results.length) {
-      return res.json({ exercise: { name, gifUrl: null, instructions: [], primaryMuscles: [], secondaryMuscles: [], muscleWikiUrl: mwSearchUrl } });
+    const results = await searchRes.json();
+    if (!Array.isArray(results) || !results.length) {
+      return res.json({ exercise: { name, videoUrl: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
-    // Pick best match — prefer exact name match
+    // Pick best match — exact name first, then first result
     const nameLower = name.toLowerCase();
     const best = results.find(r => r.name?.toLowerCase() === nameLower) || results[0];
 
-    // Get full exercise detail if we only have id
-    let detail = best;
-    if (best.id !== undefined && !best.videos && !best.instructions) {
-      try {
-        const detailRes = await fetch(
-          'https://api.musclewiki.com/exercises/' + best.id,
-          { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
-        );
-        if (detailRes.ok) detail = await detailRes.json();
-      } catch(e) {}
-    }
+    // Get male front video URL — proxy path so we can add auth header
+    const videos = best.videos || [];
+    const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front') || videos[0];
+    const videoFilename = maleFront?.url ? maleFront.url.split('/branded/')[1] : null;
 
-    // Extract video/gif URL — MuscleWiki returns branded/unbranded video filenames
-    let gifUrl = null;
-    const videos = detail.videos || detail.video_list || [];
-    if (videos.length > 0) {
-      const v = videos[0];
-      // Video filename format: male-Barbell-barbell-bench-press-front.mp4
-      const filename = v.filename || v.file || v;
-      if (typeof filename === 'string') {
-        gifUrl = 'https://api.musclewiki.com/stream/videos/branded/' + filename;
-      } else if (v.url) {
-        gifUrl = v.url;
-      }
-    }
-
-    // Extract instructions
-    const instructions = (detail.instructions || detail.steps || []).map(s =>
-      typeof s === 'string' ? s : (s.text || s.instruction || s.step || '')
-    ).filter(Boolean);
-
-    // Extract muscles
-    const primaryMuscles = (detail.muscles || detail.primary_muscles || detail.target_muscles || [])
-      .map(m => typeof m === 'string' ? m : (m.name || m.name_en || ''))
-      .filter(Boolean);
-
-    const secondaryMuscles = (detail.muscles_secondary || detail.secondary_muscles || [])
-      .map(m => typeof m === 'string' ? m : (m.name || m.name_en || ''))
-      .filter(Boolean);
-
-    const category = typeof detail.category === 'string' ? detail.category
-      : (detail.category?.name || detail.equipment || '');
-
-    const level = detail.difficulty || detail.level || '';
-
-    // Build the MuscleWiki page URL from slug
-    const slug = (detail.slug || detail.name || name).toLowerCase()
-      .replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
-    const exercisePageUrl = 'https://musclewiki.com/exercise/' + slug;
+    // Build slug for musclewiki.com page URL
+    const slug = best.name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
 
     res.json({
       exercise: {
-        name: detail.name || name,
-        gifUrl,
-        isVideo: gifUrl?.includes('.mp4'),
-        instructions,
-        primaryMuscles,
-        secondaryMuscles,
-        category,
-        level,
-        muscleWikiUrl: exercisePageUrl,
+        name: best.name,
+        videoProxyPath: videoFilename ? '/api/exercise/video/' + encodeURIComponent(videoFilename) : null,
+        instructions: best.steps || [],
+        primaryMuscles: best.primary_muscles || [],
+        secondaryMuscles: [],
+        category: best.category || '',
+        difficulty: best.difficulty || '',
+        muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
       }
     });
 
   } catch(err) {
     console.error('MuscleWiki API error:', err.message);
-    res.json({ exercise: { name, gifUrl: null, instructions: [], primaryMuscles: [], secondaryMuscles: [], muscleWikiUrl: mwSearchUrl } });
+    res.json({ exercise: { name, videoUrl: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
   }
 });
 
+// ── EXERCISE VIDEO PROXY — stream with auth header ──────
+app.get('/api/exercise/video/:filename', requireAuth, async (req, res) => {
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  if (!apiKey) return res.status(404).send('No API key');
 
+  const filename = decodeURIComponent(req.params.filename);
+  const videoUrl = 'https://api.musclewiki.com/stream/videos/branded/' + filename;
+
+  try {
+    const range = req.headers.range;
+    const headers = { 'X-API-Key': apiKey };
+    if (range) headers['Range'] = range;
+
+    const videoRes = await fetch(videoUrl, { headers });
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    if (videoRes.headers.get('content-length')) {
+      res.setHeader('Content-Length', videoRes.headers.get('content-length'));
+    }
+    if (videoRes.headers.get('content-range')) {
+      res.setHeader('Content-Range', videoRes.headers.get('content-range'));
+    }
+
+    res.status(videoRes.status);
+    videoRes.body.pipe(res);
+  } catch(err) {
+    res.status(500).send('Video proxy error: ' + err.message);
+  }
+});
 
 // ── EXERCISE DEBUG — see raw MuscleWiki response ───────
 app.get('/api/exercise/debug', requireAuth, async (req, res) => {
