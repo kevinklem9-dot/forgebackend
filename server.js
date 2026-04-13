@@ -1713,6 +1713,77 @@ const retentionRoutes = require('./routes/retention')(supabase, anthropic);
 app.use('/api', requireAuth, retentionRoutes);
 
 // ── START ──────────────────────────────────────
+// ── EXERCISE LOOKUP — proxy to avoid CORS ──────────────
+app.get('/api/exercise/search', requireAuth, async (req, res) => {
+  const { name } = req.query;
+  if (!name) return res.status(400).json({ error: 'name required' });
+
+  try {
+    // Use free-exercise-db — public domain JSON on GitHub Pages
+    // Full dataset ~800 exercises with GIF images hosted on GitHub
+    const response = await fetch(
+      'https://yuhonas.github.io/free-exercise-db/dist/exercises.json',
+      { headers: { 'Accept': 'application/json' } }
+    );
+
+    if (!response.ok) throw new Error('Exercise DB fetch failed');
+    const exercises = await response.json();
+
+    // Normalise search term
+    const search = name.toLowerCase()
+      .replace(/[^a-z0-9 ]/g, ' ')
+      .replace(/\b(barbell|dumbbell|db|bb|cable|machine|ez bar|ez-bar|kettlebell|kb|resistance band|bodyweight|bw|weighted|assisted)\b/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // Score each exercise
+    const scored = exercises
+      .map(ex => {
+        const exName = (ex.name || '').toLowerCase();
+        // Exact match
+        if (exName === search) return { ex, score: 100 };
+        // Full search term contained
+        if (exName.includes(search)) return { ex, score: 80 };
+        // Original name contained
+        if (exName.includes(name.toLowerCase())) return { ex, score: 75 };
+        // Word overlap score
+        const searchWords = search.split(' ').filter(w => w.length > 2);
+        const exWords = exName.split(' ');
+        const overlap = searchWords.filter(w => exWords.some(ew => ew.includes(w) || w.includes(ew)));
+        if (overlap.length > 0) return { ex, score: (overlap.length / searchWords.length) * 60 };
+        return { ex, score: 0 };
+      })
+      .filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    if (!scored.length) return res.json({ exercise: null });
+
+    const ex = scored[0].ex;
+
+    // Build GIF URLs — free-exercise-db hosts images on GitHub
+    const imageBase = 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/' + ex.id + '/';
+    const images = (ex.images || []).map(img => imageBase + img);
+
+    res.json({
+      exercise: {
+        name: ex.name,
+        gifUrl: images[0] || null,
+        images: images.slice(0, 2),
+        instructions: ex.instructions || [],
+        primaryMuscles: ex.primaryMuscles || [],
+        secondaryMuscles: ex.secondaryMuscles || [],
+        equipment: ex.equipment || [],
+        category: ex.category || '',
+        level: ex.level || '',
+      }
+    });
+  } catch(err) {
+    console.error('Exercise search error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 
 // ── DEBUG — View raw plan (admin only) ────────
