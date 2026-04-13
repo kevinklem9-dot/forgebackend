@@ -1713,115 +1713,109 @@ const retentionRoutes = require('./routes/retention')(supabase, anthropic);
 app.use('/api', requireAuth, retentionRoutes);
 
 // ── START ──────────────────────────────────────
-// ── EXERCISE LOOKUP — proxy to avoid CORS ──────────────
+// ── EXERCISE LOOKUP — MuscleWiki API proxy ─────────────
 app.get('/api/exercise/search', requireAuth, async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name required' });
 
-  // Build normalised slug for MuscleWiki URL
-  // e.g. "Barbell Bench Press" -> "barbell-bench-press"
-  const slug = name.toLowerCase()
-    .replace(/[^a-z0-9 ]/g, '')
-    .replace(/\s+/g, '-')
-    .trim();
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  const mwSearchUrl = 'https://musclewiki.com/search?q=' + encodeURIComponent(name);
 
-  try {
-    // Try MuscleWiki unofficial scraper first (has GIFs + instructions)
-    const mwRes = await fetch(
-      'https://workoutapi.vercel.app/exercises?name=' + encodeURIComponent(name),
-      { headers: { 'Accept': 'application/json' } }
-    );
-
-    if (mwRes.ok) {
-      const mwData = await mwRes.json();
-      const exercises = Array.isArray(mwData) ? mwData : (mwData.exercises || []);
-
-      if (exercises.length > 0) {
-        const ex = exercises[0];
-        return res.json({
-          exercise: {
-            name: ex.name || name,
-            gifUrl: ex.gifUrl || ex.videoUrl || null,
-            instructions: ex.instructions || ex.steps || [],
-            primaryMuscles: ex.target ? [ex.target] : (ex.primaryMuscles || []),
-            secondaryMuscles: ex.secondaryMuscles || [],
-            category: ex.category || ex.bodyPart || '',
-            level: ex.level || ex.difficulty || '',
-            muscleWikiSlug: slug,
-            muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
-          }
-        });
-      }
-    }
-  } catch(e) {
-    // Fall through to next source
+  if (!apiKey) {
+    return res.json({ exercise: { name, gifUrl: null, instructions: [], primaryMuscles: [], secondaryMuscles: [], muscleWikiUrl: mwSearchUrl } });
   }
 
   try {
-    // Fallback: free-exercise-db (public domain, GitHub hosted)
-    const dbRes = await fetch(
-      'https://yuhonas.github.io/free-exercise-db/dist/exercises.json',
-      { headers: { 'Accept': 'application/json' } }
+    // Search MuscleWiki API
+    const searchRes = await fetch(
+      'https://api.musclewiki.com/search?q=' + encodeURIComponent(name) + '&limit=3',
+      { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
     );
 
-    if (dbRes.ok) {
-      const exercises = await dbRes.json();
+    if (!searchRes.ok) {
+      console.error('MuscleWiki search failed:', searchRes.status, await searchRes.text());
+      return res.json({ exercise: { name, gifUrl: null, instructions: [], primaryMuscles: [], secondaryMuscles: [], muscleWikiUrl: mwSearchUrl } });
+    }
 
-      const search = name.toLowerCase()
-        .replace(/\b(barbell|dumbbell|db|bb|cable|machine|kettlebell|kb|bodyweight|bw|weighted|assisted|ez.bar)\b/gi, '')
-        .replace(/[^a-z0-9 ]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+    const searchData = await searchRes.json();
+    const results = searchData?.results || searchData?.exercises || (Array.isArray(searchData) ? searchData : []);
 
-      const scored = exercises.map(ex => {
-        const exName = (ex.name || '').toLowerCase();
-        if (exName === name.toLowerCase()) return { ex, score: 100 };
-        if (exName === search) return { ex, score: 95 };
-        if (exName.includes(search) && search.length > 3) return { ex, score: 80 };
-        if (exName.includes(name.toLowerCase())) return { ex, score: 75 };
-        const searchWords = search.split(' ').filter(w => w.length > 2);
-        const exWords = exName.split(' ');
-        const overlap = searchWords.filter(w => exWords.some(ew => ew.includes(w) || w.includes(ew)));
-        if (overlap.length > 0) return { ex, score: Math.round((overlap.length / Math.max(searchWords.length, 1)) * 60) };
-        return { ex, score: 0 };
-      }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+    if (!results.length) {
+      return res.json({ exercise: { name, gifUrl: null, instructions: [], primaryMuscles: [], secondaryMuscles: [], muscleWikiUrl: mwSearchUrl } });
+    }
 
-      if (scored.length > 0) {
-        const ex = scored[0].ex;
-        const imageBase = 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/' + ex.id + '/';
-        const images = (ex.images || []).map(img => imageBase + img);
+    // Pick best match — prefer exact name match
+    const nameLower = name.toLowerCase();
+    const best = results.find(r => r.name?.toLowerCase() === nameLower) || results[0];
 
-        return res.json({
-          exercise: {
-            name: ex.name,
-            gifUrl: images[0] || null,
-            instructions: ex.instructions || [],
-            primaryMuscles: ex.primaryMuscles || [],
-            secondaryMuscles: ex.secondaryMuscles || [],
-            category: ex.category || '',
-            level: ex.level || '',
-            muscleWikiSlug: slug,
-            muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
-          }
-        });
+    // Get full exercise detail if we only have id
+    let detail = best;
+    if (best.id !== undefined && !best.videos && !best.instructions) {
+      try {
+        const detailRes = await fetch(
+          'https://api.musclewiki.com/exercises/' + best.id,
+          { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
+        );
+        if (detailRes.ok) detail = await detailRes.json();
+      } catch(e) {}
+    }
+
+    // Extract video/gif URL — MuscleWiki returns branded/unbranded video filenames
+    let gifUrl = null;
+    const videos = detail.videos || detail.video_list || [];
+    if (videos.length > 0) {
+      const v = videos[0];
+      // Video filename format: male-Barbell-barbell-bench-press-front.mp4
+      const filename = v.filename || v.file || v;
+      if (typeof filename === 'string') {
+        gifUrl = 'https://api.musclewiki.com/stream/videos/branded/' + filename;
+      } else if (v.url) {
+        gifUrl = v.url;
       }
     }
+
+    // Extract instructions
+    const instructions = (detail.instructions || detail.steps || []).map(s =>
+      typeof s === 'string' ? s : (s.text || s.instruction || s.step || '')
+    ).filter(Boolean);
+
+    // Extract muscles
+    const primaryMuscles = (detail.muscles || detail.primary_muscles || detail.target_muscles || [])
+      .map(m => typeof m === 'string' ? m : (m.name || m.name_en || ''))
+      .filter(Boolean);
+
+    const secondaryMuscles = (detail.muscles_secondary || detail.secondary_muscles || [])
+      .map(m => typeof m === 'string' ? m : (m.name || m.name_en || ''))
+      .filter(Boolean);
+
+    const category = typeof detail.category === 'string' ? detail.category
+      : (detail.category?.name || detail.equipment || '');
+
+    const level = detail.difficulty || detail.level || '';
+
+    // Build the MuscleWiki page URL from slug
+    const slug = (detail.slug || detail.name || name).toLowerCase()
+      .replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
+    const exercisePageUrl = 'https://musclewiki.com/exercise/' + slug;
+
+    res.json({
+      exercise: {
+        name: detail.name || name,
+        gifUrl,
+        isVideo: gifUrl?.includes('.mp4'),
+        instructions,
+        primaryMuscles,
+        secondaryMuscles,
+        category,
+        level,
+        muscleWikiUrl: exercisePageUrl,
+      }
+    });
+
   } catch(err) {
-    console.error('Exercise fallback error:', err.message);
+    console.error('MuscleWiki API error:', err.message);
+    res.json({ exercise: { name, gifUrl: null, instructions: [], primaryMuscles: [], secondaryMuscles: [], muscleWikiUrl: mwSearchUrl } });
   }
-
-  // Return slug only — frontend can show MuscleWiki link as fallback
-  res.json({
-    exercise: {
-      name,
-      gifUrl: null,
-      instructions: [],
-      primaryMuscles: [],
-      secondaryMuscles: [],
-      muscleWikiSlug: slug,
-      muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
-    }
-  });
 });
 
 
