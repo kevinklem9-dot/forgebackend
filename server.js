@@ -1045,6 +1045,12 @@ Use EXACTLY this JSON structure:
             "rest": "3 min",
             "rpe": 8
           }
+        NOTE ON EXERCISE NAMES: Always prefix each exercise name with the exact equipment type:
+        - Free weights: "Barbell Bench Press", "Dumbbell Lateral Raise", "Dumbbell Romanian Deadlift"
+        - Machines: "Machine Chest Press", "Machine Lat Pulldown", "Cable Tricep Pushdown"
+        - Cables: "Cable Fly", "Cable Row", "Cable Lateral Raise"
+        - Bodyweight: "Bodyweight Dip", "Bodyweight Pull-Up"
+        This prefix is critical for matching exercise form videos. Never omit it.
         ]
       }
     ]
@@ -1727,13 +1733,21 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   }
 
   try {
-    // Try full name first, then key words if no exact match
+    // Try multiple name variants for best match
     let results = [];
+    const stripped = name.replace(/^(Barbell|Dumbbell|DB|BB|Cable|Machine|Kettlebell|KB|EZ Bar|EZ-Bar)\s+/i, '');
+    const lastTwo  = name.split(' ').slice(-2).join(' ');
+    const lastOne  = name.split(' ').slice(-1)[0];
+    // For exercises like "Lateral Raise" try with common equipment prefixes too
+    const withDumbbell = stripped !== name ? stripped : 'Dumbbell ' + name;
+
     const attempts = [
-      name,                                                          // "Dumbbell Lateral Raise"
-      name.replace(/^(Barbell|Dumbbell|DB|BB|Cable|Machine|Kettlebell|KB|EZ)\s+/i, ''), // "Lateral Raise"
-      name.split(' ').slice(-2).join(' '),                          // last 2 words
-    ].filter((v, i, a) => v && a.indexOf(v) === i);
+      name,            // exact AI name e.g. "Dumbbell Lateral Raise"
+      stripped,        // strip prefix e.g. "Lateral Raise"
+      withDumbbell,    // try dumbbell prefix if none present
+      lastTwo,         // last 2 words e.g. "Lateral Raise"
+      lastOne,         // last word fallback e.g. "Squat"
+    ].filter((v, i, a) => v && v.length > 2 && a.indexOf(v) === i);
 
     for (const attempt of attempts) {
       const searchRes = await fetch(
