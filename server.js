@@ -1746,10 +1746,11 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     const nameLower = name.toLowerCase();
     const best = results.find(r => r.name?.toLowerCase() === nameLower) || results[0];
 
-    // Get male front video URL — proxy path so we can add auth header
+    // Get male front video URL
     const videos = best.videos || [];
     const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front') || videos[0];
-    const videoFilename = maleFront?.url ? maleFront.url.split('/branded/')[1] : null;
+    // Return direct MuscleWiki URL + API key so frontend can fetch with header
+    const videoUrl = maleFront?.url || null;
 
     // Build slug for musclewiki.com page URL
     const slug = best.name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
@@ -1757,7 +1758,8 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     res.json({
       exercise: {
         name: best.name,
-        videoProxyPath: videoFilename ? '/api/exercise/video/' + videoFilename : null,
+        videoUrl,
+        videoApiKey: process.env.MUSCLEWIKI_API_KEY,
         instructions: best.steps || [],
         primaryMuscles: best.primary_muscles || [],
         secondaryMuscles: [],
@@ -1774,50 +1776,74 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 });
 
 // ── EXERCISE VIDEO PROXY — fetch and buffer with auth header ──
-// Use wildcard to handle filenames with dots (Express strips .ext from :param by default)
-app.get('/api/exercise/video/*', requireAuth, async (req, res) => {
+// In-memory token store for short-lived video access tokens
+const videoTokens = new Map(); // token -> { filename, expires }
+
+// ── EXERCISE VIDEO TOKEN — get a short-lived token ─────
+app.get('/api/exercise/video-token', requireAuth, (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
-  if (!apiKey) return res.status(404).json({ error: 'No API key configured' });
+  if (!apiKey) return res.status(404).json({ error: 'No API key' });
 
-  const filename = req.params[0];
-  if (!filename) return res.status(400).json({ error: 'No filename' });
-  if (!/^[a-zA-Z0-9._-]+$/.test(filename)) return res.status(400).json({ error: 'Invalid filename' });
-
-  try {
-    // Use node-https to buffer the video then send — most compatible approach
-    const videoBuffer = await new Promise((resolve, reject) => {
-      const chunks = [];
-      const options = {
-        hostname: 'api.musclewiki.com',
-        path: '/stream/videos/branded/' + filename,
-        method: 'GET',
-        headers: { 'X-API-Key': apiKey }
-      };
-      const req2 = https.request(options, (res2) => {
-        if (res2.statusCode !== 200) {
-          reject(new Error('upstream_' + res2.statusCode));
-          res2.resume();
-          return;
-        }
-        res2.on('data', chunk => chunks.push(chunk));
-        res2.on('end', () => resolve(Buffer.concat(chunks)));
-        res2.on('error', reject);
-      });
-      req2.on('error', reject);
-      req2.end();
-    });
-
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', videoBuffer.length);
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-    res.status(200).end(videoBuffer);
-
-  } catch(err) {
-    console.error('Video proxy error:', filename, err.message);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
+  const { filename } = req.query;
+  if (!filename || !/^[a-zA-Z0-9._-]+$/.test(filename)) {
+    return res.status(400).json({ error: 'Invalid filename' });
   }
+
+  // Generate random token
+  const token = require('crypto').randomBytes(16).toString('hex');
+  videoTokens.set(token, { filename, expires: Date.now() + 60000 }); // 60s TTL
+
+  // Cleanup expired tokens
+  for (const [k, v] of videoTokens) {
+    if (v.expires < Date.now()) videoTokens.delete(k);
+  }
+
+  res.json({ token });
+});
+
+// ── EXERCISE VIDEO STREAM — stream using token (no auth header needed) ─
+app.get('/api/exercise/video-stream/:token', (req, res) => {
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  if (!apiKey) return res.status(404).send('No API key');
+
+  const entry = videoTokens.get(req.params.token);
+  if (!entry || entry.expires < Date.now()) {
+    return res.status(403).send('Token expired or invalid');
+  }
+
+  // Delete token after use (one-time)
+  videoTokens.delete(req.params.token);
+
+  const options = {
+    hostname: 'api.musclewiki.com',
+    path: '/stream/videos/branded/' + entry.filename,
+    method: 'GET',
+    headers: { 'X-API-Key': apiKey }
+  };
+
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+
+  const proxyReq = https.request(options, (proxyRes) => {
+    if (proxyRes.statusCode !== 200) {
+      res.status(proxyRes.statusCode).end();
+      proxyRes.resume();
+      return;
+    }
+    if (proxyRes.headers['content-length']) {
+      res.setHeader('Content-Length', proxyRes.headers['content-length']);
+    }
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error('Video stream error:', err.message);
+    if (!res.headersSent) res.status(500).end();
+  });
+
+  proxyReq.end();
 });
 
 // ── EXERCISE VIDEO TEST — check API key works ───────────
