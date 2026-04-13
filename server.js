@@ -54,21 +54,40 @@ function buildExerciseLookup(exercises) {
 function findMuscleWikiName(name, exercises) {
   if (!exercises || !name) return null;
   const nameLower = name.toLowerCase().trim();
-  // Exact match
+
+  // 1. Exact match
   const exact = exercises.find(e => e.name.toLowerCase() === nameLower);
   if (exact) return exact.name;
-  // All words present
+
+  // 2. All meaningful words from AI name must appear in MuscleWiki name
   const words = nameLower.split(' ').filter(w => w.length >= 3);
+  if (words.length < 2) return null; // too vague, don't guess
+
   const allMatch = exercises.filter(e => {
     const en = e.name.toLowerCase();
     return words.every(w => en.includes(w));
   });
+
   if (allMatch.length === 1) return allMatch[0].name;
   if (allMatch.length > 1) {
-    // Pick shortest name (most specific match)
+    // Prefer shortest name (avoids "Dumbbell Full Lateral Raise" over "Dumbbell Lateral Raise")
     return allMatch.sort((a, b) => a.name.length - b.name.length)[0].name;
   }
-  return null;
+
+  // 3. Try without equipment prefix
+  const stripped = nameLower.replace(/^(barbell|dumbbell|cable|machine|kettlebell|ez bar|ez-bar|bodyweight|bw|db|bb|kb)\s+/i, '');
+  if (stripped !== nameLower) {
+    const strippedWords = stripped.split(' ').filter(w => w.length >= 3);
+    const strippedMatch = exercises.filter(e => {
+      const en = e.name.toLowerCase();
+      return strippedWords.every(w => en.includes(w));
+    });
+    if (strippedMatch.length >= 1) {
+      return strippedMatch.sort((a, b) => a.name.length - b.name.length)[0].name;
+    }
+  }
+
+  return null; // No confident match — don't remap
 }
 
 // Pre-warm cache on startup
@@ -1465,7 +1484,7 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
 
     let trialDaysLeft = 0;
     if (status === 'trial' && trialEndsAt) {
-      trialDaysLeft = Math.max(0, Math.ceil((new Date(trialEndsAt) - new Date()) / (1000 * 60 * 60 * 24)));
+      trialDaysLeft = Math.max(0, Math.floor((new Date(trialEndsAt) - new Date()) / (1000 * 60 * 60 * 24)));
     }
 
     const coachUsage = await getCoachUsage(req.user.id);
@@ -1476,6 +1495,7 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
       status,
       isExempt,
       trialDaysLeft,
+      trialEndsAt: trialEndsAt || null,
       coachUsage,
       coachLimit: 20,
       hasUnlimitedCoach: hasAccess('unlimited_coach', accessTier, isExempt),
@@ -1596,6 +1616,25 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
 
 
 // ── ADMIN — Set user tier ──────────────────────
+// ── USER TIER SELECTION (preview — Stripe not yet live) ──
+app.patch('/api/subscription/tier', requireAuth, async (req, res) => {
+  const { tier } = req.body;
+  const validTiers = ['iron', 'steel', 'forge'];
+  if (!validTiers.includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ subscription_tier: tier })
+      .eq('id', req.user.id)
+      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt')
+      .maybeSingle();
+    if (error) throw error;
+    res.json({ success: true, tier: data.subscription_tier, trialEndsAt: data.trial_ends_at });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.patch('/api/admin/users/:userId/tier', requireAuth, requireAdmin, async (req, res) => {
   const { userId } = req.params;
   const { tier, is_exempt } = req.body;
