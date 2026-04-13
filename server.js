@@ -1773,8 +1773,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   }
 });
 
-// ── EXERCISE VIDEO PROXY — buffers video server-side, sends to client ──────
-// Uses exact same approach as /buftest which confirmed works (752902 bytes)
+// ── EXERCISE VIDEO PROXY ────────────────────────────────
 app.get('/api/exercise/video/*', requireAuth, (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.status(404).json({ error: 'No API key configured' });
@@ -1793,8 +1792,8 @@ app.get('/api/exercise/video/*', requireAuth, (req, res) => {
     headers: { 'X-API-Key': apiKey }
   }, (proxyRes) => {
     if (proxyRes.statusCode !== 200) {
-      console.error('MuscleWiki video upstream error:', proxyRes.statusCode);
-      if (!res.headersSent) res.status(proxyRes.statusCode).json({ error: 'upstream ' + proxyRes.statusCode });
+      console.error('MuscleWiki upstream:', proxyRes.statusCode, filename);
+      res.socket && res.socket.writable && res.status(proxyRes.statusCode).json({ error: 'upstream ' + proxyRes.statusCode });
       proxyRes.resume();
       return;
     }
@@ -1802,16 +1801,21 @@ app.get('/api/exercise/video/*', requireAuth, (req, res) => {
     proxyRes.on('data', chunk => chunks.push(chunk));
 
     proxyRes.on('end', () => {
-      if (res.headersSent) return;
+      if (res.headersSent || !res.socket || !res.socket.writable) return;
       const buf = Buffer.concat(chunks);
-      res.writeHead(200, {
-        'Content-Type': 'video/mp4',
-        'Content-Length': buf.length,
-        'Cache-Control': 'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*',
-        'Cross-Origin-Resource-Policy': 'cross-origin',
-      });
-      res.end(buf);
+      // Write raw HTTP response to bypass Express middleware charset injection
+      res.socket.write(
+        'HTTP/1.1 200 OK\r\n' +
+        'Content-Type: video/mp4\r\n' +
+        'Content-Length: ' + buf.length + '\r\n' +
+        'Cache-Control: public, max-age=3600\r\n' +
+        'Access-Control-Allow-Origin: *\r\n' +
+        'Cross-Origin-Resource-Policy: cross-origin\r\n' +
+        'Connection: close\r\n' +
+        '\r\n'
+      );
+      res.socket.write(buf);
+      res.socket.end();
     });
 
     proxyRes.on('error', (e) => {
@@ -1826,13 +1830,13 @@ app.get('/api/exercise/video/*', requireAuth, (req, res) => {
   });
 
   proxyReq.setTimeout(30000, () => {
-    console.error('Video proxy timeout:', filename);
     proxyReq.destroy();
     if (!res.headersSent) res.status(504).json({ error: 'timeout' });
   });
 
   proxyReq.end();
 });
+
 
 // ── EXERCISE DEBUG — see raw MuscleWiki response ───────
 app.get('/api/exercise/debug', requireAuth, async (req, res) => {
