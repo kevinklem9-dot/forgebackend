@@ -1820,6 +1820,32 @@ app.get('/api/exercise/video/*', requireAuth, (req, res) => {
   proxyReq.end();
 });
 
+// ── EXERCISE VIDEO TEST — check API key works ───────────
+app.get('/api/exercise/video-test', requireAuth, (req, res) => {
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  if (!apiKey) return res.json({ error: 'No API key set' });
+
+  const options = {
+    hostname: 'api.musclewiki.com',
+    path: '/stream/videos/branded/male-barbell-bench-press-front.mp4',
+    method: 'HEAD',
+    headers: { 'X-API-Key': apiKey }
+  };
+
+  const testReq = https.request(options, (testRes) => {
+    res.json({
+      status: testRes.statusCode,
+      headers: testRes.headers,
+      apiKeyLength: apiKey.length,
+      message: testRes.statusCode === 200 ? 'API key works' : 'API key rejected — status ' + testRes.statusCode
+    });
+    testRes.resume();
+  });
+
+  testReq.on('error', (err) => res.json({ error: err.message }));
+  testReq.end();
+});
+
 // ── EXERCISE DEBUG — see raw MuscleWiki response ───────
 app.get('/api/exercise/debug', requireAuth, async (req, res) => {
   const { name } = req.query;
