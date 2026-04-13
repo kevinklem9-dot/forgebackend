@@ -1775,49 +1775,49 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 
 // ── EXERCISE VIDEO PROXY — fetch and buffer with auth header ──
 // Use wildcard to handle filenames with dots (Express strips .ext from :param by default)
-app.get('/api/exercise/video/*', requireAuth, (req, res) => {
+app.get('/api/exercise/video/*', requireAuth, async (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.status(404).json({ error: 'No API key configured' });
 
   const filename = req.params[0];
   if (!filename) return res.status(400).json({ error: 'No filename' });
+  if (!/^[a-zA-Z0-9._-]+$/.test(filename)) return res.status(400).json({ error: 'Invalid filename' });
 
-  if (!/^[a-zA-Z0-9._-]+$/.test(filename)) {
-    return res.status(400).json({ error: 'Invalid filename' });
-  }
-
-  const options = {
-    hostname: 'api.musclewiki.com',
-    path: '/stream/videos/branded/' + filename,
-    method: 'GET',
-    headers: { 'X-API-Key': apiKey }
-  };
-
-  const proxyReq = https.request(options, (proxyRes) => {
-    if (proxyRes.statusCode !== 200) {
-      console.error('MuscleWiki video failed:', proxyRes.statusCode, filename);
-      res.status(proxyRes.statusCode).json({ error: 'Video fetch failed: ' + proxyRes.statusCode });
-      proxyRes.resume();
-      return;
-    }
+  try {
+    // Use node-https to buffer the video then send — most compatible approach
+    const videoBuffer = await new Promise((resolve, reject) => {
+      const chunks = [];
+      const options = {
+        hostname: 'api.musclewiki.com',
+        path: '/stream/videos/branded/' + filename,
+        method: 'GET',
+        headers: { 'X-API-Key': apiKey }
+      };
+      const req2 = https.request(options, (res2) => {
+        if (res2.statusCode !== 200) {
+          reject(new Error('upstream_' + res2.statusCode));
+          res2.resume();
+          return;
+        }
+        res2.on('data', chunk => chunks.push(chunk));
+        res2.on('end', () => resolve(Buffer.concat(chunks)));
+        res2.on('error', reject);
+      });
+      req2.on('error', reject);
+      req2.end();
+    });
 
     res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', videoBuffer.length);
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-    if (proxyRes.headers['content-length']) {
-      res.setHeader('Content-Length', proxyRes.headers['content-length']);
-    }
-    res.status(200);
-    proxyRes.pipe(res);
-  });
+    res.status(200).end(videoBuffer);
 
-  proxyReq.on('error', (err) => {
-    console.error('Video proxy request error:', err.message);
+  } catch(err) {
+    console.error('Video proxy error:', filename, err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
-  });
-
-  proxyReq.end();
+  }
 });
 
 // ── EXERCISE VIDEO TEST — check API key works ───────────
