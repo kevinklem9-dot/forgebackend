@@ -212,10 +212,8 @@ async function normaliseExerciseNameWithAI(name, exercises) {
 
   try {
     const exerciseList = exercises.slice(0, 500).map(e => e.name).join(', ');
-    const Anthropic = require('@anthropic-ai/sdk').default;
-    const ai = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-    const msg = await ai.messages.create({
+    // Use global anthropic instance — don't re-instantiate
+    const msg = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 50,
       messages: [{
@@ -506,26 +504,27 @@ async function getCoachUsage(userId) {
 
 async function incrementCoachUsage(userId) {
   const month = billingMonth();
-  await supabase.from('ai_coach_usage').upsert({
-    user_id: userId,
-    month,
-    message_count: 1,
-    updated_at: new Date().toISOString()
-  }, {
-    onConflict: 'user_id,month',
-    ignoreDuplicates: false
-  });
-  // Increment via RPC or re-fetch and update
-  const { data } = await supabase
+  // Fetch current count first
+  const { data: existing } = await supabase
     .from('ai_coach_usage')
     .select('id, message_count')
     .eq('user_id', userId)
     .eq('month', month)
     .maybeSingle();
-  if (data) {
+
+  if (existing) {
+    // Row exists — increment
     await supabase.from('ai_coach_usage')
-      .update({ message_count: (data.message_count || 0) + 1, updated_at: new Date().toISOString() })
-      .eq('id', data.id);
+      .update({ message_count: (existing.message_count || 0) + 1, updated_at: new Date().toISOString() })
+      .eq('id', existing.id);
+  } else {
+    // First message this month — insert with count 1
+    await supabase.from('ai_coach_usage').insert({
+      user_id: userId,
+      month,
+      message_count: 1,
+      updated_at: new Date().toISOString()
+    });
   }
 }
 
@@ -883,8 +882,9 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
 
     res.json({ reply: cleanReply, plan_update: planUpdate });
   } catch (err) {
-    console.error('Chat error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Chat error:', err.message);
+    console.error('Chat stack:', err.stack);
+    res.status(500).json({ error: err.message, detail: err.stack?.split('\n')[1] });
   }
 });
 
