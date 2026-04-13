@@ -1733,21 +1733,18 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   }
 
   try {
-    // Try multiple name variants for best match
+    // Try name variants — never fall back to single words (causes wrong matches)
     let results = [];
     const stripped = name.replace(/^(Barbell|Dumbbell|DB|BB|Cable|Machine|Kettlebell|KB|EZ Bar|EZ-Bar)\s+/i, '');
-    const lastTwo  = name.split(' ').slice(-2).join(' ');
-    const lastOne  = name.split(' ').slice(-1)[0];
-    // For exercises like "Lateral Raise" try with common equipment prefixes too
     const withDumbbell = stripped !== name ? stripped : 'Dumbbell ' + name;
+    const withCable    = stripped !== name ? stripped : 'Cable ' + name;
 
     const attempts = [
-      name,            // exact AI name e.g. "Dumbbell Lateral Raise"
-      stripped,        // strip prefix e.g. "Lateral Raise"
-      withDumbbell,    // try dumbbell prefix if none present
-      lastTwo,         // last 2 words e.g. "Lateral Raise"
-      lastOne,         // last word fallback e.g. "Squat"
-    ].filter((v, i, a) => v && v.length > 2 && a.indexOf(v) === i);
+      name,            // "Dumbbell Lateral Raise" — exact AI name first
+      withDumbbell,    // "Lateral Raise" or "Dumbbell Lateral Raise"
+      withCable,       // "Cable Lateral Raise" as alternative
+      stripped,        // bare name without any prefix
+    ].filter((v, i, a) => v && v.split(' ').length >= 2 && a.indexOf(v) === i); // minimum 2 words — no single word fallbacks
 
     for (const attempt of attempts) {
       const searchRes = await fetch(
@@ -1766,16 +1763,26 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
-    // Score matches — prefer exact name, then name contains original, then first result
+    // Score matches — require meaningful word overlap, not just any match
     const nameLower = name.toLowerCase();
+    const strippedLower = stripped.toLowerCase();
     const scored = results.map(r => {
       const rName = (r.name || '').toLowerCase();
       if (rName === nameLower) return { r, score: 100 };
-      if (nameLower.includes(rName) || rName.includes(nameLower)) return { r, score: 80 };
-      const words = nameLower.split(' ').filter(w => w.length > 3);
-      const matches = words.filter(w => rName.includes(w));
-      return { r, score: Math.round((matches.length / Math.max(words.length, 1)) * 60) };
-    }).sort((a, b) => b.score - a.score);
+      if (rName === strippedLower) return { r, score: 95 };
+      if (rName.includes(strippedLower) && strippedLower.length > 5) return { r, score: 85 };
+      if (strippedLower.includes(rName) && rName.length > 5) return { r, score: 80 };
+      // Word overlap — only count meaningful words (4+ chars), require >50% match
+      const searchWords = strippedLower.split(' ').filter(w => w.length >= 4);
+      const matchCount = searchWords.filter(w => rName.includes(w)).length;
+      const ratio = searchWords.length > 0 ? matchCount / searchWords.length : 0;
+      if (ratio >= 0.5) return { r, score: Math.round(ratio * 70) };
+      return { r, score: 0 }; // No meaningful match
+    }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+
+    if (!scored.length) {
+      return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
+    }
 
     const best = scored[0].r;
 
