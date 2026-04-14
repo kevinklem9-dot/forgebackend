@@ -1025,12 +1025,22 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
 
     const systemPrompt = buildCheckinPrompt(profile, planData, recentHistory, session_summary, feeling, difficulty, language);
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1500,
-      system: systemPrompt,
-      messages: messages || [{ role: 'user', content: `I just finished training. Feeling: ${feeling}. Difficulty: ${difficulty}.` }]
-    });
+    let response;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        response = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1500,
+          system: systemPrompt,
+          messages: messages || [{ role: 'user', content: `I just finished training. Feeling: ${feeling}. Difficulty: ${difficulty}.` }]
+        });
+        break;
+      } catch(apiErr) {
+        const is529 = apiErr.status === 529 || apiErr.message?.includes('529') || apiErr.message?.includes('overloaded');
+        if (is529 && attempt < 3) { await new Promise(r => setTimeout(r, 1500 * attempt)); continue; }
+        throw apiErr;
+      }
+    }
 
     const rawReply = response.content[0].text;
     const planUpdateMatch = rawReply.match(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/);
@@ -1085,12 +1095,15 @@ app.post('/api/log', requireAuth, async (req, res) => {
     }
     const today = new Date().toISOString().split('T')[0];
 
-    // Save session log — delete today's existing log first then insert fresh
-    await supabase.from('session_logs')
+    // Save session log — upsert pattern: delete today's existing entry then insert fresh
+    const { error: delError } = await supabase.from('session_logs')
       .delete()
       .eq('user_id', req.user.id)
       .eq('day_index', day_index)
-      .eq('logged_at', today);
+      .gte('logged_at', today)
+      .lt('logged_at', today + 'T23:59:59');
+
+    if (delError) console.warn('session_logs delete warning:', delError.message);
 
     const { error: logError } = await supabase.from('session_logs').insert({
       user_id: req.user.id,
@@ -1100,7 +1113,10 @@ app.post('/api/log', requireAuth, async (req, res) => {
       exercises
     });
 
-    if (logError) throw logError;
+    if (logError) {
+      console.error('session_logs insert error:', logError.message, logError.details, logError.hint);
+      throw logError;
+    }
 
     const prUpdates = [];
     for (const ex of exercises) {
