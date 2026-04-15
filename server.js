@@ -249,7 +249,7 @@ const MANUAL_EXERCISE_MAP = {
   'decline bench press':'Barbell Decline Bench Press',
   'dumbbell press':'Dumbbell Bench Press','dumbbell bench press':'Dumbbell Bench Press',
   'chest fly':'Dumbbell Fly','cable fly':'Cable Fly','pec deck':'Machine Fly',
-  'pull up':'Bodyweight Pull Up','pull ups':'Bodyweight Pull Up','pullup':'Bodyweight Pull Up',
+  'pull up':'Bodyweight Pull Up','pull ups':'Bodyweight Pull Up','pullup':'Bodyweight Pull Up','bodyweight pull up':'Bodyweight Pull Up','bodyweight pullup':'Bodyweight Pull Up',
   'chin up':'Bodyweight Chin Up','chin ups':'Bodyweight Chin Up',
   'lat pulldown':'Cable Lat Pulldown','cable pulldown':'Cable Lat Pulldown',
   'seated row':'Cable Seated Row','cable row':'Cable Seated Row',
@@ -294,6 +294,10 @@ const MANUAL_EXERCISE_MAP = {
   'hyperextension':'Machine Back Extension','reverse fly':'Dumbbell Rear Delt Fly',
   'incline dumbbell curl':'Dumbbell Incline Curl','cable curl':'Cable Bicep Curl',
   'rope pushdown':'Cable Rope Tricep Pushdown','overhead cable extension':'Cable Overhead Tricep Extension',
+  // Additional mappings from test failures
+  'cable tricep pushdown':'Cable Rope Tricep Pushdown',
+  'tricep rope pushdown':'Cable Rope Tricep Pushdown',
+  'cable pushdown':'Cable Rope Tricep Pushdown',
 };
 
 // Resolve AI exercise name -> exact MuscleWiki name
@@ -2148,8 +2152,17 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       const en = e.name.toLowerCase();
       if (en === nameLower) return { e, score: 100 };
       if (en === stripped) return { e, score: 95 };
-      if (words.length >= 2 && words.every(w => en.includes(w))) return { e, score: 85 };
-      if (strippedWords.length >= 2 && strippedWords.every(w => en.includes(w))) return { e, score: 75 };
+      // All search words present — but penalise results much longer than query
+      // Prevents "Bodyweight Superman Pull" (22 chars) beating "Bodyweight Pull Up" (18 chars)
+      // when searching "Bodyweight Pull Up" — the correct match is closer in length
+      if (words.length >= 2 && words.every(w => en.includes(w))) {
+        const lengthPenalty = Math.max(0, en.length - nameLower.length) / 10;
+        return { e, score: Math.max(50, 85 - lengthPenalty) };
+      }
+      if (strippedWords.length >= 2 && strippedWords.every(w => en.includes(w))) {
+        const lengthPenalty = Math.max(0, en.length - strippedLower.length) / 10;
+        return { e, score: Math.max(40, 75 - lengthPenalty) };
+      }
       if (words.length >= 2) {
         const matchCount = words.filter(w => en.includes(w)).length;
         const ratio = matchCount / words.length;
@@ -2337,6 +2350,45 @@ app.get('/api/exercise/debug', requireAuth, async (req, res) => {
   }
 });
 
+
+// ── EXERCISE VIDEO TEST — check API key + cache status ──
+app.get('/api/exercise/video-test', requireAuth, async (req, res) => {
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  if (!apiKey) return res.json({ error: 'No API key set', status: 0 });
+
+  try {
+    // Check cache status
+    const cached = mwExerciseCache;
+    const cacheAge = cached ? Math.round((Date.now() - mwExerciseCacheTime) / 60000) : null;
+
+    // HEAD request to MuscleWiki to verify key is valid
+    const testReq = await new Promise((resolve, reject) => {
+      const r = https.request({
+        hostname: 'api.musclewiki.com',
+        path: '/stream/videos/branded/male-barbell-bench-press-front.mp4',
+        method: 'HEAD',
+        headers: { 'X-API-Key': apiKey }
+      }, (res2) => {
+        resolve({ statusCode: res2.statusCode, headers: res2.headers });
+        res2.resume();
+      });
+      r.on('error', reject);
+      r.setTimeout(8000, () => { r.destroy(); reject(new Error('timeout')); });
+      r.end();
+    });
+
+    res.json({
+      status: testReq.statusCode,
+      apiKeyLength: apiKey.length,
+      cacheLoaded: !!cached,
+      cacheSize: cached ? cached.length : 0,
+      cacheAgeMinutes: cacheAge,
+      message: testReq.statusCode === 200 ? 'API key valid, cache ready' : 'API key issue: status ' + testReq.statusCode,
+    });
+  } catch(e) {
+    res.json({ error: e.message, status: 0 });
+  }
+});
 
 // ── VIDEO BUFFER — works (confirmed 752902 bytes) ────────
 app.get('/api/exercise/buftest', requireAuth, async (req, res) => {
