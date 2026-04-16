@@ -32,6 +32,14 @@ async function getMuscleWikiExercises() {
     const data = await res.json();
     const exercises = data?.results || (Array.isArray(data) ? data : []);
     if (!exercises.length) return null;
+    // Normalize ID field — MuscleWiki (Django REST) may use 'pk' instead of 'id'
+    for (const ex of exercises) {
+      if (!ex.id && ex.pk) ex.id = ex.pk;
+    }
+    if (exercises[0]) {
+      console.log('MuscleWiki sample exercise keys:', Object.keys(exercises[0]).join(', '));
+      console.log('MuscleWiki sample id:', exercises[0].id, '| pk:', exercises[0].pk, '| name:', exercises[0].name);
+    }
     mwExerciseCache = exercises;
     mwExerciseCacheTime = now;
     console.log('MuscleWiki exercise cache loaded:', exercises.length, 'exercises');
@@ -391,7 +399,8 @@ async function resolveExerciseName(name, exercises) {
 const _localLookupCache = new Map(); // in-memory layer on top of Supabase
 
 async function getExerciseLookup(aiNameLower) {
-  if (_localLookupCache.has(aiNameLower)) return _localLookupCache.get(aiNameLower);
+  const localCached = _localLookupCache.get(aiNameLower);
+  if (localCached) return localCached;
   try {
     const { data } = await supabase
       .from('exercise_lookup_cache')
@@ -411,7 +420,7 @@ async function saveExerciseLookup(aiName, mwExercise) {
   const side  = videos.find(v => v.gender === 'male' && v.angle === 'side');
   const getFile = v => v?.url ? v.url.split('/branded/')[1] : null;
   const entry = {
-    mw_id: mwExercise.id,
+    mw_id: mwExercise.id || mwExercise.pk,
     mw_name: mwExercise.name,
     mw_video_front: getFile(front) || null,
     mw_video_side: getFile(side) || null,
@@ -2259,8 +2268,9 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     if (frontFile || sideFile) console.log('Video files for', (ex.name || name), ':', frontFile, sideFile);
     else if (videos.length > 0) console.log('Videos present but no filename extracted for', ex.name, '| sample URL:', videos[0]?.url);
     else console.log('No videos for', ex.name || name, '| id:', ex.id);
-    const mwPageUrl = ex.id
-      ? 'https://musclewiki.com/exercises/' + ex.id
+    const exId = ex.id || ex.pk;
+    const mwPageUrl = exId
+      ? 'https://musclewiki.com/exercises/' + exId
       : 'https://musclewiki.com/search?q=' + encodeURIComponent(ex.name || name);
     const result = {
       name: ex.name || name,
@@ -2278,9 +2288,10 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 
   // buildResponse: always fetch full detail by ID — list endpoint never has videos
   const buildResponse = async (ex) => {
-    if (ex.id && process.env.MUSCLEWIKI_API_KEY) {
+    const exerciseId = ex.id || ex.pk;
+    if (exerciseId && process.env.MUSCLEWIKI_API_KEY) {
       try {
-        const detailRes = await fetch('https://api.musclewiki.com/exercises/' + ex.id, {
+        const detailRes = await fetch('https://api.musclewiki.com/exercises/' + exerciseId, {
           headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' }
         });
         if (detailRes.ok) {
@@ -2314,7 +2325,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   if (mwId) {
     const mwExDirect = await getMuscleWikiExercises();
     if (mwExDirect) {
-      const directMatch = mwExDirect.find(e => e.id === mwId);
+      const directMatch = mwExDirect.find(e => (e.id || e.pk) === mwId);
       if (directMatch) return res.json({ exercise: await buildResponse(directMatch) });
     }
   }
@@ -2322,10 +2333,11 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   // ── STEP 1: Supabase persistent cache — fastest, most accurate ──
   try {
     const cachedLookup = await getExerciseLookup(nameLower);
-    if (cachedLookup?.mw_name) {
+    if (cachedLookup?.mw_name && cachedLookup.mw_video_front) {
+      // Only use cache if it actually has video data — old entries with null videos are stale
       const mwEx = await getMuscleWikiExercises();
       if (mwEx) {
-        const full = mwEx.find(e => e.id === cachedLookup.mw_id || e.name === cachedLookup.mw_name);
+        const full = mwEx.find(e => (e.id || e.pk) === cachedLookup.mw_id || e.name === cachedLookup.mw_name);
         if (full) return res.json({ exercise: await buildResponse(full) });
       }
       return res.json({ exercise: buildFromCache(cachedLookup) });
@@ -2505,6 +2517,97 @@ app.get('/api/exercise/debug', requireAuth, async (req, res) => {
     });
   } catch(err) {
     res.json({ error: err.message });
+  }
+});
+
+
+// ── EXERCISE VIDEO TRACE — full debug trace for video lookup ──
+app.get('/api/exercise/test-video', requireAuth, async (req, res) => {
+  const { name } = req.query;
+  if (!name) return res.status(400).json({ error: 'name param required' });
+  const trace = [];
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  trace.push({ step: 'input', name, apiKeyPresent: !!apiKey });
+
+  try {
+    // Step 1: Load exercise cache
+    const exercises = await getMuscleWikiExercises();
+    trace.push({ step: 'cache', exerciseCount: exercises?.length || 0 });
+
+    if (!exercises) return res.json({ trace, error: 'No exercise cache available' });
+
+    // Log sample exercise structure
+    if (exercises[0]) {
+      trace.push({ step: 'sample_exercise_keys', keys: Object.keys(exercises[0]), id: exercises[0].id, pk: exercises[0].pk, name: exercises[0].name });
+    }
+
+    // Step 2: Resolve name
+    const resolvedName = await resolveExerciseName(name, exercises);
+    trace.push({ step: 'resolve_name', input: name, resolved: resolvedName });
+
+    // Step 3: Find match in cache
+    const nameLower = name.toLowerCase().trim();
+    let match = null;
+    if (resolvedName) {
+      match = exercises.find(e => e.name.toLowerCase() === resolvedName.toLowerCase());
+    }
+    if (!match) {
+      // Try fuzzy
+      const words = nameLower.split(' ').filter(w => w.length >= 3);
+      const fuzzy = exercises.filter(e => words.length >= 2 && words.every(w => e.name.toLowerCase().includes(w)));
+      if (fuzzy.length) match = fuzzy.sort((a, b) => a.name.length - b.name.length)[0];
+    }
+    trace.push({ step: 'cache_match', found: !!match, matchName: match?.name || null, matchId: match?.id || null, matchPk: match?.pk || null, hasVideosInList: !!(match?.videos?.length) });
+
+    if (!match) return res.json({ trace, error: 'No match found in cache' });
+
+    // Step 4: Fetch detail by ID
+    const exerciseId = match.id || match.pk;
+    trace.push({ step: 'detail_fetch_start', url: 'https://api.musclewiki.com/exercises/' + exerciseId });
+
+    if (!exerciseId) {
+      trace.push({ step: 'detail_fetch_skip', reason: 'No ID on exercise object' });
+      return res.json({ trace, error: 'Exercise has no id or pk field' });
+    }
+
+    const detailRes = await fetch('https://api.musclewiki.com/exercises/' + exerciseId, {
+      headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
+    });
+    trace.push({ step: 'detail_response', status: detailRes.status });
+
+    if (!detailRes.ok) {
+      const errText = await detailRes.text().catch(() => '');
+      trace.push({ step: 'detail_error', body: errText.substring(0, 500) });
+      return res.json({ trace, error: 'Detail fetch failed: ' + detailRes.status });
+    }
+
+    const detail = await detailRes.json();
+    trace.push({ step: 'detail_parsed', keys: Object.keys(detail), videoCount: detail.videos?.length || 0, detailName: detail.name });
+
+    // Step 5: Extract video filenames
+    const videos = detail.videos || [];
+    if (videos.length > 0) {
+      trace.push({ step: 'videos_raw', videos: videos.slice(0, 6) });
+    }
+
+    const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
+    const maleSide = videos.find(v => v.gender === 'male' && v.angle === 'side');
+    const getFilename = v => {
+      if (!v?.url) return null;
+      if (v.url.includes('/branded/')) return v.url.split('/branded/')[1];
+      return v.url.split('/').pop() || null;
+    };
+    const frontFile = getFilename(maleFront) || getFilename(videos[0]) || null;
+    const sideFile = getFilename(maleSide) || null;
+    trace.push({ step: 'extracted_filenames', videoFilename: frontFile, videoFilename2: sideFile });
+
+    return res.json({
+      trace,
+      result: { name: detail.name || match.name, videoFilename: frontFile, videoFilename2: sideFile }
+    });
+  } catch(err) {
+    trace.push({ step: 'error', message: err.message, stack: err.stack?.split('\n').slice(0, 3) });
+    return res.json({ trace, error: err.message });
   }
 });
 
