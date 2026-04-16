@@ -2181,17 +2181,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   const nameLower = name.toLowerCase().trim();
   const mwId = req.query.mw_id ? parseInt(req.query.mw_id) : null;
 
-  // ── STEP 0: Direct ID lookup — Option 3 ──
-  // When mw_id is provided (stored in plan), skip all matching entirely
-  if (mwId) {
-    const mwExDirect = await getMuscleWikiExercises();
-    if (mwExDirect) {
-      const directMatch = mwExDirect.find(e => e.id === mwId);
-      if (directMatch) return res.json({ exercise: buildResponse(directMatch) });
-    }
-  }
-
-  // Helper: build response from a MuscleWiki exercise object
+  // Helpers defined first — must be before any usage (const is not hoisted)
   const buildResponse = (ex) => {
     const videos = ex.videos || [];
     const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
@@ -2208,12 +2198,10 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       difficulty: ex.difficulty || '',
       muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
     };
-    // Save to persistent cache for future lookups
-    saveExerciseLookup(name, ex);
+    saveExerciseLookup(name, ex); // persist for all future users
     return result;
   };
 
-  // Helper: build response from a cached lookup entry (already has filenames)
   const buildFromCache = (entry) => {
     const slug = entry.mw_name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
     return {
@@ -2227,6 +2215,15 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
     };
   };
+
+  // ── STEP 0: Direct ID lookup — bypasses all matching ──
+  if (mwId) {
+    const mwExDirect = await getMuscleWikiExercises();
+    if (mwExDirect) {
+      const directMatch = mwExDirect.find(e => e.id === mwId);
+      if (directMatch) return res.json({ exercise: buildResponse(directMatch) });
+    }
+  }
 
   // ── STEP 1: Supabase persistent cache — fastest, most accurate ──
   const cachedLookup = await getExerciseLookup(nameLower);
