@@ -19,44 +19,60 @@ const MW_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 async function getMuscleWikiExercises() {
   const now = Date.now();
-  if (mwExerciseCache && mwExerciseCache.length > 0 && (now - mwExerciseCacheTime) < MW_CACHE_TTL) {
+  if (mwExerciseCache && mwExerciseCache.length > 100 && (now - mwExerciseCacheTime) < MW_CACHE_TTL) {
     return mwExerciseCache;
   }
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return null;
   try {
-    // Paginate through all exercises — API returns max ~100 per page
+    // Fetch ALL exercises via pagination — API caps at 100 per page
     const all = [];
-    let offset = 0;
     const pageSize = 100;
-    let totalCount = null;
 
-    while (true) {
-      const res = await fetch(
-        'https://api.musclewiki.com/exercises?limit=' + pageSize + '&offset=' + offset,
-        { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
+    // Get first page to find total count
+    const firstRes = await fetch(
+      'https://api.musclewiki.com/exercises?limit=' + pageSize + '&offset=0',
+      { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
+    );
+    if (!firstRes.ok) { console.error('MuscleWiki first page failed:', firstRes.status); return null; }
+    const firstData = await firstRes.json();
+    const firstPage = firstData?.results || (Array.isArray(firstData) ? firstData : []);
+    if (!firstPage.length) return null;
+    all.push(...firstPage);
+
+    // totalCount from API response
+    const totalCount = firstData.count || firstData.total || 0;
+    console.log('MuscleWiki total exercises:', totalCount, '| first page:', firstPage.length);
+
+    // Fetch remaining pages in parallel (faster than sequential)
+    if (totalCount > pageSize) {
+      const offsets = [];
+      for (let offset = pageSize; offset < totalCount && offset < 3000; offset += pageSize) {
+        offsets.push(offset);
+      }
+      // Fetch all remaining pages concurrently
+      const pagePromises = offsets.map(offset =>
+        fetch('https://api.musclewiki.com/exercises?limit=' + pageSize + '&offset=' + offset, {
+          headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
+        })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => d?.results || (Array.isArray(d) ? d : []))
+        .catch(() => [])
       );
-      if (!res.ok) { console.error('MuscleWiki page fetch failed:', res.status); break; }
-      const data = await res.json();
-      const page = data?.results || (Array.isArray(data) ? data : []);
-      if (!page.length) break;
-      if (totalCount === null) totalCount = data.count || data.total || 9999;
-      all.push(...page);
-      offset += pageSize;
-      if (all.length >= totalCount) break;
-      if (all.length >= 2500) break; // safety cap
+      const pages = await Promise.all(pagePromises);
+      for (const page of pages) all.push(...page);
     }
 
     if (!all.length) return null;
 
-    // Normalise ID field
+    // Normalise ID field — API may use pk instead of id
     for (const ex of all) {
       if (!ex.id && ex.pk) ex.id = ex.pk;
     }
 
     mwExerciseCache = all;
     mwExerciseCacheTime = now;
-    console.log('MuscleWiki cache loaded:', all.length, 'exercises via pagination');
+    console.log('MuscleWiki cache fully loaded:', all.length, 'exercises');
     return all;
   } catch(e) {
     console.error('MuscleWiki cache error:', e.message);
@@ -319,10 +335,40 @@ const MANUAL_EXERCISE_MAP = {
   'hyperextension':'Machine Back Extension','reverse fly':'Dumbbell Rear Delt Fly',
   'incline dumbbell curl':'Dumbbell Incline Curl','cable curl':'Cable Bicep Curl',
   'rope pushdown':'Cable Rope Tricep Pushdown','overhead cable extension':'Cable Overhead Tricep Extension',
-  // Additional mappings from test failures
+  // Additional mappings from test failures + console observations
   'cable tricep pushdown':'Cable Rope Tricep Pushdown',
   'tricep rope pushdown':'Cable Rope Tricep Pushdown',
   'cable pushdown':'Cable Rope Tricep Pushdown',
+  'cable tricep pushdowns':'Cable Rope Tricep Pushdown',
+  // Dips
+  'dips':'Bodyweight Dip','dip':'Bodyweight Dip',
+  'bodyweight dips':'Bodyweight Dip','tricep dips':'Bodyweight Dip',
+  'chest dips':'Bodyweight Dip','weighted dips':'Weighted Dip',
+  // Cable lateral raises
+  'cable lateral raises':'Cable Lateral Raise',
+  'cable lateral raise':'Cable Lateral Raise',
+  // Shoulder press
+  'dumbbell shoulder press':'Dumbbell Shoulder Press',
+  'db shoulder press':'Dumbbell Shoulder Press',
+  'seated dumbbell shoulder press':'Dumbbell Shoulder Press',
+  // Flyes plural
+  'dumbbell flyes':'Dumbbell Fly',
+  'dumbbell flies':'Dumbbell Fly',
+  'cable flyes':'Cable Fly','cable flies':'Cable Fly',
+  // Common plurals the AI adds
+  'lateral raises':'Dumbbell Lateral Raise',
+  'hammer curls':'Dumbbell Hammer Curl',
+  'bicep curls':'Dumbbell Bicep Curl',
+  'tricep extensions':'Cable Tricep Extension',
+  'leg curls':'Machine Lying Leg Curl',
+  'leg extensions':'Machine Leg Extension',
+  'calf raises':'Machine Calf Raise',
+  'hip thrusts':'Barbell Hip Thrust',
+  'lunges':'Dumbbell Lunge',
+  'pull ups':'Bodyweight Pull Up',
+  'chin ups':'Bodyweight Chin Up',
+  'push ups':'Bodyweight Push Up',
+  'sit ups':'Bodyweight Sit Up',
   // Shoulder press variants
   'dumbbell shoulder press':'Dumbbell Shoulder Press',
   'seated dumbbell press':'Dumbbell Shoulder Press',
