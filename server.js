@@ -2632,17 +2632,41 @@ app.get('/api/exercise/mw-debug', requireAuth, async (req, res) => {
     // Try different endpoints to find what works
     const results = {};
 
-    // Test 1: exercises list with small limit
-    const r1 = await fetch('https://api.musclewiki.com/exercises?limit=5', {
+    // Test 1: exercises list — check pagination fields
+    const r1 = await fetch('https://api.musclewiki.com/exercises?limit=5&offset=0', {
       headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
     });
     const d1 = await r1.json();
     results.list_status = r1.status;
-    results.list_keys = Object.keys(d1);
+    results.list_all_keys = Object.keys(d1);
     results.list_count = d1.count;
+    results.list_total = d1.total;
+    results.list_next = d1.next;
     results.list_results_length = d1.results?.length;
     results.list_is_array = Array.isArray(d1);
-    results.list_sample = d1.results?.[0] ? { id: d1.results[0].id, pk: d1.results[0].pk, name: d1.results[0].name, has_videos: !!(d1.results[0].videos?.length) } : (Array.isArray(d1) && d1[0] ? { id: d1[0].id, pk: d1[0].pk, name: d1[0].name } : null);
+    results.list_sample = d1.results?.[0] ? { id: d1.results[0].id, name: d1.results[0].name } : null;
+
+    // Test 1b: try page 2 to see if offset works
+    const r1b = await fetch('https://api.musclewiki.com/exercises?limit=5&offset=5', {
+      headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
+    });
+    const d1b = await r1b.json();
+    results.page2_first_name = d1b.results?.[0]?.name || 'same or empty';
+    results.page2_status = r1b.status;
+
+    // Test 1c: try limit=200 to see if it goes above 100
+    const r1c = await fetch('https://api.musclewiki.com/exercises?limit=200&offset=0', {
+      headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
+    });
+    const d1c = await r1c.json();
+    results.limit200_count = d1c.results?.length || 0;
+
+    // Test 1d: try different pagination param names
+    const r1d = await fetch('https://api.musclewiki.com/exercises?page_size=200', {
+      headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
+    });
+    const d1d = await r1d.json();
+    results.page_size_param_count = d1d.results?.length || 0;
 
     // Test 2: single exercise detail
     const firstId = d1.results?.[0]?.id || d1.results?.[0]?.pk || (Array.isArray(d1) && d1[0]?.id);
