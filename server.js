@@ -322,6 +322,49 @@ async function resolveExerciseName(name, exercises) {
   return aiResult;
 }
 
+// ── PERSISTENT EXERCISE LOOKUP CACHE (Supabase) ──────────────────────
+// Stores: ai_name (lowercase) → { mw_id, mw_name, mw_video_front, mw_video_side }
+// Shared across ALL users — one lookup benefits everyone forever
+// SQL: CREATE TABLE exercise_lookup_cache (
+//   ai_name text PRIMARY KEY, mw_id integer, mw_name text,
+//   mw_video_front text, mw_video_side text, updated_at timestamptz DEFAULT now()
+// );
+
+const _localLookupCache = new Map(); // in-memory layer on top of Supabase
+
+async function getExerciseLookup(aiNameLower) {
+  if (_localLookupCache.has(aiNameLower)) return _localLookupCache.get(aiNameLower);
+  try {
+    const { data } = await supabase
+      .from('exercise_lookup_cache')
+      .select('mw_id, mw_name, mw_video_front, mw_video_side')
+      .eq('ai_name', aiNameLower)
+      .maybeSingle();
+    if (data) { _localLookupCache.set(aiNameLower, data); return data; }
+  } catch(e) { /* table may not exist yet */ }
+  return null;
+}
+
+async function saveExerciseLookup(aiName, mwExercise) {
+  if (!aiName || !mwExercise) return;
+  const aiNameLower = aiName.toLowerCase().trim();
+  const videos = mwExercise.videos || [];
+  const front = videos.find(v => v.gender === 'male' && v.angle === 'front') || videos[0];
+  const side  = videos.find(v => v.gender === 'male' && v.angle === 'side');
+  const getFile = v => v?.url ? v.url.split('/branded/')[1] : null;
+  const entry = {
+    mw_id: mwExercise.id,
+    mw_name: mwExercise.name,
+    mw_video_front: getFile(front) || null,
+    mw_video_side: getFile(side) || null,
+  };
+  _localLookupCache.set(aiNameLower, entry);
+  // Upsert to Supabase — fire and forget
+  supabase.from('exercise_lookup_cache').upsert({
+    ai_name: aiNameLower, ...entry, updated_at: new Date().toISOString()
+  }, { onConflict: 'ai_name' }).catch(() => {});
+}
+
 // ── CLIENTS ────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -666,11 +709,25 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
         if (!plan.nutrition?.meals?.length) throw new Error('Plan missing nutrition meals');
 
         // Remap all exercise names to exact MuscleWiki names
+        // This is the mandatory gate — every exercise must map to MuscleWiki
         if (mwExercises && plan.workout?.days) {
           for (const day of plan.workout.days) {
             for (const ex of (day.exercises || [])) {
+              // Check exact match first
+              const exactMatch = mwExercises.find(e => e.name.toLowerCase() === ex.name.toLowerCase());
+              if (exactMatch) {
+                ex.name = exactMatch.name; // normalise capitalisation
+                ex.mw_id = exactMatch.id;  // Option 3: store MuscleWiki ID
+                continue;
+              }
+              // Not an exact match — resolve via manual map / AI
               const mwName = await resolveExerciseName(ex.name, mwExercises);
-              if (mwName) ex.name = mwName;
+              if (mwName) {
+                const mwEx = mwExercises.find(e => e.name === mwName);
+                ex.name = mwName;
+                if (mwEx) ex.mw_id = mwEx.id; // Option 3: store ID
+              }
+              // If still no match, leave as-is — search will handle it at lookup time
             }
           }
         }
@@ -1382,13 +1439,14 @@ PROFILE:
   : ''
 }
 
-${mwExercises ? `EXERCISE DATABASE:
-Use ONLY exercise names from this official list. Pick appropriate ones for the user's equipment and goals.
+${mwExercises ? `EXERCISE DATABASE — CRITICAL RULE:
+You MUST use exercise names EXACTLY as they appear in this list. Copy the name character-for-character. Do NOT paraphrase, abbreviate, or invent names.
+If an exercise is not in this list, pick the closest one that IS in the list.
 ${['Barbell','Dumbbell','Cable','Machine','Bodyweight','Kettlebell'].map(cat => {
-  const exs = mwExercises.filter(e => e.category === cat).map(e => e.name).slice(0, 40);
-  return exs.length ? cat + ': ' + exs.join(', ') : '';
+  const exs = mwExercises.filter(e => e.category === cat).map(e => e.name).slice(0, 50);
+  return exs.length ? cat.toUpperCase() + ': ' + exs.join(' | ') : '';
 }).filter(Boolean).join('\n')}
-IMPORTANT: Use the exact names from this list. Do not invent exercise names.` : ''}
+REPEAT: Every exercise "name" field must be copied verbatim from the list above.` : ''}
 
 CRITICAL INSTRUCTIONS:
 1. Respond ONLY with a single valid JSON object. No text before or after it.
@@ -2108,20 +2166,39 @@ app.use('/api', requireAuth, retentionRoutes);
 
 // ── START ──────────────────────────────────────
 // ── EXERCISE LOOKUP — MuscleWiki API proxy ─────────────
+// Resolution order:
+// 1. Supabase persistent cache (shared, permanent)
+// 2. Manual map (instant, deterministic)
+// 3. In-memory MuscleWiki cache (fuzzy + AI)
+// 4. MuscleWiki live API search (fallback)
+// Every successful match is saved to Supabase for all future users
 app.get('/api/exercise/search', requireAuth, async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name required' });
 
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   const mwSearchUrl = 'https://musclewiki.com/search?q=' + encodeURIComponent(name);
+  const nameLower = name.toLowerCase().trim();
+  const mwId = req.query.mw_id ? parseInt(req.query.mw_id) : null;
 
+  // ── STEP 0: Direct ID lookup — Option 3 ──
+  // When mw_id is provided (stored in plan), skip all matching entirely
+  if (mwId) {
+    const mwExDirect = await getMuscleWikiExercises();
+    if (mwExDirect) {
+      const directMatch = mwExDirect.find(e => e.id === mwId);
+      if (directMatch) return res.json({ exercise: buildResponse(directMatch) });
+    }
+  }
+
+  // Helper: build response from a MuscleWiki exercise object
   const buildResponse = (ex) => {
     const videos = ex.videos || [];
     const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
     const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
     const getFilename = v => v?.url ? v.url.split('/branded/')[1] : null;
     const slug = (ex.name || name).toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
-    return {
+    const result = {
       name: ex.name || name,
       videoFilename: getFilename(maleFront) || getFilename(videos[0]) || null,
       videoFilename2: getFilename(maleSide) || null,
@@ -2131,36 +2208,64 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       difficulty: ex.difficulty || '',
       muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
     };
+    // Save to persistent cache for future lookups
+    saveExerciseLookup(name, ex);
+    return result;
   };
 
-  // ── STEP 1: Resolve name via manual map, cache, or AI ──
-  const cachedExercises = await getMuscleWikiExercises();
-  const resolvedName = await resolveExerciseName(name, cachedExercises);
-  if (resolvedName && cachedExercises) {
-    const match = cachedExercises.find(e => e.name.toLowerCase() === resolvedName.toLowerCase());
+  // Helper: build response from a cached lookup entry (already has filenames)
+  const buildFromCache = (entry) => {
+    const slug = entry.mw_name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
+    return {
+      name: entry.mw_name,
+      videoFilename: entry.mw_video_front || null,
+      videoFilename2: entry.mw_video_side || null,
+      instructions: [],
+      primaryMuscles: [],
+      category: '',
+      difficulty: '',
+      muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
+    };
+  };
+
+  // ── STEP 1: Supabase persistent cache — fastest, most accurate ──
+  const cachedLookup = await getExerciseLookup(nameLower);
+  if (cachedLookup?.mw_name) {
+    // Enrich with full data from in-memory cache if available
+    const mwEx = await getMuscleWikiExercises();
+    if (mwEx) {
+      const full = mwEx.find(e => e.id === cachedLookup.mw_id || e.name === cachedLookup.mw_name);
+      if (full) return res.json({ exercise: buildResponse(full) });
+    }
+    return res.json({ exercise: buildFromCache(cachedLookup) });
+  }
+
+  // ── STEP 2: Manual map + MuscleWiki in-memory cache ──
+  const mwExercises = await getMuscleWikiExercises();
+
+  // 2a. Manual map (instant, zero cost)
+  const resolvedName = await resolveExerciseName(name, mwExercises);
+  if (resolvedName && mwExercises) {
+    const match = mwExercises.find(e => e.name.toLowerCase() === resolvedName.toLowerCase());
     if (match) return res.json({ exercise: buildResponse(match) });
   }
 
-  // ── STEP 2: Fuzzy match against cache ──
-  if (cachedExercises) {
-    const nameLower = name.toLowerCase().trim();
+  // 2b. Fuzzy score against full MuscleWiki cache
+  if (mwExercises) {
     const stripped = nameLower.replace(/^(barbell|dumbbell|cable|machine|kettlebell|ez bar|ez-bar|bodyweight|bw|db|bb|kb)\s+/i, '');
     const words = nameLower.split(' ').filter(w => w.length >= 3);
     const strippedWords = stripped.split(' ').filter(w => w.length >= 3);
 
-    const scored = cachedExercises.map(e => {
+    const scored = mwExercises.map(e => {
       const en = e.name.toLowerCase();
       if (en === nameLower) return { e, score: 100 };
       if (en === stripped) return { e, score: 95 };
-      // All search words present — but penalise results much longer than query
-      // Prevents "Bodyweight Superman Pull" (22 chars) beating "Bodyweight Pull Up" (18 chars)
-      // when searching "Bodyweight Pull Up" — the correct match is closer in length
       if (words.length >= 2 && words.every(w => en.includes(w))) {
         const lengthPenalty = Math.max(0, en.length - nameLower.length) / 10;
         return { e, score: Math.max(50, 85 - lengthPenalty) };
       }
       if (strippedWords.length >= 2 && strippedWords.every(w => en.includes(w))) {
-        const lengthPenalty = Math.max(0, en.length - strippedLower.length) / 10;
+        const lengthPenalty = Math.max(0, en.length - stripped.length) / 10;
         return { e, score: Math.max(40, 75 - lengthPenalty) };
       }
       if (words.length >= 2) {
@@ -2173,15 +2278,15 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 
     if (scored.length > 0) return res.json({ exercise: buildResponse(scored[0].e) });
 
-    // ── STEP 1b: Try manual map + AI normalisation ──
-    const aiName = await normaliseExerciseNameWithAI(name, cachedExercises);
+    // 2c. AI normalisation via Claude Haiku (costs one API call, result cached)
+    const aiName = await normaliseExerciseNameWithAI(name, mwExercises);
     if (aiName) {
-      const aiMatch = cachedExercises.find(e => e.name === aiName);
+      const aiMatch = mwExercises.find(e => e.name === aiName);
       if (aiMatch) return res.json({ exercise: buildResponse(aiMatch) });
     }
   }
 
-  // ── STEP 2: Fall back to API search if cache miss or no match ──
+  // ── STEP 3: MuscleWiki live API search (last resort) ──
   if (!apiKey) {
     return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
   }
@@ -2205,12 +2310,14 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
-    const nameLower2 = name.toLowerCase().trim();
-    const words2 = nameLower2.split(' ').filter(w => w.length >= 3);
+    const words2 = nameLower.split(' ').filter(w => w.length >= 3);
     const apiScored = results.map(r => {
       const rn = r.name.toLowerCase();
-      if (rn === nameLower2) return { r, score: 100 };
-      if (words2.length >= 2 && words2.every(w => rn.includes(w))) return { r, score: 85 };
+      if (rn === nameLower) return { r, score: 100 };
+      if (words2.length >= 2 && words2.every(w => rn.includes(w))) {
+        const lp = Math.max(0, rn.length - nameLower.length) / 10;
+        return { r, score: Math.max(50, 85 - lp) };
+      }
       const matchCount = words2.filter(w => rn.includes(w)).length;
       const ratio = words2.length > 0 ? matchCount / words2.length : 0;
       if (ratio >= 0.75) return { r, score: Math.round(ratio * 65) };
