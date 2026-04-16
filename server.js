@@ -19,7 +19,7 @@ const MW_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 async function getMuscleWikiExercises() {
   const now = Date.now();
-  if (mwExerciseCache && mwExerciseCache.length > 100 && (now - mwExerciseCacheTime) < MW_CACHE_TTL) {
+  if (mwExerciseCache && mwExerciseCache.length > 500 && (now - mwExerciseCacheTime) < MW_CACHE_TTL) {
     return mwExerciseCache;
   }
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
@@ -2616,6 +2616,14 @@ app.get('/api/exercise/debug', requireAuth, async (req, res) => {
 
 
 // ── EXERCISE VIDEO TRACE — full debug trace for video lookup ──
+// ── MUSCLEWIKI CACHE BUST ─────────────────────────────
+app.post('/api/exercise/reload-cache', requireAuth, async (req, res) => {
+  mwExerciseCache = null;
+  mwExerciseCacheTime = 0;
+  const exercises = await getMuscleWikiExercises();
+  res.json({ success: !!exercises, count: exercises?.length || 0 });
+});
+
 // ── MUSCLEWIKI RAW DIAGNOSTIC ─────────────────────────
 app.get('/api/exercise/mw-debug', requireAuth, async (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
