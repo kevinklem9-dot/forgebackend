@@ -2177,7 +2177,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   if (!name) return res.status(400).json({ error: 'name required' });
 
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
-  const mwSearchUrl = 'https://musclewiki.com/search?q=' + encodeURIComponent(name);
+  const mwSearchUrl = 'https://musclewiki.com/search?q=' + encodeURIComponent(name); // used as fallback when no match
   const nameLower = name.toLowerCase().trim();
   const mwId = req.query.mw_id ? parseInt(req.query.mw_id) : null;
 
@@ -2187,7 +2187,10 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
     const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
     const getFilename = v => v?.url ? v.url.split('/branded/')[1] : null;
-    const slug = (ex.name || name).toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
+    // Use ID-based URL if available — slug URLs 404
+    const mwPageUrl = ex.id
+      ? 'https://musclewiki.com/exercises/' + ex.id
+      : 'https://musclewiki.com/search?q=' + encodeURIComponent(ex.name || name);
     const result = {
       name: ex.name || name,
       videoFilename: getFilename(maleFront) || getFilename(videos[0]) || null,
@@ -2196,14 +2199,16 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       primaryMuscles: ex.primary_muscles || [],
       category: ex.category || '',
       difficulty: ex.difficulty || '',
-      muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
+      muscleWikiUrl: mwPageUrl,
     };
-    saveExerciseLookup(name, ex); // persist for all future users
+    try { saveExerciseLookup(name, ex); } catch(e) {} // persist for all future users
     return result;
   };
 
   const buildFromCache = (entry) => {
-    const slug = entry.mw_name.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-');
+    const mwPageUrl2 = entry.mw_id
+      ? 'https://musclewiki.com/exercises/' + entry.mw_id
+      : 'https://musclewiki.com/search?q=' + encodeURIComponent(entry.mw_name);
     return {
       name: entry.mw_name,
       videoFilename: entry.mw_video_front || null,
@@ -2212,7 +2217,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       primaryMuscles: [],
       category: '',
       difficulty: '',
-      muscleWikiUrl: 'https://musclewiki.com/exercise/' + slug,
+      muscleWikiUrl: mwPageUrl2,
     };
   };
 
@@ -2226,15 +2231,19 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   }
 
   // ── STEP 1: Supabase persistent cache — fastest, most accurate ──
-  const cachedLookup = await getExerciseLookup(nameLower);
-  if (cachedLookup?.mw_name) {
-    // Enrich with full data from in-memory cache if available
-    const mwEx = await getMuscleWikiExercises();
-    if (mwEx) {
-      const full = mwEx.find(e => e.id === cachedLookup.mw_id || e.name === cachedLookup.mw_name);
-      if (full) return res.json({ exercise: buildResponse(full) });
+  try {
+    const cachedLookup = await getExerciseLookup(nameLower);
+    if (cachedLookup?.mw_name) {
+      const mwEx = await getMuscleWikiExercises();
+      if (mwEx) {
+        const full = mwEx.find(e => e.id === cachedLookup.mw_id || e.name === cachedLookup.mw_name);
+        if (full) return res.json({ exercise: buildResponse(full) });
+      }
+      return res.json({ exercise: buildFromCache(cachedLookup) });
     }
-    return res.json({ exercise: buildFromCache(cachedLookup) });
+  } catch(cacheErr) {
+    console.warn('Exercise cache lookup failed (table may not exist yet):', cacheErr.message);
+    // Continue to next step — cache miss is not fatal
   }
 
   // ── STEP 2: Manual map + MuscleWiki in-memory cache ──
