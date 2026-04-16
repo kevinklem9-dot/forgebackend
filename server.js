@@ -19,31 +19,45 @@ const MW_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 async function getMuscleWikiExercises() {
   const now = Date.now();
-  if (mwExerciseCache && (now - mwExerciseCacheTime) < MW_CACHE_TTL) {
+  if (mwExerciseCache && mwExerciseCache.length > 0 && (now - mwExerciseCacheTime) < MW_CACHE_TTL) {
     return mwExerciseCache;
   }
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return null;
   try {
-    const res = await fetch('https://api.musclewiki.com/exercises?limit=2000', {
-      headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const exercises = data?.results || (Array.isArray(data) ? data : []);
-    if (!exercises.length) return null;
-    // Normalize ID field — MuscleWiki (Django REST) may use 'pk' instead of 'id'
-    for (const ex of exercises) {
+    // Paginate through all exercises — API returns max ~100 per page
+    const all = [];
+    let offset = 0;
+    const pageSize = 100;
+    let totalCount = null;
+
+    while (true) {
+      const res = await fetch(
+        'https://api.musclewiki.com/exercises?limit=' + pageSize + '&offset=' + offset,
+        { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
+      );
+      if (!res.ok) { console.error('MuscleWiki page fetch failed:', res.status); break; }
+      const data = await res.json();
+      const page = data?.results || (Array.isArray(data) ? data : []);
+      if (!page.length) break;
+      if (totalCount === null) totalCount = data.count || data.total || 9999;
+      all.push(...page);
+      offset += pageSize;
+      if (all.length >= totalCount) break;
+      if (all.length >= 2500) break; // safety cap
+    }
+
+    if (!all.length) return null;
+
+    // Normalise ID field
+    for (const ex of all) {
       if (!ex.id && ex.pk) ex.id = ex.pk;
     }
-    if (exercises[0]) {
-      console.log('MuscleWiki sample exercise keys:', Object.keys(exercises[0]).join(', '));
-      console.log('MuscleWiki sample id:', exercises[0].id, '| pk:', exercises[0].pk, '| name:', exercises[0].name);
-    }
-    mwExerciseCache = exercises;
+
+    mwExerciseCache = all;
     mwExerciseCacheTime = now;
-    console.log('MuscleWiki exercise cache loaded:', exercises.length, 'exercises');
-    return exercises;
+    console.log('MuscleWiki cache loaded:', all.length, 'exercises via pagination');
+    return all;
   } catch(e) {
     console.error('MuscleWiki cache error:', e.message);
     return null;
@@ -2286,7 +2300,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     return result;
   };
 
-  // buildResponse: always fetch full detail by ID — list endpoint never has videos
+  // buildResponse: fetch full detail by ID — list endpoint never has videos
   const buildResponse = async (ex) => {
     const exerciseId = ex.id || ex.pk;
     if (exerciseId && process.env.MUSCLEWIKI_API_KEY) {
@@ -2296,11 +2310,19 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
         });
         if (detailRes.ok) {
           const detail = await detailRes.json();
-          return buildResponseFromDetail({ ...ex, ...detail });
+          if (detail?.videos?.length) {
+            console.log('Detail fetch success for', ex.name, '| id:', exerciseId, '| videos:', detail.videos.length);
+            return buildResponseFromDetail({ ...ex, ...detail });
+          }
+          console.warn('Detail returned no videos for', ex.name, '| id:', exerciseId);
+        } else {
+          console.warn('Detail fetch HTTP error:', detailRes.status, 'for id:', exerciseId);
         }
       } catch(e) {
-        console.warn('Detail fetch failed for', ex.name, ex.id, e.message);
+        console.warn('Detail fetch exception for', ex.name, '|', e.message);
       }
+    } else {
+      console.warn('No ID for exercise:', ex.name, '| id:', ex.id, '| pk:', ex.pk);
     }
     return buildResponseFromDetail(ex);
   };
@@ -2393,8 +2415,34 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     }
   }
 
-  // MuscleWiki search API returns unreliable results — removed
-  // If we get here, no confident match was found in our cache
+  // Cache miss or no match — try fetching by searching and matching exact name
+  if (process.env.MUSCLEWIKI_API_KEY) {
+    try {
+      // Search with the exact name and only accept 100% name match
+      const searchRes = await fetch(
+        'https://api.musclewiki.com/exercises?search=' + encodeURIComponent(name) + '&limit=10',
+        { headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' } }
+      );
+      if (searchRes.ok) {
+        const searchData = await searchRes.json();
+        const searchResults = searchData?.results || (Array.isArray(searchData) ? searchData : []);
+        // Only accept exact name match — prevents wrong exercise
+        const exact = searchResults.find(r => r.name?.toLowerCase() === nameLower);
+        if (exact) {
+          console.log('Found via search param:', exact.name, '| id:', exact.id || exact.pk);
+          return res.json({ exercise: await buildResponse(exact) });
+        }
+        // Also try stripped name
+        const strippedMatch = searchResults.find(r => r.name?.toLowerCase() === stripped);
+        if (strippedMatch) {
+          return res.json({ exercise: await buildResponse(strippedMatch) });
+        }
+      }
+    } catch(e) {
+      console.warn('Search param fallback failed:', e.message);
+    }
+  }
+
   console.log('No match found for:', name);
   return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
 });
