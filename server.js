@@ -8,6 +8,7 @@ const Anthropic = require('@anthropic-ai/sdk').default;
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+app.set('trust proxy', 1); // Required for Railway — enables X-Forwarded-For
 const PORT = process.env.PORT || 3000;
 
 // ── MUSCLEWIKI EXERCISE CACHE ─────────────────────────
@@ -300,6 +301,61 @@ const MANUAL_EXERCISE_MAP = {
   'cable tricep pushdown':'Cable Rope Tricep Pushdown',
   'tricep rope pushdown':'Cable Rope Tricep Pushdown',
   'cable pushdown':'Cable Rope Tricep Pushdown',
+  // Shoulder press variants
+  'dumbbell shoulder press':'Dumbbell Shoulder Press',
+  'seated dumbbell press':'Dumbbell Shoulder Press',
+  'seated dumbbell shoulder press':'Dumbbell Shoulder Press',
+  'db shoulder press':'Dumbbell Shoulder Press',
+  // Fly variants
+  'dumbbell flyes':'Dumbbell Fly',
+  'dumbbell fly':'Dumbbell Fly',
+  'dumbbell flies':'Dumbbell Fly',
+  'flat dumbbell fly':'Dumbbell Fly',
+  'flat dumbbell flyes':'Dumbbell Fly',
+  'incline dumbbell flyes':'Dumbbell Incline Fly',
+  'incline dumbbell fly':'Dumbbell Incline Fly',
+  'incline fly':'Dumbbell Incline Fly',
+  // Press variants
+  'incline barbell press':'Barbell Incline Bench Press',
+  'incline bench':'Barbell Incline Bench Press',
+  'close grip bench press':'Barbell Close Grip Bench Press',
+  'close grip press':'Barbell Close Grip Bench Press',
+  'decline press':'Barbell Decline Bench Press',
+  // Row variants
+  'cable seated row':'Cable Seated Row',
+  'seated cable row':'Cable Seated Row',
+  'low cable row':'Cable Seated Row',
+  // Curl variants
+  'standing barbell curl':'Barbell Curl',
+  'standing bicep curl':'Barbell Curl',
+  'incline dumbbell curl':'Dumbbell Incline Curl',
+  'incline curl':'Dumbbell Incline Curl',
+  // Leg variants
+  'barbell hip thrust':'Barbell Hip Thrust',
+  'hip thrusts':'Barbell Hip Thrust',
+  'stiff leg deadlift':'Barbell Stiff Leg Deadlift',
+  'straight leg deadlift':'Barbell Stiff Leg Deadlift',
+  'hack squat':'Machine Hack Squat',
+  'smith machine squat':'Smith Machine Squat',
+  // Pull variants
+  'wide grip pulldown':'Cable Wide Grip Lat Pulldown',
+  'close grip pulldown':'Cable Close Grip Lat Pulldown',
+  'neutral grip pulldown':'Cable Neutral Grip Lat Pulldown',
+  'bodyweight pullup':'Bodyweight Pull Up',
+  'bodyweight pull-up':'Bodyweight Pull Up',
+  'weighted pull up':'Weighted Pull Up',
+  // Core
+  'hanging leg raise':'Bodyweight Hanging Leg Raise',
+  'cable wood chop':'Cable Wood Chop',
+  // Misc
+  'barbell upright row':'Barbell Upright Row',
+  'dumbbell upright row':'Dumbbell Upright Row',
+  'dumbbell arnold press':'Dumbbell Arnold Press',
+  'face pulls':'Cable Face Pull',
+  'cable face pull':'Cable Face Pull',
+  'dumbbell kickback':'Dumbbell Tricep Kickback',
+  'tricep kickback':'Dumbbell Tricep Kickback',
+  'dumbbell tricep kickback':'Dumbbell Tricep Kickback',
 };
 
 // Resolve AI exercise name -> exact MuscleWiki name
@@ -2220,22 +2276,19 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     return result;
   };
 
-  // buildResponse: fetches full detail if videos missing (list endpoint omits videos)
+  // buildResponse: always fetch full detail by ID — list endpoint never has videos
   const buildResponse = async (ex) => {
-    // List endpoint doesn't include videos — fetch detail if needed
-    if ((!ex.videos || ex.videos.length === 0) && ex.id && process.env.MUSCLEWIKI_API_KEY) {
+    if (ex.id && process.env.MUSCLEWIKI_API_KEY) {
       try {
         const detailRes = await fetch('https://api.musclewiki.com/exercises/' + ex.id, {
           headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' }
         });
         if (detailRes.ok) {
           const detail = await detailRes.json();
-          if (detail?.videos?.length) {
-            return buildResponseFromDetail({ ...ex, ...detail });
-          }
+          return buildResponseFromDetail({ ...ex, ...detail });
         }
       } catch(e) {
-        console.warn('Detail fetch failed for', ex.id, e.message);
+        console.warn('Detail fetch failed for', ex.name, ex.id, e.message);
       }
     }
     return buildResponseFromDetail(ex);
@@ -2328,54 +2381,10 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     }
   }
 
-  // ── STEP 3: MuscleWiki live API search (last resort) ──
-  if (!apiKey) {
-    return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
-  }
-
-  try {
-    const stripped2 = name.replace(/^(Barbell|Dumbbell|Cable|Machine|Kettlebell|EZ Bar|EZ-Bar|Bodyweight|DB|BB|KB)\s+/i, '');
-    const attempts = [name, stripped2].filter((v, i, a) => v && v.split(' ').length >= 2 && a.indexOf(v) === i);
-
-    let results = [];
-    for (const attempt of attempts) {
-      const r = await fetch(
-        'https://api.musclewiki.com/search?q=' + encodeURIComponent(attempt) + '&limit=5',
-        { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
-      );
-      if (!r.ok) continue;
-      const data = await r.json();
-      if (Array.isArray(data) && data.length > 0) { results = data; break; }
-    }
-
-    if (!results.length) {
-      return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
-    }
-
-    const words2 = nameLower.split(' ').filter(w => w.length >= 3);
-    const apiScored = results.map(r => {
-      const rn = r.name.toLowerCase();
-      if (rn === nameLower) return { r, score: 100 };
-      if (words2.length >= 2 && words2.every(w => rn.includes(w))) {
-        const lp = Math.max(0, rn.length - nameLower.length) / 10;
-        return { r, score: Math.max(50, 85 - lp) };
-      }
-      const matchCount = words2.filter(w => rn.includes(w)).length;
-      const ratio = words2.length > 0 ? matchCount / words2.length : 0;
-      if (ratio >= 0.75) return { r, score: Math.round(ratio * 65) };
-      return { r, score: 0 };
-    }).filter(s => s.score > 0).sort((a, b) => b.score - a.score || a.r.name.length - b.r.name.length);
-
-    if (!apiScored.length) {
-      return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
-    }
-
-    return res.json({ exercise: await buildResponse(apiScored[0].r) });
-
-  } catch(err) {
-    console.error('Exercise search error:', err.message);
-    res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
-  }
+  // MuscleWiki search API returns unreliable results — removed
+  // If we get here, no confident match was found in our cache
+  console.log('No match found for:', name);
+  return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
 });
 
 
