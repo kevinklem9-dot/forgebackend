@@ -18,70 +18,89 @@ let mwExerciseCacheTime = 0;
 const MW_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 async function getMuscleWikiExercises() {
-  const now = Date.now();
-  if (mwExerciseCache && mwExerciseCache.length > 500 && (now - mwExerciseCacheTime) < MW_CACHE_TTL) {
-    return mwExerciseCache;
+  // Return whatever we have cached — don't re-fetch if we have anything
+  if (mwExerciseCache && mwExerciseCache.length > 0) return mwExerciseCache;
+  // Return empty — we no longer bulk-fetch (rate limited on TESTING tier)
+  // Lookups happen on-demand via getExerciseByName()
+  return mwExerciseCache || [];
+}
+
+// Fetch a single exercise by exact name — on demand, cached permanently in Supabase
+async function getExerciseByName(name) {
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  if (!apiKey) return null;
+  const lower = name.toLowerCase().trim();
+
+  // 1. Check in-memory detail cache
+  for (const [id, ex] of _detailCache) {
+    if (ex.name?.toLowerCase() === lower) return ex;
   }
+
+  // 2. Check Supabase persistent cache
+  try {
+    const { data } = await supabase
+      .from('exercise_lookup_cache')
+      .select('*')
+      .eq('ai_name', lower)
+      .maybeSingle();
+    if (data?.mw_id) {
+      // We have a cached ID — fetch detail directly
+      const cached = await fetchExerciseDetail(data.mw_id);
+      if (cached) return cached;
+    }
+  } catch(e) {}
+
+  // 3. Search MuscleWiki — try exact name with search param
+  try {
+    const r = await fetch(
+      'https://api.musclewiki.com/exercises?search=' + encodeURIComponent(name) + '&page_size=10',
+      { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
+    );
+    if (!r.ok) { console.warn('MuscleWiki search failed:', r.status); return null; }
+    const data = await r.json();
+    const results = data?.results || [];
+    // Only accept exact name match
+    const exact = results.find(e => e.name?.toLowerCase() === lower);
+    if (exact) {
+      const detail = await fetchExerciseDetail(exact.id || exact.pk);
+      if (detail) {
+        // Save to Supabase cache
+        const videos = detail.videos || [];
+        const front = videos.find(v => v.gender === 'male' && v.angle === 'front') || videos[0];
+        const side  = videos.find(v => v.gender === 'male' && v.angle === 'side');
+        const getFile = v => v?.url?.includes('/branded/') ? v.url.split('/branded/')[1] : null;
+        supabase.from('exercise_lookup_cache').upsert({
+          ai_name: lower,
+          mw_id: detail.id,
+          mw_name: detail.name,
+          mw_video_front: getFile(front),
+          mw_video_side: getFile(side),
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'ai_name' }).catch(() => {});
+        return detail;
+      }
+    }
+  } catch(e) { console.warn('getExerciseByName search error:', e.message); }
+  return null;
+}
+
+// Fetch full exercise detail by ID with caching
+async function fetchExerciseDetail(id) {
+  if (!id) return null;
+  if (_detailCache.has(id)) return _detailCache.get(id);
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return null;
   try {
-    // API uses page_size param (max ~20) with offset pagination
-    // Total: ~1902 exercises, 20/page = ~96 pages
-    const pageSize = 20;
-
-    // Get first page + total count
-    const firstRes = await fetch(
-      'https://api.musclewiki.com/exercises?page_size=' + pageSize + '&offset=0',
-      { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
-    );
-    if (!firstRes.ok) { console.error('MuscleWiki first page failed:', firstRes.status); return null; }
-    const firstData = await firstRes.json();
-    const firstPage = firstData?.results || [];
-    if (!firstPage.length) return null;
-
-    const totalCount = firstData.total || firstData.count || 0;
-    console.log('MuscleWiki total:', totalCount, '| page_size:', pageSize);
-
-    // Build all offsets
-    const offsets = [];
-    for (let offset = pageSize; offset < totalCount && offset < 2500; offset += pageSize) {
-      offsets.push(offset);
-    }
-
-    // Fetch in batches of 10 parallel requests to avoid rate limits
-    const all = [...firstPage];
-    const batchSize = 10;
-    for (let i = 0; i < offsets.length; i += batchSize) {
-      const batch = offsets.slice(i, i + batchSize);
-      const pages = await Promise.all(batch.map(offset =>
-        fetch('https://api.musclewiki.com/exercises?page_size=' + pageSize + '&offset=' + offset, {
-          headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
-        })
-        .then(r => r.ok ? r.json() : null)
-        .then(d => d?.results || [])
-        .catch(() => [])
-      ));
-      for (const page of pages) all.push(...page);
-    }
-
-    if (!all.length) return null;
-
-    // Normalise ID field
-    for (const ex of all) {
-      if (!ex.id && ex.pk) ex.id = ex.pk;
-    }
-
-    mwExerciseCache = all;
-    mwExerciseCacheTime = now;
-    console.log('MuscleWiki cache loaded:', all.length, '/', totalCount, 'exercises');
-    // Pre-warm detail cache in background — don't await
-    prewarmDetailCache(all).catch(() => {});
-    return all;
-  } catch(e) {
-    console.error('MuscleWiki cache error:', e.message);
-    return null;
-  }
+    const r = await fetch('https://api.musclewiki.com/exercises/' + id, {
+      headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
+    });
+    if (!r.ok) return null;
+    const detail = await r.json();
+    _detailCache.set(id, detail);
+    return detail;
+  } catch(e) { return null; }
 }
+
 
 // Build exercise name lookup map: lowercase name -> exact name
 function buildExerciseLookup(exercises) {
@@ -2331,220 +2350,96 @@ const retentionRoutes = require('./routes/retention')(supabase, anthropic);
 app.use('/api', requireAuth, retentionRoutes);
 
 // ── START ──────────────────────────────────────
-// ── EXERCISE LOOKUP — MuscleWiki API proxy ─────────────
-// Resolution order:
-// 1. Supabase persistent cache (shared, permanent)
-// 2. Manual map (instant, deterministic)
-// 3. In-memory MuscleWiki cache (fuzzy + AI)
-// 4. MuscleWiki live API search (fallback)
-// Every successful match is saved to Supabase for all future users
+// ── EXERCISE LOOKUP — on-demand with Supabase cache ─────
 app.get('/api/exercise/search', requireAuth, async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name required' });
 
-  const apiKey = process.env.MUSCLEWIKI_API_KEY;
-  const mwSearchUrl = 'https://musclewiki.com/search?q=' + encodeURIComponent(name); // used as fallback when no match
   const nameLower = name.toLowerCase().trim();
+  const mwSearchUrl = 'https://musclewiki.com/search?q=' + encodeURIComponent(name);
   const mwId = req.query.mw_id ? parseInt(req.query.mw_id) : null;
 
-  // Helpers defined first — must be before any usage (const is not hoisted)
-  // buildResponseFromDetail: builds full response from a detail-enriched exercise object
-  const buildResponseFromDetail = (ex) => {
-    const videos = ex.videos || [];
-    const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
-    const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
-    const getFilename = v => {
-      if (!v?.url) return null;
-      // Handle different URL formats MuscleWiki may return
-      if (v.url.includes('/branded/')) return v.url.split('/branded/')[1];
-      // If URL is already just a filename
-      if (v.url.match(/^[a-zA-Z0-9._-]+$/)) return v.url;
-      // Extract filename from end of URL
-      return v.url.split('/').pop() || null;
-    };
-    const frontFile = getFilename(maleFront) || getFilename(videos[0]) || null;
-    const sideFile  = getFilename(maleSide) || null;
-    if (frontFile || sideFile) console.log('Video files for', (ex.name || name), ':', frontFile, sideFile);
-    else if (videos.length > 0) console.log('Videos present but no filename extracted for', ex.name, '| sample URL:', videos[0]?.url);
-    else console.log('No videos for', ex.name || name, '| id:', ex.id);
-    const exId = ex.id || ex.pk;
-    const mwPageUrl = exId
-      ? 'https://musclewiki.com/exercises/' + exId
-      : 'https://musclewiki.com/search?q=' + encodeURIComponent(ex.name || name);
-    const result = {
-      name: ex.name || name,
-      videoFilename: frontFile,
-      videoFilename2: sideFile,
-      instructions: ex.steps || [],
-      primaryMuscles: ex.primary_muscles || [],
-      category: ex.category || '',
-      difficulty: ex.difficulty || '',
-      muscleWikiUrl: mwPageUrl,
-    };
-    try { saveExerciseLookup(name, ex); } catch(e) {}
-    return result;
-  };
-
-  // buildResponse: fetch full detail by ID — list endpoint never has videos
-  const buildResponse = async (ex) => {
-    const exerciseId = ex.id || ex.pk;
-    if (!exerciseId) {
-      console.warn('No ID for exercise:', ex.name);
-      return buildResponseFromDetail(ex);
-    }
-
-    // Check detail cache first
-    if (_detailCache.has(exerciseId)) {
-      return buildResponseFromDetail(_detailCache.get(exerciseId));
-    }
-
-    if (process.env.MUSCLEWIKI_API_KEY) {
-      try {
-        // Use AbortController for timeout — Railway has 30s limit
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
-        const detailRes = await fetch('https://api.musclewiki.com/exercises/' + exerciseId, {
-          headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' },
-          signal: controller.signal
-        });
-        clearTimeout(timeout);
-        console.log('Detail fetch status:', detailRes.status, 'for', ex.name, 'id:', exerciseId);
-        if (detailRes.ok) {
-          const detail = await detailRes.json();
-          console.log('Detail videos count:', detail?.videos?.length, 'for', ex.name);
-          const merged = { ...ex, ...detail };
-          _detailCache.set(exerciseId, merged);
-          if (detail?.videos?.length) {
-            return buildResponseFromDetail(merged);
-          }
-          console.warn('Detail has no videos for', ex.name, 'id:', exerciseId);
-        } else {
-          const errText = await detailRes.text().catch(() => '');
-          console.warn('Detail HTTP', detailRes.status, 'for', ex.name, ':', errText.slice(0, 100));
-        }
-      } catch(e) {
-        console.warn('Detail fetch exception for', ex.name, ':', e.name, e.message);
-      }
-    }
-    return buildResponseFromDetail(ex);
-  };
-
-  const buildFromCache = (entry) => {
-    const mwPageUrl2 = entry.mw_id
-      ? 'https://musclewiki.com/exercises/' + entry.mw_id
-      : 'https://musclewiki.com/search?q=' + encodeURIComponent(entry.mw_name);
+  const buildResult = (detail, resolvedName) => {
+    const videos = detail?.videos || [];
+    const front = videos.find(v => v.gender === 'male' && v.angle === 'front') || videos[0];
+    const side  = videos.find(v => v.gender === 'male' && v.angle === 'side');
+    const getFile = v => v?.url?.includes('/branded/') ? v.url.split('/branded/')[1] : null;
+    const exName = detail?.name || resolvedName || name;
     return {
-      name: entry.mw_name,
-      videoFilename: entry.mw_video_front || null,
-      videoFilename2: entry.mw_video_side || null,
-      instructions: [],
-      primaryMuscles: [],
-      category: '',
-      difficulty: '',
-      muscleWikiUrl: mwPageUrl2,
+      name: exName,
+      videoFilename: getFile(front) || null,
+      videoFilename2: getFile(side) || null,
+      instructions: detail?.steps || [],
+      primaryMuscles: detail?.primary_muscles || [],
+      category: detail?.category || '',
+      difficulty: detail?.difficulty || '',
+      muscleWikiUrl: detail?.id ? 'https://musclewiki.com/exercises/' + detail.id : mwSearchUrl,
     };
   };
 
-  // ── STEP 0: Direct ID lookup — bypasses all matching ──
+  // ── STEP 0: Direct ID lookup ──
   if (mwId) {
-    const mwExDirect = await getMuscleWikiExercises();
-    if (mwExDirect) {
-      const directMatch = mwExDirect.find(e => (e.id || e.pk) === mwId);
-      if (directMatch) return res.json({ exercise: await buildResponse(directMatch) });
-    }
+    const detail = await fetchExerciseDetail(mwId);
+    if (detail) return res.json({ exercise: buildResult(detail) });
   }
 
-  // ── STEP 1: Supabase persistent cache — fastest, most accurate ──
+  // ── STEP 1: Supabase persistent cache ──
   try {
-    const cachedLookup = await getExerciseLookup(nameLower);
-    if (cachedLookup?.mw_name && cachedLookup.mw_video_front) {
-      // Only use cache if it actually has video data — old entries with null videos are stale
-      const mwEx = await getMuscleWikiExercises();
-      if (mwEx) {
-        const full = mwEx.find(e => (e.id || e.pk) === cachedLookup.mw_id || e.name === cachedLookup.mw_name);
-        if (full) return res.json({ exercise: await buildResponse(full) });
-      }
-      return res.json({ exercise: buildFromCache(cachedLookup) });
+    const { data } = await supabase
+      .from('exercise_lookup_cache')
+      .select('*')
+      .eq('ai_name', nameLower)
+      .maybeSingle();
+    if (data?.mw_name) {
+      // Have cached entry — get full detail
+      const detail = await fetchExerciseDetail(data.mw_id);
+      if (detail) return res.json({ exercise: buildResult(detail) });
+      // No detail but have filenames — return from cache directly
+      return res.json({ exercise: {
+        name: data.mw_name,
+        videoFilename: data.mw_video_front || null,
+        videoFilename2: data.mw_video_side || null,
+        instructions: [], primaryMuscles: [], category: '', difficulty: '',
+        muscleWikiUrl: data.mw_id ? 'https://musclewiki.com/exercises/' + data.mw_id : mwSearchUrl,
+      }});
     }
-  } catch(cacheErr) {
-    console.warn('Exercise cache lookup failed (table may not exist yet):', cacheErr.message);
-    // Continue to next step — cache miss is not fatal
+  } catch(e) { /* cache miss */ }
+
+  // ── STEP 2: Manual map → resolve to exact name ──
+  const resolvedName = MANUAL_EXERCISE_MAP[nameLower]
+    || MANUAL_EXERCISE_MAP[nameLower.replace(/^(barbell|dumbbell|cable|machine|kettlebell|ez bar|bodyweight|bw|db|bb|kb)\s+/i, '')]
+    || name;
+
+  // ── STEP 3: Fetch from MuscleWiki by exact name ──
+  const detail = await getExerciseByName(resolvedName);
+  if (detail) {
+    // Cache the ai_name → mw result
+    const videos = detail.videos || [];
+    const front = videos.find(v => v.gender === 'male' && v.angle === 'front') || videos[0];
+    const side  = videos.find(v => v.gender === 'male' && v.angle === 'side');
+    const getFile = v => v?.url?.includes('/branded/') ? v.url.split('/branded/')[1] : null;
+    supabase.from('exercise_lookup_cache').upsert({
+      ai_name: nameLower,
+      mw_id: detail.id,
+      mw_name: detail.name,
+      mw_video_front: getFile(front),
+      mw_video_side: getFile(side),
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'ai_name' }).catch(() => {});
+    return res.json({ exercise: buildResult(detail) });
   }
 
-  // ── STEP 2: Manual map + MuscleWiki in-memory cache ──
-  const mwExercises = await getMuscleWikiExercises();
-
-  // 2a. Manual map (instant, zero cost)
-  const resolvedName = await resolveExerciseName(name, mwExercises);
-  if (resolvedName && mwExercises) {
-    const match = mwExercises.find(e => e.name.toLowerCase() === resolvedName.toLowerCase());
-    if (match) return res.json({ exercise: await buildResponse(match) });
-  }
-
-  // 2b. Fuzzy score against full MuscleWiki cache
-  if (mwExercises) {
-    const stripped = nameLower.replace(/^(barbell|dumbbell|cable|machine|kettlebell|ez bar|ez-bar|bodyweight|bw|db|bb|kb)\s+/i, '');
-    const words = nameLower.split(' ').filter(w => w.length >= 3);
-    const strippedWords = stripped.split(' ').filter(w => w.length >= 3);
-
-    const scored = mwExercises.map(e => {
-      const en = e.name.toLowerCase();
-      if (en === nameLower) return { e, score: 100 };
-      if (en === stripped) return { e, score: 95 };
-      if (words.length >= 2 && words.every(w => en.includes(w))) {
-        const lengthPenalty = Math.max(0, en.length - nameLower.length) / 10;
-        return { e, score: Math.max(50, 85 - lengthPenalty) };
-      }
-      if (strippedWords.length >= 2 && strippedWords.every(w => en.includes(w))) {
-        const lengthPenalty = Math.max(0, en.length - stripped.length) / 10;
-        return { e, score: Math.max(40, 75 - lengthPenalty) };
-      }
-      if (words.length >= 2) {
-        const matchCount = words.filter(w => en.includes(w)).length;
-        const ratio = matchCount / words.length;
-        if (ratio >= 0.75) return { e, score: Math.round(ratio * 65) };
-      }
-      return { e, score: 0 };
-    }).filter(s => s.score > 0).sort((a, b) => b.score - a.score || a.e.name.length - b.e.name.length);
-
-    if (scored.length > 0) return res.json({ exercise: await buildResponse(scored[0].e) });
-
-    // 2c. AI normalisation via Claude Haiku (costs one API call, result cached)
-    const aiName = await normaliseExerciseNameWithAI(name, mwExercises);
+  // ── STEP 4: Try AI normalisation as last resort ──
+  const mwExList = mwExerciseCache?.length > 0 ? mwExerciseCache : null;
+  if (mwExList) {
+    const aiName = await normaliseExerciseNameWithAI(name, mwExList);
     if (aiName) {
-      const aiMatch = mwExercises.find(e => e.name === aiName);
-      if (aiMatch) return res.json({ exercise: await buildResponse(aiMatch) });
+      const aiDetail = await getExerciseByName(aiName);
+      if (aiDetail) return res.json({ exercise: buildResult(aiDetail) });
     }
   }
 
-  // Cache miss or no match — try fetching by searching and matching exact name
-  if (process.env.MUSCLEWIKI_API_KEY) {
-    try {
-      // Search with the exact name and only accept 100% name match
-      const searchRes = await fetch(
-        'https://api.musclewiki.com/exercises?search=' + encodeURIComponent(name) + '&limit=10',
-        { headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' } }
-      );
-      if (searchRes.ok) {
-        const searchData = await searchRes.json();
-        const searchResults = searchData?.results || (Array.isArray(searchData) ? searchData : []);
-        // Only accept exact name match — prevents wrong exercise
-        const exact = searchResults.find(r => r.name?.toLowerCase() === nameLower);
-        if (exact) {
-          console.log('Found via search param:', exact.name, '| id:', exact.id || exact.pk);
-          return res.json({ exercise: await buildResponse(exact) });
-        }
-        // Also try stripped name
-        const strippedMatch = searchResults.find(r => r.name?.toLowerCase() === stripped);
-        if (strippedMatch) {
-          return res.json({ exercise: await buildResponse(strippedMatch) });
-        }
-      }
-    } catch(e) {
-      console.warn('Search param fallback failed:', e.message);
-    }
-  }
-
+  // No match — return name only, no video
   console.log('No match found for:', name);
   return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
 });
