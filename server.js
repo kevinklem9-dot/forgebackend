@@ -2400,22 +2400,30 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 
     if (process.env.MUSCLEWIKI_API_KEY) {
       try {
+        // Use AbortController for timeout — Railway has 30s limit
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 8000);
         const detailRes = await fetch('https://api.musclewiki.com/exercises/' + exerciseId, {
-          headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' }
+          headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' },
+          signal: controller.signal
         });
+        clearTimeout(timeout);
+        console.log('Detail fetch status:', detailRes.status, 'for', ex.name, 'id:', exerciseId);
         if (detailRes.ok) {
           const detail = await detailRes.json();
+          console.log('Detail videos count:', detail?.videos?.length, 'for', ex.name);
           const merged = { ...ex, ...detail };
-          _detailCache.set(exerciseId, merged); // cache for future requests
+          _detailCache.set(exerciseId, merged);
           if (detail?.videos?.length) {
             return buildResponseFromDetail(merged);
           }
-          console.warn('Detail no videos for', ex.name, 'id:', exerciseId);
+          console.warn('Detail has no videos for', ex.name, 'id:', exerciseId);
         } else {
-          console.warn('Detail HTTP error:', detailRes.status, 'id:', exerciseId);
+          const errText = await detailRes.text().catch(() => '');
+          console.warn('Detail HTTP', detailRes.status, 'for', ex.name, ':', errText.slice(0, 100));
         }
       } catch(e) {
-        console.warn('Detail fetch failed:', ex.name, e.message);
+        console.warn('Detail fetch exception for', ex.name, ':', e.name, e.message);
       }
     }
     return buildResponseFromDetail(ex);
