@@ -2189,9 +2189,20 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     const videos = ex.videos || [];
     const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
     const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
-    const getFilename = v => v?.url ? v.url.split('/branded/')[1] : null;
+    const getFilename = v => {
+      if (!v?.url) return null;
+      // Handle different URL formats MuscleWiki may return
+      if (v.url.includes('/branded/')) return v.url.split('/branded/')[1];
+      // If URL is already just a filename
+      if (v.url.match(/^[a-zA-Z0-9._-]+$/)) return v.url;
+      // Extract filename from end of URL
+      return v.url.split('/').pop() || null;
+    };
     const frontFile = getFilename(maleFront) || getFilename(videos[0]) || null;
     const sideFile  = getFilename(maleSide) || null;
+    if (frontFile || sideFile) console.log('Video files for', (ex.name || name), ':', frontFile, sideFile);
+    else if (videos.length > 0) console.log('Videos present but no filename extracted for', ex.name, '| sample URL:', videos[0]?.url);
+    else console.log('No videos for', ex.name || name, '| id:', ex.id);
     const mwPageUrl = ex.id
       ? 'https://musclewiki.com/exercises/' + ex.id
       : 'https://musclewiki.com/search?q=' + encodeURIComponent(ex.name || name);
@@ -2611,4 +2622,16 @@ app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 app.get('/api/debug/plan', requireAuth, requireAdmin, async (req, res) => {
   const { data } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle();
   res.json(data);
+});
+
+// ── EXERCISE ID FINDER — dev tool ─────────────────────
+app.get('/api/exercise/find-ids', requireAuth, async (req, res) => {
+  const exercises = await getMuscleWikiExercises();
+  if (!exercises) return res.json({ error: 'Cache not loaded' });
+  const names = (req.query.names || '').split(',').map(n => n.trim().toLowerCase());
+  const results = names.map(n => {
+    const matches = exercises.filter(e => e.name.toLowerCase().includes(n)).slice(0, 3);
+    return { query: n, matches: matches.map(e => ({ id: e.id, name: e.name, videos: (e.videos||[]).length })) };
+  });
+  res.json({ results, totalCached: exercises.length });
 });
