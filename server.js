@@ -2522,6 +2522,49 @@ app.get('/api/exercise/debug', requireAuth, async (req, res) => {
 
 
 // ── EXERCISE VIDEO TRACE — full debug trace for video lookup ──
+// ── MUSCLEWIKI RAW DIAGNOSTIC ─────────────────────────
+app.get('/api/exercise/mw-debug', requireAuth, async (req, res) => {
+  const apiKey = process.env.MUSCLEWIKI_API_KEY;
+  if (!apiKey) return res.json({ error: 'No API key' });
+  try {
+    // Try different endpoints to find what works
+    const results = {};
+
+    // Test 1: exercises list with small limit
+    const r1 = await fetch('https://api.musclewiki.com/exercises?limit=5', {
+      headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
+    });
+    const d1 = await r1.json();
+    results.list_status = r1.status;
+    results.list_keys = Object.keys(d1);
+    results.list_count = d1.count;
+    results.list_results_length = d1.results?.length;
+    results.list_is_array = Array.isArray(d1);
+    results.list_sample = d1.results?.[0] ? { id: d1.results[0].id, pk: d1.results[0].pk, name: d1.results[0].name, has_videos: !!(d1.results[0].videos?.length) } : (Array.isArray(d1) && d1[0] ? { id: d1[0].id, pk: d1[0].pk, name: d1[0].name } : null);
+
+    // Test 2: single exercise detail
+    const firstId = d1.results?.[0]?.id || d1.results?.[0]?.pk || (Array.isArray(d1) && d1[0]?.id);
+    if (firstId) {
+      const r2 = await fetch('https://api.musclewiki.com/exercises/' + firstId, {
+        headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
+      });
+      const d2 = await r2.json();
+      results.detail_status = r2.status;
+      results.detail_keys = Object.keys(d2);
+      results.detail_has_videos = !!(d2.videos?.length);
+      results.detail_video_sample = d2.videos?.[0];
+    }
+
+    // Test 3: current cache state
+    results.cache_size = mwExerciseCache ? mwExerciseCache.length : 0;
+    results.cache_age_minutes = mwExerciseCacheTime ? Math.round((Date.now() - mwExerciseCacheTime) / 60000) : null;
+
+    res.json(results);
+  } catch(e) {
+    res.json({ error: e.message, stack: e.stack?.split('\n').slice(0,3) });
+  }
+});
+
 app.get('/api/exercise/test-video', requireAuth, async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name param required' });
