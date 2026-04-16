@@ -25,54 +25,55 @@ async function getMuscleWikiExercises() {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return null;
   try {
-    // Fetch ALL exercises via pagination — API caps at 100 per page
-    const all = [];
-    const pageSize = 100;
+    // API uses page_size param (max ~20) with offset pagination
+    // Total: ~1902 exercises, 20/page = ~96 pages
+    const pageSize = 20;
 
-    // Get first page to find total count
+    // Get first page + total count
     const firstRes = await fetch(
-      'https://api.musclewiki.com/exercises?limit=' + pageSize + '&offset=0',
+      'https://api.musclewiki.com/exercises?page_size=' + pageSize + '&offset=0',
       { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
     );
     if (!firstRes.ok) { console.error('MuscleWiki first page failed:', firstRes.status); return null; }
     const firstData = await firstRes.json();
-    const firstPage = firstData?.results || (Array.isArray(firstData) ? firstData : []);
+    const firstPage = firstData?.results || [];
     if (!firstPage.length) return null;
-    all.push(...firstPage);
 
-    // totalCount from API response
-    const totalCount = firstData.count || firstData.total || 0;
-    console.log('MuscleWiki total exercises:', totalCount, '| first page:', firstPage.length);
+    const totalCount = firstData.total || firstData.count || 0;
+    console.log('MuscleWiki total:', totalCount, '| page_size:', pageSize);
 
-    // Fetch remaining pages in parallel (faster than sequential)
-    if (totalCount > pageSize) {
-      const offsets = [];
-      for (let offset = pageSize; offset < totalCount && offset < 3000; offset += pageSize) {
-        offsets.push(offset);
-      }
-      // Fetch all remaining pages concurrently
-      const pagePromises = offsets.map(offset =>
-        fetch('https://api.musclewiki.com/exercises?limit=' + pageSize + '&offset=' + offset, {
+    // Build all offsets
+    const offsets = [];
+    for (let offset = pageSize; offset < totalCount && offset < 2500; offset += pageSize) {
+      offsets.push(offset);
+    }
+
+    // Fetch in batches of 10 parallel requests to avoid rate limits
+    const all = [...firstPage];
+    const batchSize = 10;
+    for (let i = 0; i < offsets.length; i += batchSize) {
+      const batch = offsets.slice(i, i + batchSize);
+      const pages = await Promise.all(batch.map(offset =>
+        fetch('https://api.musclewiki.com/exercises?page_size=' + pageSize + '&offset=' + offset, {
           headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' }
         })
         .then(r => r.ok ? r.json() : null)
-        .then(d => d?.results || (Array.isArray(d) ? d : []))
+        .then(d => d?.results || [])
         .catch(() => [])
-      );
-      const pages = await Promise.all(pagePromises);
+      ));
       for (const page of pages) all.push(...page);
     }
 
     if (!all.length) return null;
 
-    // Normalise ID field — API may use pk instead of id
+    // Normalise ID field
     for (const ex of all) {
       if (!ex.id && ex.pk) ex.id = ex.pk;
     }
 
     mwExerciseCache = all;
     mwExerciseCacheTime = now;
-    console.log('MuscleWiki cache fully loaded:', all.length, 'exercises');
+    console.log('MuscleWiki cache loaded:', all.length, '/', totalCount, 'exercises');
     return all;
   } catch(e) {
     console.error('MuscleWiki cache error:', e.message);
