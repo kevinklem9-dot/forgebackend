@@ -249,6 +249,8 @@ const MANUAL_EXERCISE_MAP = {
   'decline bench press':'Barbell Decline Bench Press',
   'dumbbell press':'Dumbbell Bench Press','dumbbell bench press':'Dumbbell Bench Press',
   'chest fly':'Dumbbell Fly','cable fly':'Cable Fly','pec deck':'Machine Fly',
+  'dumbbell flyes':'Dumbbell Fly','dumbbell fly':'Dumbbell Fly','dumbbell flies':'Dumbbell Fly',
+  'incline dumbbell flyes':'Dumbbell Incline Fly','incline fly':'Dumbbell Incline Fly','incline flies':'Dumbbell Incline Fly',
   'pull up':'Bodyweight Pull Up','pull ups':'Bodyweight Pull Up','pullup':'Bodyweight Pull Up','bodyweight pull up':'Bodyweight Pull Up','bodyweight pullup':'Bodyweight Pull Up',
   'chin up':'Bodyweight Chin Up','chin ups':'Bodyweight Chin Up',
   'lat pulldown':'Cable Lat Pulldown','cable pulldown':'Cable Lat Pulldown',
@@ -2182,27 +2184,50 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   const mwId = req.query.mw_id ? parseInt(req.query.mw_id) : null;
 
   // Helpers defined first — must be before any usage (const is not hoisted)
-  const buildResponse = (ex) => {
+  // buildResponseFromDetail: builds full response from a detail-enriched exercise object
+  const buildResponseFromDetail = (ex) => {
     const videos = ex.videos || [];
     const maleFront = videos.find(v => v.gender === 'male' && v.angle === 'front');
     const maleSide  = videos.find(v => v.gender === 'male' && v.angle === 'side');
     const getFilename = v => v?.url ? v.url.split('/branded/')[1] : null;
-    // Use ID-based URL if available — slug URLs 404
+    const frontFile = getFilename(maleFront) || getFilename(videos[0]) || null;
+    const sideFile  = getFilename(maleSide) || null;
     const mwPageUrl = ex.id
       ? 'https://musclewiki.com/exercises/' + ex.id
       : 'https://musclewiki.com/search?q=' + encodeURIComponent(ex.name || name);
     const result = {
       name: ex.name || name,
-      videoFilename: getFilename(maleFront) || getFilename(videos[0]) || null,
-      videoFilename2: getFilename(maleSide) || null,
+      videoFilename: frontFile,
+      videoFilename2: sideFile,
       instructions: ex.steps || [],
       primaryMuscles: ex.primary_muscles || [],
       category: ex.category || '',
       difficulty: ex.difficulty || '',
       muscleWikiUrl: mwPageUrl,
     };
-    try { saveExerciseLookup(name, ex); } catch(e) {} // persist for all future users
+    try { saveExerciseLookup(name, ex); } catch(e) {}
     return result;
+  };
+
+  // buildResponse: fetches full detail if videos missing (list endpoint omits videos)
+  const buildResponse = async (ex) => {
+    // List endpoint doesn't include videos — fetch detail if needed
+    if ((!ex.videos || ex.videos.length === 0) && ex.id && process.env.MUSCLEWIKI_API_KEY) {
+      try {
+        const detailRes = await fetch('https://api.musclewiki.com/exercises/' + ex.id, {
+          headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' }
+        });
+        if (detailRes.ok) {
+          const detail = await detailRes.json();
+          if (detail?.videos?.length) {
+            return buildResponseFromDetail({ ...ex, ...detail });
+          }
+        }
+      } catch(e) {
+        console.warn('Detail fetch failed for', ex.id, e.message);
+      }
+    }
+    return buildResponseFromDetail(ex);
   };
 
   const buildFromCache = (entry) => {
@@ -2226,7 +2251,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
     const mwExDirect = await getMuscleWikiExercises();
     if (mwExDirect) {
       const directMatch = mwExDirect.find(e => e.id === mwId);
-      if (directMatch) return res.json({ exercise: buildResponse(directMatch) });
+      if (directMatch) return res.json({ exercise: await buildResponse(directMatch) });
     }
   }
 
@@ -2237,7 +2262,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       const mwEx = await getMuscleWikiExercises();
       if (mwEx) {
         const full = mwEx.find(e => e.id === cachedLookup.mw_id || e.name === cachedLookup.mw_name);
-        if (full) return res.json({ exercise: buildResponse(full) });
+        if (full) return res.json({ exercise: await buildResponse(full) });
       }
       return res.json({ exercise: buildFromCache(cachedLookup) });
     }
@@ -2253,7 +2278,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   const resolvedName = await resolveExerciseName(name, mwExercises);
   if (resolvedName && mwExercises) {
     const match = mwExercises.find(e => e.name.toLowerCase() === resolvedName.toLowerCase());
-    if (match) return res.json({ exercise: buildResponse(match) });
+    if (match) return res.json({ exercise: await buildResponse(match) });
   }
 
   // 2b. Fuzzy score against full MuscleWiki cache
@@ -2282,13 +2307,13 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       return { e, score: 0 };
     }).filter(s => s.score > 0).sort((a, b) => b.score - a.score || a.e.name.length - b.e.name.length);
 
-    if (scored.length > 0) return res.json({ exercise: buildResponse(scored[0].e) });
+    if (scored.length > 0) return res.json({ exercise: await buildResponse(scored[0].e) });
 
     // 2c. AI normalisation via Claude Haiku (costs one API call, result cached)
     const aiName = await normaliseExerciseNameWithAI(name, mwExercises);
     if (aiName) {
       const aiMatch = mwExercises.find(e => e.name === aiName);
-      if (aiMatch) return res.json({ exercise: buildResponse(aiMatch) });
+      if (aiMatch) return res.json({ exercise: await buildResponse(aiMatch) });
     }
   }
 
@@ -2334,7 +2359,7 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
       return res.json({ exercise: { name, videoFilename: null, videoFilename2: null, instructions: [], primaryMuscles: [], category: '', difficulty: '', muscleWikiUrl: mwSearchUrl } });
     }
 
-    return res.json({ exercise: buildResponse(apiScored[0].r) });
+    return res.json({ exercise: await buildResponse(apiScored[0].r) });
 
   } catch(err) {
     console.error('Exercise search error:', err.message);
