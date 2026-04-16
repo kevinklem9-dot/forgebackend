@@ -74,6 +74,8 @@ async function getMuscleWikiExercises() {
     mwExerciseCache = all;
     mwExerciseCacheTime = now;
     console.log('MuscleWiki cache loaded:', all.length, '/', totalCount, 'exercises');
+    // Pre-warm detail cache in background — don't await
+    prewarmDetailCache(all).catch(() => {});
     return all;
   } catch(e) {
     console.error('MuscleWiki cache error:', e.message);
@@ -449,6 +451,41 @@ async function resolveExerciseName(name, exercises) {
   return aiResult;
 }
 
+// Pre-warm detail cache for common exercises — runs in background after list loads
+async function prewarmDetailCache(exercises) {
+  if (!exercises?.length || !process.env.MUSCLEWIKI_API_KEY) return;
+  // Common exercises the AI generates — pre-fetch their details
+  const commonNames = [
+    'Barbell Bench Press','Barbell Squat','Barbell Deadlift','Barbell Romanian Deadlift',
+    'Barbell Overhead Press','Barbell Row','Barbell Curl','Barbell Hip Thrust',
+    'Dumbbell Bench Press','Dumbbell Incline Press','Dumbbell Shoulder Press',
+    'Dumbbell Lateral Raise','Dumbbell Fly','Dumbbell Romanian Deadlift',
+    'Dumbbell Curl','Dumbbell Hammer Curl','Dumbbell Row','Dumbbell Lunge',
+    'Cable Lateral Raise','Cable Fly','Cable Row','Cable Tricep Pushdown',
+    'Cable Rope Tricep Pushdown','Cable Bicep Curl','Cable Face Pull',
+    'Machine Leg Press','Machine Leg Extension','Machine Lying Leg Curl',
+    'Machine Calf Raise','Machine Chest Press','Machine Lat Pulldown',
+    'Bodyweight Pull Up','Bodyweight Dip','Bodyweight Push Up',
+    'EZ Bar Curl','EZ Bar Skull Crusher',
+  ];
+  const toFetch = exercises.filter(e => commonNames.some(n => e.name === n) && !_detailCache.has(e.id));
+  console.log('Pre-warming detail cache for', toFetch.length, 'common exercises...');
+  // Fetch in small batches of 5 to avoid rate limits
+  for (let i = 0; i < toFetch.length; i += 5) {
+    const batch = toFetch.slice(i, i + 5);
+    await Promise.all(batch.map(async (ex) => {
+      try {
+        const r = await fetch('https://api.musclewiki.com/exercises/' + ex.id, {
+          headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' }
+        });
+        if (r.ok) { const d = await r.json(); _detailCache.set(ex.id, { ...ex, ...d }); }
+      } catch(e) {}
+    }));
+    await new Promise(r => setTimeout(r, 300)); // small delay between batches
+  }
+  console.log('Detail cache pre-warmed:', _detailCache.size, 'exercises ready');
+}
+
 // ── PERSISTENT EXERCISE LOOKUP CACHE (Supabase) ──────────────────────
 // Stores: ai_name (lowercase) → { mw_id, mw_name, mw_video_front, mw_video_side }
 // Shared across ALL users — one lookup benefits everyone forever
@@ -458,6 +495,7 @@ async function resolveExerciseName(name, exercises) {
 // );
 
 const _localLookupCache = new Map(); // in-memory layer on top of Supabase
+const _detailCache = new Map(); // id -> full exercise detail with videos
 
 async function getExerciseLookup(aiNameLower) {
   const localCached = _localLookupCache.get(aiNameLower);
@@ -2350,26 +2388,35 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
   // buildResponse: fetch full detail by ID — list endpoint never has videos
   const buildResponse = async (ex) => {
     const exerciseId = ex.id || ex.pk;
-    if (exerciseId && process.env.MUSCLEWIKI_API_KEY) {
+    if (!exerciseId) {
+      console.warn('No ID for exercise:', ex.name);
+      return buildResponseFromDetail(ex);
+    }
+
+    // Check detail cache first
+    if (_detailCache.has(exerciseId)) {
+      return buildResponseFromDetail(_detailCache.get(exerciseId));
+    }
+
+    if (process.env.MUSCLEWIKI_API_KEY) {
       try {
         const detailRes = await fetch('https://api.musclewiki.com/exercises/' + exerciseId, {
           headers: { 'X-API-Key': process.env.MUSCLEWIKI_API_KEY, 'Accept': 'application/json' }
         });
         if (detailRes.ok) {
           const detail = await detailRes.json();
+          const merged = { ...ex, ...detail };
+          _detailCache.set(exerciseId, merged); // cache for future requests
           if (detail?.videos?.length) {
-            console.log('Detail fetch success for', ex.name, '| id:', exerciseId, '| videos:', detail.videos.length);
-            return buildResponseFromDetail({ ...ex, ...detail });
+            return buildResponseFromDetail(merged);
           }
-          console.warn('Detail returned no videos for', ex.name, '| id:', exerciseId);
+          console.warn('Detail no videos for', ex.name, 'id:', exerciseId);
         } else {
-          console.warn('Detail fetch HTTP error:', detailRes.status, 'for id:', exerciseId);
+          console.warn('Detail HTTP error:', detailRes.status, 'id:', exerciseId);
         }
       } catch(e) {
-        console.warn('Detail fetch exception for', ex.name, '|', e.message);
+        console.warn('Detail fetch failed:', ex.name, e.message);
       }
-    } else {
-      console.warn('No ID for exercise:', ex.name, '| id:', ex.id, '| pk:', ex.pk);
     }
     return buildResponseFromDetail(ex);
   };
