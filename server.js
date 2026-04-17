@@ -47,14 +47,14 @@ async function getYouTubeVideoId(exerciseName) {
   if (!apiKey) return null;
 
   try {
-    const query = encodeURIComponent(exerciseName + ' exercise proper form tutorial');
+    // Search for short form tutorials — under 4 minutes, prioritise quick how-to channels
+    const query = encodeURIComponent(exerciseName + ' how to proper form');
+    // videoDuration=short targets videos under 4 minutes
     const url = 'https://www.googleapis.com/youtube/v3/search?part=snippet&q=' + query
-      + '&type=video&maxResults=3&videoDuration=medium&relevanceLanguage=en'
+      + '&type=video&maxResults=5&videoDuration=short&relevanceLanguage=en'
       + '&key=' + apiKey;
 
-    console.log('YouTube search URL:', url.replace(apiKey, 'KEY_HIDDEN'));
     const r = await fetch(url);
-    console.log('YouTube search status:', r.status);
     if (!r.ok) {
       const errText = await r.text().catch(() => '');
       console.warn('YouTube search failed:', r.status, errText.slice(0, 200));
@@ -64,15 +64,25 @@ async function getYouTubeVideoId(exerciseName) {
     const items = data.items || [];
     if (!items.length) return null;
 
-    // Pick best result — prefer known fitness channels
-    const preferred = ['Jeff Nippard','Alan Thrall','Jujimufu','Austin Current',
-      'Renaissance Periodization','Athlean-X','Jeremy Ethier','Mark Rippetoe',
-      'Starting Strength','PictureFit','Squat University'];
+    // Prefer channels known for short, clean form demonstrations
+    const preferred = [
+      'Jeff Nippard','Alan Thrall','Squat University','Austin Current',
+      'Starting Strength','Athlean-X','Jeremy Ethier','Renaissance Periodization',
+      'PictureFit','Buff Dudes','Scott Herman Fitness','Bodybuilding.com',
+      'FitnessFAQs','Dr. Mike Israetel'
+    ];
 
+    // Score results — prefer short videos from trusted channels
     let best = items[0];
     for (const item of items) {
       const channel = item.snippet?.channelTitle || '';
-      if (preferred.some(p => channel.includes(p))) { best = item; break; }
+      const title = item.snippet?.title?.toLowerCase() || '';
+      // Skip obviously long videos (playlists, full workouts)
+      if (title.includes('full workout') || title.includes('30 min') || title.includes('hour')) continue;
+      if (preferred.some(p => channel.toLowerCase().includes(p.toLowerCase()))) {
+        best = item;
+        break;
+      }
     }
 
     const result = {
@@ -2514,6 +2524,13 @@ app.get('/api/exercise/debug', requireAuth, async (req, res) => {
 // ── YOUTUBE VIDEO TEST ────────────────────────────────
 app.get('/api/exercise/yt-test', requireAuth, async (req, res) => {
   const name = req.query.name || 'Barbell Bench Press';
+  const force = req.query.force === '1'; // ?force=1 bypasses cache
+  if (force) {
+    const lower = name.toLowerCase().trim();
+    _ytCache.delete(lower);
+    // Also clear from Supabase
+    supabase.from('exercise_video_cache').delete().eq('exercise_name', lower).then(() => {}).catch(() => {});
+  }
   const yt = await getYouTubeVideoId(name);
   res.json({ name, result: yt, youtubeKeyPresent: !!process.env.YOUTUBE_API_KEY });
 });
