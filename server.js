@@ -52,9 +52,12 @@ async function getYouTubeVideoId(exerciseName) {
       + '&type=video&maxResults=3&videoDuration=medium&relevanceLanguage=en'
       + '&key=' + apiKey;
 
+    console.log('YouTube search URL:', url.replace(apiKey, 'KEY_HIDDEN'));
     const r = await fetch(url);
+    console.log('YouTube search status:', r.status);
     if (!r.ok) {
-      console.warn('YouTube search failed:', r.status);
+      const errText = await r.text().catch(() => '');
+      console.warn('YouTube search failed:', r.status, errText.slice(0, 200));
       return null;
     }
     const data = await r.json();
