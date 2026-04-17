@@ -52,19 +52,26 @@ async function getExerciseByName(name) {
 
   // 3. Search MuscleWiki — try exact name with search param
   try {
-    const r = await fetch(
-      'https://api.musclewiki.com/exercises?search=' + encodeURIComponent(name) + '&page_size=10',
-      { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } }
-    );
-    if (!r.ok) { console.warn('MuscleWiki search failed:', r.status); return null; }
+    const searchUrl = 'https://api.musclewiki.com/exercises?search=' + encodeURIComponent(name) + '&page_size=10';
+    console.log('MuscleWiki search:', searchUrl);
+    const r = await fetch(searchUrl, { headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' } });
+    console.log('MuscleWiki search status:', r.status, 'for', name);
+    if (!r.ok) {
+      const errText = await r.text().catch(() => '');
+      console.warn('MuscleWiki search failed:', r.status, errText.slice(0, 100));
+      return null;
+    }
     const data = await r.json();
     const results = data?.results || [];
-    // Only accept exact name match
-    const exact = results.find(e => e.name?.toLowerCase() === lower);
+    console.log('MuscleWiki search results:', results.length, 'for', name, '| names:', results.slice(0,3).map(e=>e.name).join(', '));
+    // Try exact match first, then case-insensitive
+    const exact = results.find(e => e.name?.toLowerCase() === lower)
+      || results.find(e => e.name?.toLowerCase().includes(lower))
+      || (results.length === 1 ? results[0] : null);
+    console.log('Exact match:', exact?.name || 'none');
     if (exact) {
       const detail = await fetchExerciseDetail(exact.id || exact.pk);
       if (detail) {
-        // Save to Supabase cache
         const videos = detail.videos || [];
         const front = videos.find(v => v.gender === 'male' && v.angle === 'front') || videos[0];
         const side  = videos.find(v => v.gender === 'male' && v.angle === 'side');
@@ -80,7 +87,7 @@ async function getExerciseByName(name) {
         return detail;
       }
     }
-  } catch(e) { console.warn('getExerciseByName search error:', e.message); }
+  } catch(e) { console.warn('getExerciseByName error:', e.message); }
   return null;
 }
 
