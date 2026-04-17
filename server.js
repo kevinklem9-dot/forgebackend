@@ -91,7 +91,7 @@ async function getYouTubeVideoId(exerciseName) {
       video_title: result.title,
       channel: result.channel,
       updated_at: new Date().toISOString()
-    }, { onConflict: 'exercise_name' }).catch(() => {});
+    }, { onConflict: 'exercise_name' }).then(() => {}).catch(() => {});
 
     console.log('YouTube found for', exerciseName, ':', result.videoId, '|', result.title);
     return result;
