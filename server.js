@@ -2348,13 +2348,14 @@ app.get('/api/monthly-review/latest', requireAuth, loadSubscription, async (req,
       return res.status(403).json({ error: 'feature_locked', message: 'Monthly reviews are available on the Forge plan.' });
     }
 
-    const month = billingMonth();
+    const month = new Date();
+    const monthStart = new Date(month.getFullYear(), month.getMonth(), 1).toISOString();
+
     const { data } = await supabase
       .from('monthly_reviews')
       .select('*')
       .eq('user_id', req.user.id)
-      .order('generated_at', { ascending: false })
-      .limit(1)
+      .eq('month_start', monthStart)
       .maybeSingle();
 
     res.json({ review: data || null });
@@ -2431,8 +2432,13 @@ Be direct, specific, and use their actual numbers. No generic filler. Write like
 
     const summary = aiRes.content[0]?.text || '';
 
-    // Save to monthly_reviews
-    await supabase.from('monthly_reviews').upsert({
+    // Save to monthly_reviews — delete existing for this user/month then insert fresh
+    await supabase.from('monthly_reviews')
+      .delete()
+      .eq('user_id', userId)
+      .eq('month_start', monthStart);
+
+    const { error: insertErr } = await supabase.from('monthly_reviews').insert({
       user_id: userId,
       month_start: monthStart,
       workouts_completed: sessions.length,
@@ -2442,7 +2448,12 @@ Be direct, specific, and use their actual numbers. No generic filler. Write like
         : null,
       summary,
       generated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id,month_start' });
+    });
+
+    if (insertErr) {
+      console.error('Monthly review save error:', insertErr);
+      // Still return the review even if save failed
+    }
 
     res.json({ review: { summary, workouts_completed: sessions.length, prs_hit: prs.length, month_start: monthStart } });
   } catch(err) {
