@@ -980,6 +980,109 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
   }
 });
 
+// ── TRANSLATE PLAN ─────────────────────────────
+app.post('/api/translate-plan', requireAuth, async (req, res) => {
+  try {
+    const { language } = req.body;
+    if (!language || language === 'en') return res.json({ ok: true, skipped: true });
+
+    const LANG_NAMES = { es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese', nl:'Dutch', uk:'Ukrainian', fi:'Finnish', ar:'Arabic', zh:'Chinese (Simplified)', ja:'Japanese' };
+    const langName = LANG_NAMES[language] || language;
+
+    // Load the user's current plan
+    const { data: planRow } = await supabase
+      .from('plans')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('generated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!planRow) return res.status(404).json({ error: 'No plan found' });
+
+    const plan = planRow.workout_plan;
+    const nutrition = planRow.nutrition_plan;
+
+    // Extract only translatable text — exercise names stay in English (universal gym terminology)
+    const toTranslate = {
+      split_name: plan?.split_name || '',
+      split_description: plan?.split_description || '',
+      strategy: nutrition?.strategy || '',
+      days: (plan?.days || []).map(d => ({
+        day_name: d.day_name || '',
+        label: d.label || '',
+        muscles: d.muscles || [],
+        exercise_notes: (d.exercises || []).map(e => e.note || ''),
+      })),
+      meal_names: (nutrition?.meals || []).map(m => m.name || ''),
+      food_names: (nutrition?.meals || []).flatMap(m => (m.foods || []).map(f => f.name || '')),
+    };
+
+    const prompt = `Translate the following fitness plan text fields from English into ${langName}.
+Rules:
+- Keep exercise names (e.g. "Barbell Bench Press", "Squat") in English — these are universal gym terms
+- Translate everything else: day names, labels, muscle names, exercise notes, meal names, food names, strategy
+- Keep all numbers, units (kg, g, kcal, min), time formats exactly as-is
+- Return ONLY valid JSON with the same structure, no explanation
+
+Input JSON:
+${JSON.stringify(toTranslate, null, 2)}`;
+
+    const aiRes = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    let translated;
+    try {
+      const text = aiRes.content[0]?.text || '';
+      const clean = text.replace(/```json\n?|```/g, '').trim();
+      translated = JSON.parse(clean);
+    } catch (e) {
+      console.error('Translate plan parse error:', e.message);
+      return res.status(500).json({ error: 'Failed to parse translation' });
+    }
+
+    // Apply translations back to plan objects (deep clone to avoid mutation)
+    const newPlan = JSON.parse(JSON.stringify(plan));
+    const newNutrition = JSON.parse(JSON.stringify(nutrition));
+
+    if (translated.split_name) newPlan.split_name = translated.split_name;
+    if (translated.split_description) newPlan.split_description = translated.split_description;
+    if (translated.strategy && newNutrition) newNutrition.strategy = translated.strategy;
+
+    (translated.days || []).forEach((td, i) => {
+      if (!newPlan.days?.[i]) return;
+      if (td.day_name) newPlan.days[i].day_name = td.day_name;
+      if (td.label) newPlan.days[i].label = td.label;
+      if (td.muscles?.length) newPlan.days[i].muscles = td.muscles;
+      (td.exercise_notes || []).forEach((note, j) => {
+        if (newPlan.days[i].exercises?.[j] && note) {
+          newPlan.days[i].exercises[j].note = note;
+        }
+      });
+    });
+
+    // Translate meal names
+    const mealNames = translated.meal_names || [];
+    const foodNames = translated.food_names || [];
+    let foodIdx = 0;
+    (newNutrition?.meals || []).forEach((meal, mi) => {
+      if (mealNames[mi]) meal.name = mealNames[mi];
+      (meal.foods || []).forEach(food => {
+        if (foodNames[foodIdx]) food.name = foodNames[foodIdx];
+        foodIdx++;
+      });
+    });
+
+    res.json({ ok: true, workout_plan: newPlan, nutrition_plan: newNutrition });
+  } catch (err) {
+    console.error('translate-plan error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GET PLAN ───────────────────────────────────
 app.get('/api/plan', requireAuth, async (req, res) => {
   try {
