@@ -593,7 +593,7 @@ const corsOptions = {
 app.use(helmet({ contentSecurityPolicy: false })); // Security headers
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all preflight requests
-app.use(express.json({ limit: '100kb' }));
+app.use(express.json({ limit: '500kb' }));
 
 // Rate limiting — protect against abuse
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
@@ -1334,7 +1334,10 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
 
     res.json({ reply: cleanReply, plan_update: planUpdate });
   } catch (err) {
-    console.error('Checkin error:', err);
+    console.error('Checkin error:', err.status || '', err.message);
+    if (err.message?.includes('overloaded') || err.status === 529) {
+      return res.status(503).json({ error: 'AI is busy — please try again in a moment.' });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -2356,6 +2359,94 @@ app.get('/api/monthly-review/latest', requireAuth, loadSubscription, async (req,
 
     res.json({ review: data || null });
   } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── MONTHLY REVIEW GENERATE ────────────────────
+app.post('/api/monthly-review/generate', requireAuth, loadSubscription, async (req, res) => {
+  try {
+    const { accessTier, isExempt } = req.subscription;
+    if (!hasAccess('monthly_review', accessTier, isExempt)) {
+      return res.status(403).json({ error: 'feature_locked', message: 'Monthly reviews are available on the Forge plan.' });
+    }
+
+    const userId = req.user.id;
+
+    // Gather monthly data
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const monthName = now.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+
+    const [profileRes, sessionsRes, prsRes, metricsRes] = await Promise.all([
+      supabase.from('profiles').select('*').eq('id', userId).maybeSingle(),
+      supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', monthStart).order('created_at', { ascending: false }),
+      supabase.from('personal_records').select('*').eq('user_id', userId).gte('achieved_at', monthStart),
+      supabase.from('body_metrics').select('*').eq('user_id', userId).gte('recorded_at', monthStart).order('recorded_at', { ascending: false }),
+    ]);
+
+    const profile = profileRes.data;
+    const sessions = sessionsRes.data || [];
+    const prs = prsRes.data || [];
+    const metrics = metricsRes.data || [];
+
+    const sessionSummary = sessions.map(s => {
+      const dateStr = new Date(s.created_at).toLocaleDateString('en-GB');
+      const exStr = (s.exercises || []).map(e => {
+        const setsStr = (e.sets_data || []).map(st => st.weight + 'kg×' + st.reps).join(', ');
+        return e.name + ' ' + setsStr;
+      }).join(' | ');
+      return dateStr + ': ' + (s.day_label || 'Session') + ' — ' + exStr;
+    }).join('\n');
+
+    const prompt = `You are a personal trainer writing a monthly deep-dive review for ${profile?.name || 'this athlete'}.
+
+Month: ${monthName}
+Goal: ${profile?.goal || 'Build muscle'}
+Experience: ${profile?.experience || 'intermediate'}
+Sessions completed: ${sessions.length}
+PRs hit this month: ${prs.length}
+${metrics.length ? `Latest weight: ${metrics[0].weight_kg || '—'}kg` : ''}
+
+Session log:
+${sessionSummary || 'No sessions logged this month.'}
+
+PRs: ${prs.map(p => `${p.exercise_name}: ${p.weight_kg}kg × ${p.reps}`).join(', ') || 'None'}
+
+Write a concise but thorough monthly review (250-350 words) covering:
+1. Overall assessment of the month
+2. Key strength progressions or PRs worth highlighting
+3. Patterns you noticed (consistency, weak days, strong exercises)
+4. One thing they did really well
+5. One specific focus area for next month
+6. A short motivating close
+
+Be direct, specific, and use their actual numbers. No generic filler. Write like a coach who actually looked at their data.`;
+
+    const aiRes = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 600,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const summary = aiRes.content[0]?.text || '';
+
+    // Save to monthly_reviews
+    await supabase.from('monthly_reviews').upsert({
+      user_id: userId,
+      month_start: monthStart,
+      workouts_completed: sessions.length,
+      prs_hit: prs.length,
+      adherence_pct: profile?.days_per_week
+        ? Math.round((sessions.length / (parseInt(profile.days_per_week) * 4.3)) * 100)
+        : null,
+      summary,
+      generated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id,month_start' });
+
+    res.json({ review: { summary, workouts_completed: sessions.length, prs_hit: prs.length, month_start: monthStart } });
+  } catch(err) {
+    console.error('Monthly review error:', err);
     res.status(500).json({ error: err.message });
   }
 });
