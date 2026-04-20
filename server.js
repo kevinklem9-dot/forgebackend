@@ -1,4 +1,6 @@
 require('dotenv').config();
+process.on('uncaughtException', err => { console.error('UNCAUGHT EXCEPTION:', err.message, err.stack); process.exit(1); });
+process.on('unhandledRejection', (reason) => { console.error('UNHANDLED REJECTION:', reason); });
 const express = require('express');
 const https = require('https');
 const cors = require('cors');
@@ -2444,6 +2446,106 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
 
 
 // ── MONTHLY REVIEW — Latest ────────────────────
+// ── WEEKLY REVIEW GENERATE ─────────────────────
+app.post('/api/review/generate', requireAuth, loadSubscription, async (req, res) => {
+  try {
+    const { accessTier, isExempt } = req.subscription;
+    if (!hasAccess('weekly_review', accessTier, isExempt)) {
+      return res.status(403).json({ error: 'feature_locked', message: 'Weekly reviews are available on Steel and above.' });
+    }
+
+    const userId = req.user.id;
+    const now = new Date();
+    const weekStart = new Date(now);
+    weekStart.setDate(now.getDate() - now.getDay()); // Sunday
+    weekStart.setHours(0, 0, 0, 0);
+    const weekStartStr = weekStart.toISOString().split('T')[0];
+
+    const [profileRes, sessionsRes, prsRes] = await Promise.all([
+      supabase.from('profiles').select('*').eq('id', userId).maybeSingle(),
+      supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', weekStart.toISOString()),
+      supabase.from('personal_records').select('*').eq('user_id', userId).gte('achieved_at', weekStartStr),
+    ]);
+
+    const profile = profileRes.data;
+    const sessions = sessionsRes.data || [];
+    const prs = prsRes.data || [];
+
+    const sessionSummary = sessions.map(s => {
+      const exStr = (s.exercises || []).map(e => {
+        const setsStr = (e.sets_data || []).map(st => `${st.weight}kg×${st.reps}`).join(', ');
+        return `${e.name}: ${setsStr}`;
+      }).join(' | ');
+      return new Date(s.created_at).toLocaleDateString('en-GB') + ': ' + (s.day_label || 'Session') + ' — ' + exStr;
+    }).join('\n');
+
+    const prompt = `You are FORGE, an AI fitness coach. Write a short weekly review for ${profile?.name || 'this athlete'}.
+
+Week: ${weekStartStr}
+Goal: ${profile?.goal || 'Build muscle'}
+Sessions completed: ${sessions.length}
+PRs hit: ${prs.length}${prs.length ? ' (' + prs.map(p => `${p.exercise_name}: ${p.weight_kg}kg×${p.reps}`).join(', ') + ')' : ''}
+
+Session log:
+${sessionSummary || 'No sessions logged this week.'}
+
+Write a concise weekly review (100-150 words) covering: how the week went, any highlights, one thing to focus on next week. Be direct and specific. Use their actual numbers. No filler.`;
+
+    const aiRes = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const summary = aiRes.content[0]?.text || '';
+
+    // Save — delete existing for this week then insert
+    await supabase.from('weekly_reviews').delete().eq('user_id', userId).eq('week_start', weekStartStr);
+
+    const { error: insertErr } = await supabase.from('weekly_reviews').insert({
+      user_id: userId,
+      week_start: weekStartStr,
+      workouts_completed: sessions.length,
+      workouts_planned: profile?.days_per_week || 4,
+      prs_hit: prs.length,
+      summary,
+      ai_insights: summary,
+      created_at: new Date().toISOString(),
+    });
+
+    if (insertErr) console.error('Weekly review insert error:', insertErr);
+
+    res.json({ review: { summary, workouts_completed: sessions.length, prs_hit: prs.length, week_start: weekStartStr } });
+  } catch (err) {
+    console.error('Weekly review generate error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── WEEKLY REVIEW LATEST (fallback if retention routes missing) ─────────────
+app.get('/api/review/latest', requireAuth, loadSubscription, async (req, res) => {
+  try {
+    const { accessTier, isExempt } = req.subscription;
+    if (!hasAccess('weekly_review', accessTier, isExempt)) {
+      return res.status(403).json({ error: 'feature_locked' });
+    }
+    const { data, error } = await supabase
+      .from('weekly_reviews')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) console.error('weekly review latest error:', error);
+    // Normalise field names
+    if (data && !data.summary && data.ai_insights) data.summary = data.ai_insights;
+    res.json({ review: data || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── MONTHLY REVIEW LATEST ──────────────────────
 app.get('/api/monthly-review/latest', requireAuth, loadSubscription, async (req, res) => {
   try {
     const { accessTier, isExempt } = req.subscription;
@@ -2578,8 +2680,13 @@ Be direct, specific, and use their actual numbers. No generic filler. Write like
 });
 
 // ── RETENTION FEATURES ────────────────────────
-const retentionRoutes = require('./routes/retention')(supabase, anthropic);
-app.use('/api', requireAuth, retentionRoutes);
+try {
+  const retentionRoutes = require('./routes/retention')(supabase, anthropic);
+  app.use('/api', requireAuth, retentionRoutes);
+  console.log('Retention routes loaded OK');
+} catch (err) {
+  console.error('Failed to load retention routes:', err.message);
+}
 
 // ── START ──────────────────────────────────────
 // ── EXERCISE LOOKUP — YouTube video search ───────────────
