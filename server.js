@@ -715,7 +715,7 @@ async function loadSubscription(req, res, next) {
       }
     }
 
-    // During trial, full access regardless of tier
+    // During trial, full access to everything — best sales tool
     const accessTier = (effectiveStatus === 'trial' && !isExempt) ? 'forge' : effectiveTier;
 
     req.subscription = {
@@ -2265,6 +2265,22 @@ app.patch('/api/subscription/tier', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, tier: data.subscription_tier, trialEndsAt: data.trial_ends_at });
   } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/admin/users/:userId/expire-trial', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('profiles')
+      .update({
+        subscription_status: 'expired',
+        trial_ends_at: new Date().toISOString(),
+      })
+      .eq('id', req.params.userId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
