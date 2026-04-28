@@ -854,6 +854,31 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       }
     }
 
+    // Handle creator code or referral code
+    const { code } = req.body;
+    if (code && data.user?.id) {
+      if (code.startsWith('FORGE-')) {
+        // Referral code
+        const { data: referrer } = await supabase.from('profiles').select('id, referral_stats').eq('referral_code', code).maybeSingle();
+        if (referrer) {
+          const extendedTrial = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
+          await supabase.from('profiles').update({ trial_ends_at: extendedTrial, referred_by: referrer.id }).eq('id', data.user.id);
+          const stats = referrer.referral_stats || {};
+          stats.signups = (stats.signups || 0) + 1;
+          await supabase.from('profiles').update({ referral_stats: stats }).eq('id', referrer.id);
+        }
+      } else {
+        // Creator code
+        const { data: codeRow } = await supabase.from('creator_codes').select('*').eq('code', code.toUpperCase()).maybeSingle();
+        if (codeRow && !(codeRow.expires_at && new Date(codeRow.expires_at) < new Date()) && !(codeRow.max_uses && codeRow.uses_count >= codeRow.max_uses)) {
+          const extendedTrial = new Date(Date.now() + (codeRow.trial_days || 14) * 24 * 60 * 60 * 1000).toISOString();
+          await supabase.from('profiles').update({ trial_ends_at: extendedTrial }).eq('id', data.user.id);
+          await supabase.from('creator_codes').update({ uses_count: (codeRow.uses_count || 0) + 1 }).eq('id', codeRow.id);
+          await supabase.from('creator_code_uses').insert({ code_id: codeRow.id, user_id: data.user.id, used_at: new Date().toISOString() }).catch(() => {});
+        }
+      }
+    }
+
     // Return success — user must confirm email before logging in
     res.json({ requires_confirmation: true, email });
   } catch (err) {
@@ -3304,6 +3329,90 @@ app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════
+// LAUNCH PRICING SYSTEM
+// ═══════════════════════════════════════════════════════
+
+const LAUNCH_PROMO_THRESHOLD = 500;
+
+// Get current launch pricing status
+async function getLaunchPricingStatus() {
+  try {
+    const { data } = await supabase
+      .from('launch_pricing_config')
+      .select('*')
+      .maybeSingle();
+    if (!data) {
+      // Default state — both active, 0 sold
+      return {
+        steel_active: true, steel_sold: 0, steel_threshold: LAUNCH_PROMO_THRESHOLD,
+        forge_active: true, forge_sold: 0, forge_threshold: LAUNCH_PROMO_THRESHOLD,
+      };
+    }
+    return {
+      steel_active: data.steel_active && data.steel_sold < LAUNCH_PROMO_THRESHOLD,
+      steel_sold: data.steel_sold || 0,
+      steel_threshold: LAUNCH_PROMO_THRESHOLD,
+      forge_active: data.forge_active && data.forge_sold < LAUNCH_PROMO_THRESHOLD,
+      forge_sold: data.forge_sold || 0,
+      forge_threshold: LAUNCH_PROMO_THRESHOLD,
+    };
+  } catch(e) {
+    console.error('getLaunchPricingStatus error:', e.message);
+    return { steel_active: false, steel_sold: 0, forge_active: false, forge_sold: 0 };
+  }
+}
+
+// Public endpoint — frontend polls this to show/hide promo UI
+app.get('/api/launch-pricing', async (req, res) => {
+  const status = await getLaunchPricingStatus();
+  res.json(status);
+});
+
+// Increment counter when a paid subscription completes
+app.post('/api/launch-pricing/record-subscription', requireAuth, async (req, res) => {
+  try {
+    const { tier } = req.body; // 'steel' or 'forge'
+    if (!['steel','forge'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
+    const status = await getLaunchPricingStatus();
+    if (!status[`${tier}_active`]) return res.json({ ok: true, promo_active: false });
+    const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
+    const newSold = (config?.[`${tier}_sold`] || 0) + 1;
+    const nowEnded = newSold >= LAUNCH_PROMO_THRESHOLD;
+    await supabase.from('launch_pricing_config').upsert({
+      id: 1,
+      steel_active: config?.steel_active ?? true,
+      steel_sold: tier === 'steel' ? newSold : (config?.steel_sold || 0),
+      forge_active: config?.forge_active ?? true,
+      forge_sold: tier === 'forge' ? newSold : (config?.forge_sold || 0),
+      ...(tier === 'steel' && nowEnded ? { steel_active: false } : {}),
+      ...(tier === 'forge' && nowEnded ? { forge_active: false } : {}),
+    });
+    res.json({ ok: true, promo_active: !nowEnded, remaining: LAUNCH_PROMO_THRESHOLD - newSold });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: view and control launch pricing
+app.get('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, res) => {
+  const status = await getLaunchPricingStatus();
+  res.json(status);
+});
+
+app.patch('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { steel_active, forge_active } = req.body;
+    const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
+    await supabase.from('launch_pricing_config').upsert({
+      id: 1,
+      steel_active: steel_active !== undefined ? steel_active : (config?.steel_active ?? true),
+      steel_sold: config?.steel_sold || 0,
+      forge_active: forge_active !== undefined ? forge_active : (config?.forge_active ?? true),
+      forge_sold: config?.forge_sold || 0,
+    });
+    res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 
 // ── DEBUG — View raw plan (admin only) ────────
@@ -3322,4 +3431,277 @@ app.get('/api/exercise/find-ids', requireAuth, async (req, res) => {
     return { query: n, matches: matches.map(e => ({ id: e.id, name: e.name, videos: (e.videos||[]).length })) };
   });
   res.json({ results, totalCached: exercises.length });
+});
+
+// ═══════════════════════════════════════════════════════
+// PUSH NOTIFICATIONS
+// ═══════════════════════════════════════════════════════
+
+// Send push notification to a user
+async function sendPushToUser(userId, title, body, url = '/') {
+  try {
+    const { data: subs } = await supabase
+      .from('push_subscriptions')
+      .select('subscription')
+      .eq('user_id', userId);
+    if (!subs?.length) return;
+    const payload = JSON.stringify({ title, body, url });
+    for (const row of subs) {
+      try {
+        await fetch(row.subscription.endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'TTL': '86400',
+          },
+          body: payload,
+        }).catch(() => {});
+      } catch(e) { /* ignore individual failures */ }
+    }
+  } catch(e) { console.error('sendPushToUser error:', e.message); }
+}
+
+// Subscribe to push
+app.post('/api/push/subscribe', requireAuth, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription?.endpoint) return res.status(400).json({ error: 'Invalid subscription' });
+    await supabase.from('push_subscriptions').upsert({
+      user_id: req.user.id,
+      subscription,
+    }, { onConflict: 'user_id' });
+    res.json({ ok: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Trigger grace period notification sequence
+app.post('/api/push/grace-period', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  // Store grace period start in profile metadata
+  await supabase.from('profiles').update({ grace_period_started_at: new Date().toISOString() }).eq('id', userId);
+  // Schedule notifications (fire and forget — use setTimeout for simplicity)
+  // Notification 1 — 6 hours
+  setTimeout(async () => {
+    const { data: profile } = await supabase.from('profiles').select('subscription_status').eq('id', userId).maybeSingle();
+    if (profile?.subscription_status === 'active') return; // converted — stop
+    await sendPushToUser(userId,
+      'FORGE',
+      'Your plan is still here. Your progress is saved. Whenever you\'re ready, pick up where you left off.'
+    );
+  }, 6 * 60 * 60 * 1000);
+  // Notification 2 — 24 hours
+  setTimeout(async () => {
+    const { data: profile } = await supabase.from('profiles').select('subscription_status').eq('id', userId).maybeSingle();
+    if (profile?.subscription_status === 'active') return;
+    await sendPushToUser(userId,
+      'Your coach has something to say',
+      'Your AI coach has insight on your last session. Upgrade to Steel to hear it.'
+    );
+  }, 24 * 60 * 60 * 1000);
+  // Notification 3 — 48 hours
+  setTimeout(async () => {
+    const { data: profile } = await supabase.from('profiles').select('subscription_status').eq('id', userId).maybeSingle();
+    if (profile?.subscription_status === 'active') return;
+    // Check founding member slots
+    const { data: slots } = await supabase.from('founding_member_config').select('*').maybeSingle();
+    const ironAvailable = (slots?.iron_sold || 0) < (slots?.iron_total || 500);
+    const steelAvailable = (slots?.steel_sold || 0) < (slots?.steel_total || 250);
+    // Check Steel launch promo
+    const promoStatus = await getLaunchPricingStatus();
+    // Priority: A (founding) → C (steel promo) → B (fallback)
+    if (ironAvailable || steelAvailable) {
+      await sendPushToUser(userId, 'Founding Member slots are going', 'Lifetime access to FORGE — pay once, train forever. Limited slots remaining.');
+    } else if (promoStatus.steel_active) {
+      await sendPushToUser(userId, 'Launch pricing is still live', 'Steel is CHF 11.99/mo while spots remain. That price locks in permanently — it never increases.');
+    } else {
+      await sendPushToUser(userId, 'Your coaching is on hold', 'It takes 30 seconds to restart it.');
+    }
+  }, 48 * 60 * 60 * 1000);
+  res.json({ ok: true });
+});
+
+// Day 3-4 founding member push (called by a scheduled job or on plan fetch)
+app.post('/api/push/founding-member-notify', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    // Check if already sent
+    const { data: profile } = await supabase.from('profiles')
+      .select('founding_notified_at, subscription_status')
+      .eq('id', userId).maybeSingle();
+    if (profile?.founding_notified_at) return res.json({ ok: true, skipped: true });
+    if (profile?.subscription_status === 'active') return res.json({ ok: true, skipped: true });
+    // Check slots
+    const { data: slots } = await supabase.from('founding_member_config').select('*').maybeSingle();
+    const available = ((slots?.iron_sold || 0) < (slots?.iron_total || 500)) || ((slots?.steel_sold || 0) < (slots?.steel_total || 250));
+    if (!available) return res.json({ ok: true, skipped: true });
+    await sendPushToUser(userId, 'Founding Member access — limited slots', 'Pay once, train forever. First 500 members only. You\'re eligible now.');
+    await supabase.from('profiles').update({ founding_notified_at: new Date().toISOString() }).eq('id', userId);
+    res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// TESTIMONIAL — dynamic, updatable without code deploy
+// ═══════════════════════════════════════════════════════
+app.get('/api/testimonial', async (req, res) => {
+  try {
+    const { data } = await supabase.from('app_config').select('value').eq('key', 'paywall_testimonial').maybeSingle();
+    res.json(data?.value || {
+      quote: "Built me a full programme in under 2 minutes. I've tried four other apps. This is the first one that felt like it actually knew what I needed.",
+      attribution: "— James, training for football season"
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/admin/testimonial', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { quote, attribution } = req.body;
+    await supabase.from('app_config').upsert({ key: 'paywall_testimonial', value: { quote, attribution } }, { onConflict: 'key' });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// TRIAL DAY 7 — IN-APP TESTIMONIAL PROMPT FEEDBACK
+// ═══════════════════════════════════════════════════════
+app.post('/api/trial-feedback', requireAuth, async (req, res) => {
+  try {
+    const { feedback } = req.body;
+    await supabase.from('trial_feedback').insert({ user_id: req.user.id, feedback, created_at: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// FOUNDING MEMBER
+// ═══════════════════════════════════════════════════════
+app.get('/api/founding-member/slots', async (req, res) => {
+  try {
+    const { data } = await supabase.from('founding_member_config').select('*').maybeSingle();
+    res.json({
+      iron_total: data?.iron_total || 500,
+      iron_sold: data?.iron_sold || 0,
+      steel_total: data?.steel_total || 250,
+      steel_sold: data?.steel_sold || 0,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
+  try {
+    const { tier } = req.body; // 'iron' or 'steel'
+    if (!['iron','steel'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
+    const { data: config } = await supabase.from('founding_member_config').select('*').maybeSingle();
+    const sold = config?.[`${tier}_sold`] || 0;
+    const total = config?.[`${tier}_total`] || (tier === 'iron' ? 500 : 250);
+    if (sold >= total) return res.status(400).json({ error: 'Sold out' });
+    // Increment sold counter
+    await supabase.from('founding_member_config').upsert({
+      id: config?.id || 1,
+      [`${tier}_sold`]: sold + 1,
+      iron_total: config?.iron_total || 500,
+      steel_total: config?.steel_total || 250,
+    });
+    // Set user to lifetime
+    await supabase.from('profiles').update({
+      subscription_tier: tier,
+      subscription_status: 'lifetime',
+      lifetime_tier: tier,
+    }).eq('id', req.user.id);
+    res.json({ ok: true, tier });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// REFERRAL PROGRAMME
+// ═══════════════════════════════════════════════════════
+app.get('/api/referral', requireAuth, async (req, res) => {
+  try {
+    // Get or create referral code
+    let { data: profile } = await supabase.from('profiles').select('referral_code, referral_stats').eq('id', req.user.id).maybeSingle();
+    if (!profile?.referral_code) {
+      const code = 'FORGE-' + req.user.id.replace(/-/g,'').substring(0,8).toUpperCase();
+      await supabase.from('profiles').update({ referral_code: code }).eq('id', req.user.id);
+      profile = { referral_code: code, referral_stats: null };
+    }
+    const stats = profile.referral_stats || { clicks: 0, signups: 0, conversions: 0, credits: 0 };
+    res.json({ code: profile.referral_code, stats });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Apply referral code on signup — called after account creation
+app.post('/api/referral/apply', requireAuth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'No code' });
+    const { data: referrer } = await supabase.from('profiles').select('id, referral_stats').eq('referral_code', code.toUpperCase()).maybeSingle();
+    if (!referrer) return res.status(404).json({ error: 'Invalid code' });
+    if (referrer.id === req.user.id) return res.status(400).json({ error: 'Cannot refer yourself' });
+    // Extend this user's trial to 14 days
+    const trialEndsAt = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
+    await supabase.from('profiles').update({ trial_ends_at: trialEndsAt, referred_by: referrer.id }).eq('id', req.user.id);
+    // Track signup in referrer stats
+    const stats = referrer.referral_stats || { clicks: 0, signups: 0, conversions: 0, credits: 0 };
+    stats.signups = (stats.signups || 0) + 1;
+    await supabase.from('profiles').update({ referral_stats: stats }).eq('id', referrer.id);
+    res.json({ ok: true, trialDays: 14 });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// CREATOR CODES (Section 10)
+// ═══════════════════════════════════════════════════════
+app.post('/api/creator-code/validate', async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'No code' });
+    const { data } = await supabase.from('creator_codes')
+      .select('*').eq('code', code.toUpperCase().trim()).maybeSingle();
+    if (!data) return res.status(404).json({ error: 'Invalid code' });
+    if (data.expires_at && new Date(data.expires_at) < new Date()) return res.status(400).json({ error: 'Code expired' });
+    if (data.max_uses && data.uses_count >= data.max_uses) return res.status(400).json({ error: 'Code fully redeemed' });
+    res.json({ ok: true, trial_days: data.trial_days || 14, name: data.name });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/creator-code/redeem', requireAuth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    const { data } = await supabase.from('creator_codes')
+      .select('*').eq('code', code.toUpperCase().trim()).maybeSingle();
+    if (!data) return res.status(404).json({ error: 'Invalid code' });
+    // Extend trial
+    const trialEndsAt = new Date(Date.now() + (data.trial_days || 14) * 24 * 60 * 60 * 1000).toISOString();
+    await supabase.from('profiles').update({ trial_ends_at: trialEndsAt }).eq('id', req.user.id);
+    // Track usage
+    await supabase.from('creator_codes').update({
+      uses_count: (data.uses_count || 0) + 1,
+    }).eq('id', data.id);
+    await supabase.from('creator_code_uses').insert({
+      code_id: data.id, user_id: req.user.id, used_at: new Date().toISOString()
+    });
+    res.json({ ok: true, trial_days: data.trial_days || 14 });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: create creator code
+app.post('/api/admin/creator-codes', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { name, code, trial_days, expires_at, max_uses } = req.body;
+    const { data, error } = await supabase.from('creator_codes').insert({
+      name, code: code.toUpperCase(), trial_days: trial_days || 14,
+      expires_at: expires_at || null, max_uses: max_uses || null, uses_count: 0
+    }).select().maybeSingle();
+    if (error) throw error;
+    res.json({ ok: true, code: data });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/creator-codes', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { data } = await supabase.from('creator_codes').select('*').order('created_at', { ascending: false });
+    res.json({ codes: data || [] });
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
