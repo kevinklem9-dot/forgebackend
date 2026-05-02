@@ -575,6 +575,46 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ── STRIPE ─────────────────────────────────────────────
+let stripe = null;
+try {
+  if (process.env.STRIPE_SECRET_KEY) {
+    stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+    console.log('Stripe initialised ✓');
+  } else {
+    console.warn('STRIPE_SECRET_KEY not set — Stripe features disabled');
+  }
+} catch(e) {
+  console.error('Stripe init failed:', e.message);
+}
+
+// Price ID map — swap these for live IDs when going to production
+const STRIPE_PRICES = {
+  iron_monthly:        process.env.STRIPE_PRICE_IRON_MONTHLY        || 'price_1TRVyYCP6MFAx438g7OtULUQ',
+  iron_annual:         process.env.STRIPE_PRICE_IRON_ANNUAL         || 'price_1TRVz4CP6MFAx438Bph4XBhA',
+  steel_monthly:       process.env.STRIPE_PRICE_STEEL_MONTHLY       || 'price_1TRVzOCP6MFAx438TZ91bkEL',
+  steel_annual:        process.env.STRIPE_PRICE_STEEL_ANNUAL        || 'price_1TRW00CP6MFAx4383yXNBGFU',
+  forge_monthly:       process.env.STRIPE_PRICE_FORGE_MONTHLY       || 'price_1TRW0OCP6MFAx438U9PU9vMV',
+  forge_annual:        process.env.STRIPE_PRICE_FORGE_ANNUAL        || 'price_1TRW0jCP6MFAx438kn5AaNUk',
+  steel_monthly_promo: process.env.STRIPE_PRICE_STEEL_MONTHLY_PROMO || 'price_1TRW19CP6MFAx438Z9q3divk',
+  steel_annual_promo:  process.env.STRIPE_PRICE_STEEL_ANNUAL_PROMO  || 'price_1TRW1hCP6MFAx438y1Ce7oNs',
+  forge_monthly_promo: process.env.STRIPE_PRICE_FORGE_MONTHLY_PROMO || 'price_1TRW27CP6MFAx438cccyiUmk',
+  forge_annual_promo:  process.env.STRIPE_PRICE_FORGE_ANNUAL_PROMO  || 'price_1TRW2YCP6MFAx438qTEPAtwj',
+  iron_founding:       process.env.STRIPE_PRICE_IRON_FOUNDING       || 'price_1TRW33CP6MFAx438rk9GZZ6P',
+  steel_founding:      process.env.STRIPE_PRICE_STEEL_FOUNDING      || 'price_1TRW3PCP6MFAx438tgVOex9V',
+};
+
+// Map price IDs back to tiers — used by webhook and sync endpoint
+function getTierFromPriceId(priceId) {
+  const map = {};
+  Object.entries(STRIPE_PRICES).forEach(([key, id]) => {
+    if (key.startsWith('iron')) map[id] = 'iron';
+    else if (key.startsWith('steel')) map[id] = 'steel';
+    else if (key.startsWith('forge')) map[id] = 'forge';
+  });
+  return map[priceId] || null;
+}
+
 // ── MIDDLEWARE ─────────────────────────────────
 const corsOptions = {
   origin: (origin, callback) => {
@@ -595,6 +635,144 @@ const corsOptions = {
 app.use(helmet({ contentSecurityPolicy: false })); // Security headers
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all preflight requests
+// Stripe webhook needs raw body — must come BEFORE express.json()
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error('Webhook signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const userId = session.metadata?.user_id;
+        const tier = session.metadata?.tier;
+        const billing = session.metadata?.billing; // 'monthly', 'annual', 'lifetime'
+        const isPromo = session.metadata?.is_promo === 'true';
+        if (!userId || !tier) break;
+
+        if (billing === 'lifetime') {
+          // Founding member — set lifetime status
+          await supabase.from('profiles').update({
+            subscription_tier: tier,
+            subscription_status: 'lifetime',
+            lifetime_tier: tier,
+            stripe_customer_id: session.customer,
+          }).eq('id', userId);
+          // Increment founding member counter
+          const { data: fmConfig } = await supabase.from('founding_member_config').select('*').maybeSingle();
+          await supabase.from('founding_member_config').upsert({
+            id: 1,
+            [`${tier}_sold`]: (fmConfig?.[`${tier}_sold`] || 0) + 1,
+            iron_total: fmConfig?.iron_total || 500,
+            steel_total: fmConfig?.steel_total || 250,
+          });
+        } else {
+          // Subscription — set active
+          await supabase.from('profiles').update({
+            subscription_tier: tier,
+            subscription_status: 'active',
+            stripe_customer_id: session.customer,
+            stripe_subscription_id: session.subscription,
+          }).eq('id', userId);
+          // Increment launch promo counter if applicable
+          if (isPromo && ['steel','forge'].includes(tier)) {
+            await stripe_recordLaunchSub(tier);
+          }
+          // Handle referral credit
+          await handleReferralConversion(userId);
+        }
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        // Find user by stripe subscription id
+        const { data: profile } = await supabase.from('profiles')
+          .select('id').eq('stripe_subscription_id', sub.id).maybeSingle();
+        if (profile) {
+          await supabase.from('profiles').update({
+            subscription_status: 'expired',
+            subscription_tier: 'iron',
+          }).eq('id', profile.id);
+        }
+        break;
+      }
+
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        const { data: profile } = await supabase.from('profiles')
+          .select('id').eq('stripe_subscription_id', sub.id).maybeSingle();
+        if (profile) {
+          const status = sub.status === 'active' ? 'active' : sub.status === 'past_due' ? 'past_due' : 'expired';
+          // Determine tier from the active price ID
+          const priceId = sub.items?.data?.[0]?.price?.id;
+          const tierFromPrice = priceId ? getTierFromPriceId(priceId) : null;
+          const updateData = { subscription_status: status };
+          if (tierFromPrice) updateData.subscription_tier = tierFromPrice;
+          await supabase.from('profiles').update(updateData).eq('id', profile.id);
+        }
+        break;
+      }
+
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object;
+        const { data: profile } = await supabase.from('profiles')
+          .select('id').eq('stripe_customer_id', invoice.customer).maybeSingle();
+        if (profile) {
+          await supabase.from('profiles').update({ subscription_status: 'past_due' }).eq('id', profile.id);
+        }
+        break;
+      }
+    }
+    res.json({ received: true });
+  } catch(err) {
+    console.error('Webhook handler error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Helper: record launch promo subscription
+async function stripe_recordLaunchSub(tier) {
+  try {
+    const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
+    const newSold = (config?.[`${tier}_sold`] || 0) + 1;
+    const nowEnded = newSold >= 500;
+    await supabase.from('launch_pricing_config').upsert({
+      id: 1,
+      steel_active: tier === 'steel' ? !nowEnded : (config?.steel_active ?? true),
+      steel_sold: tier === 'steel' ? newSold : (config?.steel_sold || 0),
+      forge_active: tier === 'forge' ? !nowEnded : (config?.forge_active ?? true),
+      forge_sold: tier === 'forge' ? newSold : (config?.forge_sold || 0),
+    });
+  } catch(e) { console.error('stripe_recordLaunchSub error:', e.message); }
+}
+
+// Helper: handle referral conversion credit
+async function handleReferralConversion(userId) {
+  try {
+    const { data: profile } = await supabase.from('profiles')
+      .select('referred_by').eq('id', userId).maybeSingle();
+    if (!profile?.referred_by) return;
+    const referrerId = profile.referred_by;
+    const { data: referrer } = await supabase.from('profiles')
+      .select('referral_stats, stripe_subscription_id').eq('id', referrerId).maybeSingle();
+    if (!referrer) return;
+    const stats = referrer.referral_stats || {};
+    stats.conversions = (stats.conversions || 0) + 1;
+    stats.credits = (stats.credits || 0) + 1;
+    await supabase.from('profiles').update({ referral_stats: stats }).eq('id', referrerId);
+    // Send push notification to referrer
+    await sendPushToUser(referrerId, 'FORGE', 'Someone you referred just joined FORGE. A free month has been added to your account.');
+  } catch(e) { console.error('handleReferralConversion error:', e.message); }
+}
+
 app.use(express.json({ limit: '500kb' }));
 
 // Rate limiting — protect against abuse
@@ -906,6 +1084,21 @@ app.post('/api/reset-password', resetLimiter, async (req, res) => {
 
 // ── GENERATE PLAN ──────────────────────────────
 app.post('/api/generate-plan', requireAuth, async (req, res) => {
+  // Keep connection alive during long generation — Railway times out at 60s
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  // Send a heartbeat comment every 20 seconds to prevent proxy timeout
+  const heartbeat = setInterval(() => {
+    try { res.write(''); } catch(e) { clearInterval(heartbeat); }
+  }, 20000);
+
+  const sendResponse = (status, data) => {
+    clearInterval(heartbeat);
+    res.status(status).end(JSON.stringify(data));
+  };
+
   try {
     const { data: profile, error: profileErr } = await supabase
       .from('profiles')
@@ -915,10 +1108,13 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     if (profileErr || !profile) {
       console.error('Profile fetch error:', profileErr?.message);
-      return res.status(404).json({ error: 'Profile not found. Please try again.' });
+      return sendResponse(404, { error: 'Profile not found. Please try again.' });
     }
 
-    console.log('Generating plan for:', profile.name, '| goal:', profile.goal, '| injuries:', profile.injuries);
+    console.log('=== GENERATE PLAN START ===');
+    console.log('User:', profile.name, '| goal:', profile.goal, '| language:', req.body?.language);
+    console.log('ANTHROPIC_API_KEY set:', !!process.env.ANTHROPIC_API_KEY);
+    console.log('SUPABASE_URL set:', !!process.env.SUPABASE_URL);
 
     const language = req.body?.language || 'en';
 
@@ -932,14 +1128,14 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
+        console.log(`Attempt ${attempt}: calling Anthropic...`);
         const message = await anthropic.messages.create({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 12000,
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 8000,
           messages: [{ role: 'user', content: prompt }]
         });
-
         const raw = message.content[0].text;
-        console.log(`Attempt ${attempt} - raw response length:`, raw.length);
+        console.log(`Attempt ${attempt}: Anthropic responded, length:`, raw.length);
 
         // Strip markdown fences
         let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -989,13 +1185,15 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     }
 
     if (!plan) {
-      return res.status(500).json({ error: 'Failed to generate plan — please try again', detail: lastError?.message });
+      return sendResponse(500, { error: 'Failed to generate plan — please try again', detail: lastError?.message });
     }
 
     // Delete any existing plan for this user first (clean slate)
+    console.log('Deleting existing plan...');
     await supabase.from('plans').delete().eq('user_id', req.user.id);
 
     // Save to DB — reset translations cache, store source language
+    console.log('Inserting new plan...');
     const { data, error } = await supabase
       .from('plans')
       .insert({ user_id: req.user.id, workout_plan: plan.workout, nutrition_plan: plan.nutrition, translations: {}, source_language: language || 'en' })
@@ -1003,9 +1201,10 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      console.error('DB insert error:', error.message);
+      console.error('DB insert error:', error.message, error.details, error.hint);
       throw error;
     }
+    console.log('Plan saved to DB successfully');
 
     // Also save to programmes table (deactivate existing, add new active one)
     const planName = `${profile?.goal || 'My'} Plan — ${new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
@@ -1021,10 +1220,10 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
 
     console.log('Plan generated successfully for:', profile.name);
-    res.json({ plan: data });
+    sendResponse(200, { plan: data });
   } catch (err) {
     console.error('Generate plan error:', err.message);
-    res.status(500).json({ error: 'Failed to generate plan — please try again', detail: err.message });
+    sendResponse(500, { error: 'Failed to generate plan — please try again', detail: err.message });
   }
 });
 
@@ -1363,7 +1562,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         response = await anthropic.messages.create({
-          model: 'claude-sonnet-4-20250514',
+          model: 'claude-sonnet-4-6',
           max_tokens: 6000,
           system: systemPrompt,
           messages: sanitised
@@ -1561,7 +1760,7 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         response = await anthropic.messages.create({
-          model: 'claude-sonnet-4-20250514',
+          model: 'claude-sonnet-4-6',
           max_tokens: 1500,
           system: systemPrompt,
           messages: messages || [{ role: 'user', content: `I just finished training. Feeling: ${feeling}. Difficulty: ${difficulty}.` }]
@@ -2290,6 +2489,22 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
 
     const coachUsage = await getCoachUsage(req.user.id);
 
+    // Include stripe_subscription_id so frontend can detect paid subscribers
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('stripe_subscription_id')
+      .eq('id', req.user.id)
+      .maybeSingle();
+
+    // Fetch renewal date from Stripe if active subscriber
+    let renewalDate = null;
+    if (status === 'active' && profile?.stripe_subscription_id) {
+      try {
+        const stripeSub = await stripe.subscriptions.retrieve(profile.stripe_subscription_id);
+        renewalDate = new Date(stripeSub.current_period_end * 1000).toISOString();
+      } catch(e) { /* non-fatal */ }
+    }
+
     res.json({
       tier,
       accessTier,
@@ -2300,8 +2515,122 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
       coachUsage,
       coachLimit: 20,
       hasUnlimitedCoach: hasAccess('unlimited_coach', accessTier, isExempt),
+      stripe_subscription_id: profile?.stripe_subscription_id || null,
+      renewalDate,
     });
   } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+// STRIPE CHECKOUT
+// ═══════════════════════════════════════════════════════
+
+app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { tier, billing, is_promo } = req.body;
+    if (!tier || !billing) return res.status(400).json({ error: 'Missing tier or billing' });
+
+    const userId = req.user.id;
+    const userEmail = req.user.email;
+
+    // Determine price ID
+    let priceKey;
+    if (billing === 'lifetime') {
+      priceKey = `${tier}_founding`;
+    } else if (is_promo && (tier === 'steel' || tier === 'forge')) {
+      priceKey = `${tier}_${billing}_promo`;
+    } else {
+      priceKey = `${tier}_${billing}`;
+    }
+
+    const priceId = STRIPE_PRICES[priceKey];
+    if (!priceId) return res.status(400).json({ error: `No price found for ${priceKey}` });
+
+    // Get or create Stripe customer
+    const { data: profile } = await supabase.from('profiles')
+      .select('stripe_customer_id, name').eq('id', userId).maybeSingle();
+
+    let customerId = profile?.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: userEmail,
+        name: profile?.name || '',
+        metadata: { user_id: userId },
+      });
+      customerId = customer.id;
+      await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', userId);
+    }
+
+    const isSubscription = billing !== 'lifetime';
+    const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
+    const appUrl = frontendUrl.replace(/\/$/, '') + '/app.html';
+
+    const sessionParams = {
+      customer: customerId,
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      mode: isSubscription ? 'subscription' : 'payment',
+      success_url: `${appUrl}?payment=success&tier=${tier}&billing=${billing}`,
+      cancel_url: `${appUrl}?payment=cancelled`,
+      metadata: { user_id: userId, tier, billing, is_promo: String(!!is_promo) },
+      allow_promotion_codes: true,
+    };
+
+    if (isSubscription) {
+      sessionParams.subscription_data = { metadata: { user_id: userId, tier, billing } };
+    } else {
+      sessionParams.payment_intent_data = { metadata: { user_id: userId, tier, billing } };
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionParams);
+    res.json({ url: session.url, session_id: session.id });
+  } catch (err) {
+    console.error('Stripe checkout error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Stripe billing portal — manage/cancel subscription
+app.post('/api/stripe/portal', requireAuth, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { data: profile } = await supabase.from('profiles')
+      .select('stripe_customer_id').eq('id', req.user.id).maybeSingle();
+    if (!profile?.stripe_customer_id) return res.status(400).json({ error: 'No Stripe customer found. Please make a purchase first.' });
+    const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
+    const appUrl = frontendUrl.replace(/\/$/, '') + '/app.html';
+    const session = await stripe.billingPortal.sessions.create({
+      customer: profile.stripe_customer_id,
+      return_url: `${appUrl}?portal_return=true`,
+    });
+    res.json({ url: session.url });
+  } catch(err) {
+    console.error('Billing portal error:', err.message);
+    // Common cause: portal not configured in Stripe dashboard
+    if (err.message?.includes('configuration')) {
+      return res.status(500).json({ error: 'Billing portal not configured. Go to Stripe Dashboard → Settings → Billing → Customer portal and save the settings.' });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sync subscription tier from Stripe — called after billing portal return
+app.post('/api/stripe/sync-subscription', requireAuth, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { data: profile } = await supabase.from('profiles')
+      .select('stripe_subscription_id, stripe_customer_id').eq('id', req.user.id).maybeSingle();
+    if (!profile?.stripe_subscription_id) return res.json({ ok: true, synced: false });
+    const sub = await stripe.subscriptions.retrieve(profile.stripe_subscription_id);
+    const status = sub.status === 'active' ? 'active' : sub.status === 'past_due' ? 'past_due' : 'expired';
+    const priceId = sub.items?.data?.[0]?.price?.id;
+    const tier = priceId ? getTierFromPriceId(priceId) : null;
+    const updateData = { subscription_status: status };
+    if (tier) updateData.subscription_tier = tier;
+    await supabase.from('profiles').update(updateData).eq('id', req.user.id);
+    res.json({ ok: true, synced: true, tier, status });
+  } catch(err) {
+    console.error('Sync subscription error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -3413,7 +3742,11 @@ app.patch('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, re
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
-app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
+// Increase timeout to 3 minutes — plan generation with Sonnet can take up to 90 seconds
+server.timeout = 180000;
+server.keepAliveTimeout = 180000;
+server.headersTimeout = 185000;
 
 // ── DEBUG — View raw plan (admin only) ────────
 app.get('/api/debug/plan', requireAuth, requireAdmin, async (req, res) => {
