@@ -7,8 +7,18 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const Anthropic = require('@anthropic-ai/sdk').default;
 
+// Validate required env vars before attempting to connect
+const REQUIRED_VARS = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'ANTHROPIC_API_KEY'];
+const missing = REQUIRED_VARS.filter(v => !process.env[v]);
+if (missing.length) {
+  console.error('Missing required environment variables:', missing.join(', '));
+  console.error('Make sure these are set in Railway environment variables.');
+  process.exit(1);
+}
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+console.log('Monthly review job starting — Supabase and Anthropic clients initialised ✓');
 
 function billingMonth() {
   const d = new Date();
@@ -73,7 +83,7 @@ async function generateMonthlyReviews() {
       const prevMetrics = bodyMetrics?.[1];
 
       const aiResponse = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: 800,
         messages: [{
           role: 'user',
