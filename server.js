@@ -1131,7 +1131,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
         console.log(`Attempt ${attempt}: calling Anthropic...`);
         const message = await anthropic.messages.create({
           model: 'claude-haiku-4-5-20251001',
-          max_tokens: 8000,
+          max_tokens: 12000,
           messages: [{ role: 'user', content: prompt }]
         });
         const raw = message.content[0].text;
@@ -1146,7 +1146,24 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
         if (start === -1 || end === -1) throw new Error('No JSON object found in response');
         clean = clean.substring(start, end + 1);
 
-        plan = JSON.parse(clean);
+        // If JSON appears truncated (common with large plans), try to repair it
+        // by finding the last valid closing bracket position
+        let parsed;
+        try {
+          parsed = JSON.parse(clean);
+        } catch(jsonErr) {
+          console.log(`Attempt ${attempt}: JSON parse failed, attempting repair...`);
+          // Find the deepest valid JSON by progressively trimming
+          // Try to close any open arrays/objects
+          let repaired = clean;
+          const opens = (repaired.match(/\[/g) || []).length - (repaired.match(/\]/g) || []).length;
+          const openBraces = (repaired.match(/\{/g) || []).length - (repaired.match(/\}/g) || []).length;
+          // Close unclosed arrays first, then objects
+          for (let i = 0; i < opens; i++) repaired += ']';
+          for (let i = 0; i < openBraces; i++) repaired += '}';
+          parsed = JSON.parse(repaired); // will throw if still broken
+        }
+        plan = parsed;
 
         // Validate plan has required fields
         if (!plan.workout?.days?.length) throw new Error('Plan missing workout days');
