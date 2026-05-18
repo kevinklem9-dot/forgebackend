@@ -1072,7 +1072,7 @@ app.post('/api/reset-password', resetLimiter, async (req, res) => {
 
   try {
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: (process.env.FRONTEND_URL || 'https://klemforge.com').replace(/\/$/, '') + '/app.html?reset=true'
+      redirectTo: (process.env.SITE_URL || process.env.FRONTEND_URL || 'https://klemforge.com').replace(/\/$/, '') + '/app.html?reset=true'
     });
     // Always return success — don't reveal if email exists or not
     if (error) console.error('Reset password error:', error.message);
