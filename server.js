@@ -863,7 +863,7 @@ async function loadSubscription(req, res, next) {
     // Use cached profile from requireAuth if available, otherwise fetch
     const profile = req.profileCache || (await supabase
       .from('profiles')
-      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt, is_frozen')
+      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt, is_frozen, name')
       .eq('id', req.user.id)
       .maybeSingle()).data;
 
@@ -871,10 +871,17 @@ async function loadSubscription(req, res, next) {
     const status = profile?.subscription_status || 'trial';
     const isExempt = profile?.is_exempt || false;
 
-    // If trial but no trial_ends_at set (old account), set it now
+    // If profile name is missing, try to fill from auth user metadata
+    if (!profile?.name && req.user?.user_metadata?.name) {
+      await supabase.from('profiles').update({ name: req.user.user_metadata.name }).eq('id', req.user.id);
+      if (profile) profile.name = req.user.user_metadata.name;
+    }
+
+    // If trial but no trial_ends_at set — set it now and return it in this response
     if (status === 'trial' && !profile?.trial_ends_at && profile?.id) {
       const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      supabase.from('profiles').update({ trial_ends_at: trialEndsAt }).eq('id', req.user.id).then(() => {});
+      await supabase.from('profiles').update({ trial_ends_at: trialEndsAt }).eq('id', req.user.id);
+      profile.trial_ends_at = trialEndsAt;
     }
 
     // Check trial expiry
@@ -1737,47 +1744,6 @@ function applyPlanUpdate(plan, instruction) {
     }
   }
 
-  if (instruction.type === 'replace_entire_plan') {
-    // Completely replaces the entire workout plan
-    if (instruction.workout) updated.workout = instruction.workout;
-    if (instruction.nutrition) updated.nutrition = instruction.nutrition;
-  }
-
-  if (instruction.type === 'replace_workout_plan') {
-    // Replaces entire workout plan only
-    if (instruction.workout) updated.workout = instruction.workout;
-  }
-
-  if (instruction.type === 'replace_nutrition_plan') {
-    // Replaces entire nutrition plan only
-    if (instruction.nutrition) updated.nutrition = instruction.nutrition;
-  }
-
-  if (instruction.type === 'add_day') {
-    // Adds a new training day
-    if (!updated.workout) updated.workout = { days: [] };
-    if (!updated.workout.days) updated.workout.days = [];
-    updated.workout.days.push(instruction.day);
-    updated.workout.days.sort((a, b) => a.day_index - b.day_index);
-  }
-
-  if (instruction.type === 'remove_day') {
-    // Removes a training day by day_index
-    if (updated.workout?.days) {
-      updated.workout.days = updated.workout.days.filter(d => d.day_index !== instruction.day_index);
-    }
-  }
-
-  if (instruction.type === 'update_goals') {
-    // Updates the plan's goals/objectives metadata
-    if (updated.workout) {
-      if (instruction.goal) updated.workout.goal = instruction.goal;
-      if (instruction.experience) updated.workout.experience = instruction.experience;
-      if (instruction.days_per_week !== undefined) updated.workout.days_per_week = instruction.days_per_week;
-      if (instruction.split_type) updated.workout.split_type = instruction.split_type;
-    }
-  }
-
   return updated;
 }
 
@@ -2324,28 +2290,6 @@ PLAN UPDATE TYPES — use exactly as shown:
 
 8. REPLACE ALL EXERCISES ON A DAY:
 <PLAN_UPDATE>{"type":"update_day","day_index":0,"exercises":[{"name":"Exercise","note":"cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8}],"summary":"Replaced Monday workout"}</PLAN_UPDATE>
-
-- Add a training day: <PLAN_UPDATE>{"type":"add_day","day":{"day_index":4,"day_name":"Friday","label":"Lower Body B","exercises":[{"name":"Squat","note":"Full depth","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]},"summary":"Added Friday lower body session"}</PLAN_UPDATE>
-
-- Remove a training day: <PLAN_UPDATE>{"type":"remove_day","day_index":4,"summary":"Removed Friday session"}</PLAN_UPDATE>
-
-- Update goals/split: <PLAN_UPDATE>{"type":"update_goals","goal":"hypertrophy","days_per_week":4,"split_type":"Upper/Lower","summary":"Updated to 4-day upper/lower split"}</PLAN_UPDATE>
-
-- Replace entire workout plan: <PLAN_UPDATE>{"type":"replace_workout_plan","workout":{"days_per_week":4,"split_type":"Push/Pull/Legs","goal":"muscle","days":[{"day_index":0,"day_name":"Monday","label":"Push A","exercises":[{"name":"Bench Press","note":"Controlled descent","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]}]},"summary":"Complete new 4-day Push/Pull/Legs programme"}</PLAN_UPDATE>
-
-- Replace entire nutrition plan: <PLAN_UPDATE>{"type":"replace_nutrition_plan","nutrition":{"calories":3000,"protein_g":180,"carbs_g":350,"fat_g":85,"meals":[{"name":"Breakfast","time":"7:00 AM","kcal":700,"protein_g":50,"carbs_g":80,"fat_g":20,"foods":[{"name":"Oats","amount":"80g"},{"name":"Whey protein","amount":"1 scoop"}]}]},"summary":"New nutrition plan at 3000 kcal"}</PLAN_UPDATE>
-
-- Replace entire plan (workout + nutrition): <PLAN_UPDATE>{"type":"replace_entire_plan","workout":{...},"nutrition":{...},"summary":"Complete programme overhaul"}</PLAN_UPDATE>
-
-CRITICAL RULES FOR PLAN EDITING:
-- When user asks to change goals, training days, split, or wants a completely different programme — use replace_workout_plan with the full new plan
-- When user asks to change calories, macros, or wants a completely new diet — use replace_nutrition_plan
-- Never refuse to make changes. Never say you need to regenerate. Just make the change directly.
-- Always confirm what you changed in plain language after the PLAN_UPDATE tag
-- ONLY OUTPUT ONE <PLAN_UPDATE> TAG PER RESPONSE — never multiple tags for the same action
-- Before adding a day, check the existing days in the plan. Do not add a day that already exists at that day_index
-- Before removing a day, verify it exists in the plan first
-- The plan shown in your context is the current live plan — treat it as ground truth
 
 RULES:
 - ALWAYS use the OCCUPIED and FREE day_index lists above — never guess
