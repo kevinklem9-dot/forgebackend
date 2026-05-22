@@ -1485,6 +1485,21 @@ app.get('/api/profile', requireAuth, async (req, res) => {
       .maybeSingle();
 
     if (error) throw error;
+
+    // Backfill name from user_metadata if profile name is empty
+    if (data && !data.name && req.user?.user_metadata?.name) {
+      const backfillName = req.user.user_metadata.name;
+      await supabase.from('profiles').update({ name: backfillName }).eq('id', req.user.id);
+      data.name = backfillName;
+    }
+
+    // Backfill trial_ends_at if missing
+    if (data && data.subscription_status === 'trial' && !data.trial_ends_at) {
+      const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      await supabase.from('profiles').update({ trial_ends_at: trialEndsAt }).eq('id', req.user.id);
+      data.trial_ends_at = trialEndsAt;
+    }
+
     res.json({ profile: data });
   } catch (err) {
     res.status(500).json({ error: err.message });
