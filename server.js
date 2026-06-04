@@ -105,7 +105,6 @@ async function getYouTubeVideoId(exerciseName) {
       updated_at: new Date().toISOString()
     }, { onConflict: 'exercise_name' }).then(() => {}).catch(() => {});
 
-    console.log('YouTube found for', exerciseName, ':', result.videoId, '|', result.title);
     return result;
   } catch(e) {
     console.warn('YouTube lookup error:', e.message);
@@ -505,7 +504,6 @@ async function prewarmDetailCache(exercises) {
     'EZ Bar Curl','EZ Bar Skull Crusher',
   ];
   const toFetch = exercises.filter(e => commonNames.some(n => e.name === n) && !_detailCache.has(e.id));
-  console.log('Pre-warming detail cache for', toFetch.length, 'common exercises...');
   // Fetch in small batches of 5 to avoid rate limits
   for (let i = 0; i < toFetch.length; i += 5) {
     const batch = toFetch.slice(i, i + 5);
@@ -519,7 +517,6 @@ async function prewarmDetailCache(exercises) {
     }));
     await new Promise(r => setTimeout(r, 300)); // small delay between batches
   }
-  console.log('Detail cache pre-warmed:', _detailCache.size, 'exercises ready');
 }
 
 // ── PERSISTENT EXERCISE LOOKUP CACHE (Supabase) ──────────────────────
@@ -568,12 +565,52 @@ async function saveExerciseLookup(aiName, mwExercise) {
 }
 
 // ── CLIENTS ────────────────────────────────────
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Module-level singletons — created ONCE, reused across all requests (correct for
+// Supabase/Anthropic which use stateless HTTP, not persistent connection pools).
+// Anthropic gets an explicit request timeout so a hung upstream call fails fast
+// instead of holding a worker until the 180s server socket timeout.
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  timeout: 120 * 1000, // 120s ceiling per AI call (plan gen with haiku can run long)
+  maxRetries: 2,
+});
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
+
+// ── BOOT MIGRATIONS (best-effort) ──────────────────────
+// Adds columns newer features need. The Supabase JS client can't run raw DDL, so
+// this calls an optional `run_sql` RPC if the project defines one; if it doesn't,
+// the .catch swallows it and the canonical migration is the SQL below — run once
+// in the Supabase SQL editor:
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS units text DEFAULT 'kg';
+//   ALTER TABLE programmes ADD COLUMN IF NOT EXISTS description text;
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS enabled_features jsonb DEFAULT '["plans","nutrition","progress","prs","coach","logging"]'::jsonb;
+//   ALTER TABLE programmes ADD COLUMN IF NOT EXISTS programme_type text DEFAULT 'workout';
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_mins int DEFAULT 60;
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_varies boolean DEFAULT false;
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_by_day jsonb DEFAULT null;
+// PATCH /api/profile degrades gracefully if profiles.units / enabled_features is still
+// absent, and the frontend caches both in localStorage, so the app works either way.
+const BOOT_MIGRATIONS = [
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS units text DEFAULT 'kg'`,
+  `ALTER TABLE programmes ADD COLUMN IF NOT EXISTS description text`,
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS enabled_features jsonb DEFAULT '["plans","nutrition","progress","prs","coach","logging"]'::jsonb`,
+  // Custom programme builder stores its origin here ('custom'); AI/onboarding plans default to 'workout'.
+  `ALTER TABLE programmes ADD COLUMN IF NOT EXISTS programme_type text DEFAULT 'workout'`,
+  // Onboarding session-duration question. Single value in minutes, or per-day when it varies.
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_mins int DEFAULT 60`,
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_varies boolean DEFAULT false`,
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_by_day jsonb DEFAULT null`,
+];
+(async () => {
+  for (const sql of BOOT_MIGRATIONS) {
+    try { await supabase.rpc('run_sql', { sql }); }
+    catch (e) { /* no run_sql RPC — apply the SQL above in the Supabase SQL editor */ }
+  }
+})();
 
 // ── STRIPE ─────────────────────────────────────────────
 let stripe = null;
@@ -602,7 +639,34 @@ const STRIPE_PRICES = {
   forge_annual_promo:  process.env.STRIPE_PRICE_FORGE_ANNUAL_PROMO  || 'price_1TRW2YCP6MFAx438qTEPAtwj',
   iron_founding:       process.env.STRIPE_PRICE_IRON_FOUNDING       || 'price_1TRW33CP6MFAx438rk9GZZ6P',
   steel_founding:      process.env.STRIPE_PRICE_STEEL_FOUNDING      || 'price_1TRW3PCP6MFAx438tgVOex9V',
+  // Coach plans — create in Stripe dashboard, set as env vars on Railway
+  coach_starter_monthly: process.env.STRIPE_PRICE_COACH_STARTER_MONTHLY || '',
+  coach_starter_annual:  process.env.STRIPE_PRICE_COACH_STARTER_ANNUAL  || '',
+  coach_pro_monthly:     process.env.STRIPE_PRICE_COACH_PRO_MONTHLY     || '',
+  coach_pro_annual:      process.env.STRIPE_PRICE_COACH_PRO_ANNUAL      || '',
+  coach_elite_monthly:   process.env.STRIPE_PRICE_COACH_ELITE_MONTHLY   || '',
+  coach_elite_annual:    process.env.STRIPE_PRICE_COACH_ELITE_ANNUAL    || '',
 };
+
+// ── COACH PLAN CONFIG ──────────────────────────────────
+// Seat limits and commission rates per coach plan. Shared with frontend.
+const COACH_PLAN_CONFIG = {
+  starter: { seatLimit: 10,       commissionRate: 10 },
+  pro:     { seatLimit: 30,       commissionRate: 15 },
+  elite:   { seatLimit: Infinity, commissionRate: 20 },
+};
+
+// Map coach price IDs back to plan name — used by webhook
+function getCoachPlanFromPriceId(priceId) {
+  const map = {};
+  Object.entries(STRIPE_PRICES).forEach(([key, id]) => {
+    if (!id) return;
+    if (key.startsWith('coach_starter')) map[id] = 'starter';
+    else if (key.startsWith('coach_pro')) map[id] = 'pro';
+    else if (key.startsWith('coach_elite')) map[id] = 'elite';
+  });
+  return map[priceId] || null;
+}
 
 // Map price IDs back to tiers — used by webhook and sync endpoint
 function getTierFromPriceId(priceId) {
@@ -622,8 +686,10 @@ const corsOptions = {
     const allowed = [
       process.env.FRONTEND_URL,
       'https://kevinklem9-dot.github.io',
-      'http://localhost:3000',
-      'http://localhost:5173'
+      'https://www.klemforge.com',
+      'https://klemforge.com',
+      // Dev origins only outside production — never trust localhost in prod.
+      ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:8080'] : []),
     ].filter(Boolean);
     if (allowed.some(o => origin.startsWith(o))) return callback(null, true);
     callback(new Error('Not allowed by CORS'));
@@ -633,11 +699,22 @@ const corsOptions = {
   allowedHeaders: ['Content-Type','Authorization']
 };
 app.use(helmet({ contentSecurityPolicy: false })); // Security headers
+// Explicit hardening on top of helmet — DENY framing outright (helmet defaults to
+// SAMEORIGIN) and lock down powerful browser features the app never uses.
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all preflight requests
 // Stripe webhook needs raw body — must come BEFORE express.json()
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
+  // TODO: set STRIPE_WEBHOOK_SECRET env var to whsec_live_... in production Railway
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
   let event;
   try {
@@ -655,6 +732,36 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         const tier = session.metadata?.tier;
         const billing = session.metadata?.billing; // 'monthly', 'annual', 'lifetime'
         const isPromo = session.metadata?.is_promo === 'true';
+        const isCoachSetup = session.metadata?.account_type === 'coach';
+
+        // ── COACH PLAN CHECKOUT ─────────────────────────
+        if (isCoachSetup && userId) {
+          const coachPlan = session.metadata?.coach_plan;
+          const coachBio = session.metadata?.coach_bio || null;
+          const coachTitle = session.metadata?.coach_title || null;
+          const isPostTrial = session.metadata?.coach_post_trial === 'true';
+          const planConfig = COACH_PLAN_CONFIG[coachPlan];
+          if (planConfig) {
+            const update = {
+              account_type: 'coach',
+              coach_plan: coachPlan,
+              coach_plan_status: 'active',
+              coach_stripe_subscription_id: session.subscription,
+              coach_commission_rate: planConfig.commissionRate,
+              stripe_customer_id: session.customer,
+            };
+            // Post-trial reactivation: do NOT touch coach_trial_start (trial already happened),
+            // and don't overwrite title/bio if not provided.
+            if (!isPostTrial) {
+              update.coach_trial_start = new Date().toISOString();
+              if (coachBio) update.coach_bio = coachBio;
+              if (coachTitle) update.coach_title = coachTitle;
+            }
+            await supabase.from('profiles').update(update).eq('id', userId);
+          }
+          break;
+        }
+
         if (!userId || !tier) break;
 
         if (billing === 'lifetime') {
@@ -693,7 +800,16 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
-        // Find user by stripe subscription id
+        // Check coach subscription first
+        const { data: coachProfile } = await supabase.from('profiles')
+          .select('id').eq('coach_stripe_subscription_id', sub.id).maybeSingle();
+        if (coachProfile) {
+          await supabase.from('profiles').update({
+            coach_plan_status: 'cancelled',
+          }).eq('id', coachProfile.id);
+          break;
+        }
+        // Fall through to individual subscription
         const { data: profile } = await supabase.from('profiles')
           .select('id').eq('stripe_subscription_id', sub.id).maybeSingle();
         if (profile) {
@@ -707,6 +823,26 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 
       case 'customer.subscription.updated': {
         const sub = event.data.object;
+        // Check coach subscription first
+        const { data: coachProfile } = await supabase.from('profiles')
+          .select('id').eq('coach_stripe_subscription_id', sub.id).maybeSingle();
+        if (coachProfile) {
+          const priceId = sub.items?.data?.[0]?.price?.id;
+          const planFromPrice = priceId ? getCoachPlanFromPriceId(priceId) : null;
+          let coachStatus;
+          if (sub.status === 'trialing') coachStatus = 'trial';
+          else if (sub.status === 'active') coachStatus = 'active';
+          else if (sub.status === 'past_due') coachStatus = 'past_due';
+          else coachStatus = 'cancelled';
+          const updateData = { coach_plan_status: coachStatus };
+          if (planFromPrice) {
+            updateData.coach_plan = planFromPrice;
+            updateData.coach_commission_rate = COACH_PLAN_CONFIG[planFromPrice]?.commissionRate || 0;
+          }
+          await supabase.from('profiles').update(updateData).eq('id', coachProfile.id);
+          break;
+        }
+        // Fall through to individual subscription
         const { data: profile } = await supabase.from('profiles')
           .select('id').eq('stripe_subscription_id', sub.id).maybeSingle();
         if (profile) {
@@ -734,7 +870,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     res.json({ received: true });
   } catch(err) {
     console.error('Webhook handler error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -775,17 +911,52 @@ async function handleReferralConversion(userId) {
 
 app.use(express.json({ limit: '500kb' }));
 
-// Rate limiting — protect against abuse
-const limiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
-const chatLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
-const planLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many plan generations — try again in an hour.' } });
-const checkinLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, message: { error: 'Too many check-ins — slow down.' } });
-const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, message: { error: 'Too many signups — try again later.' } });
-const resetLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many reset attempts — try again later.' } });
+// Rate limiting — protect against abuse. Skipped entirely outside production so
+// staging (NODE_ENV=development) never blocks testing.
+const skipNonProd = (req) => process.env.NODE_ENV !== 'production';
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500, skip: skipNonProd });
+const chatLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, skip: skipNonProd });
+const planLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 20, skip: skipNonProd, message: { error: 'Too many plan generations — try again in an hour.' } });
+const checkinLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, skip: skipNonProd, message: { error: 'Too many check-ins — slow down.' } });
+const signupLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 50, skip: skipNonProd, message: { error: 'Too many signups — try again later.' } });
+const resetLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, skip: skipNonProd, message: { error: 'Too many reset attempts — try again later.' } });
 app.use('/api/', limiter);
 app.use('/api/chat', chatLimiter);
 app.use('/api/generate-plan', planLimiter);
 app.use('/api/checkin', checkinLimiter);
+
+// ── REQUEST TIMEOUT ────────────────────────────
+// Fail a stuck request at 30s instead of holding the socket open to the 180s
+// server timeout. The long-running AI endpoints (plan/chat/checkin/review/translate)
+// and the raw-socket video proxy are EXCLUDED — they legitimately run past 30s and
+// manage their own timeouts/heartbeats. A blanket 30s timeout here would kill them.
+const TIMEOUT_EXEMPT = [
+  '/api/generate-plan', '/api/chat', '/api/checkin', '/api/translate-plan',
+  '/api/review/generate', '/api/monthly-review/generate',
+  '/api/exercise/video', '/api/exercise/buftest',
+];
+app.use((req, res, next) => {
+  if (!TIMEOUT_EXEMPT.some(p => req.path.startsWith(p))) {
+    res.setTimeout(30000, () => {
+      if (!res.headersSent) res.status(408).json({ error: 'Request timeout' });
+    });
+  }
+  next();
+});
+
+// ── CACHE CONTROL ──────────────────────────────
+// Most API responses carry personal (health/fitness/billing) data — keep them out of
+// shared/proxy/browser caches so stale or cross-user data can never be served. The few
+// genuinely public, slow-changing endpoints opt into a short cache for performance.
+const PUBLIC_CACHEABLE = ['/api/launch-pricing', '/api/testimonial', '/api/version', '/api/founding-member/slots', '/api/vapid-public-key'];
+app.use((req, res, next) => {
+  if (req.path === '/health' || PUBLIC_CACHEABLE.some(p => req.path.startsWith(p))) {
+    res.setHeader('Cache-Control', 'public, max-age=300');
+  } else if (req.path.startsWith('/api/')) {
+    res.setHeader('Cache-Control', 'private, no-store');
+  }
+  next();
+});
 
 // ── AUTH MIDDLEWARE ────────────────────────────
 async function requireAuth(req, res, next) {
@@ -828,6 +999,20 @@ function requireAdmin(req, res, next) {
 }
 
 
+// ── SELECT FIELD LISTS ─────────────────────────
+// Explicit column lists replace select('*') on wide/heavy tables. `profiles` has
+// 30+ columns; `plans` carries large workout/nutrition jsonb plus a `translations`
+// cache (up to 12 languages) that most reads do not need.
+// Standard minimal profile select for account/subscription checks:
+const PROFILE_FIELDS = 'id, name, subscription_tier, subscription_status, trial_ends_at, account_type, coach_plan, coach_plan_status';
+// Fields the AI prompt builders actually read off a profile:
+const COACH_PROFILE_FIELDS = 'name, age, sex, height_cm, weight_kg, goal, experience, days_per_week, equipment, diet_style, diet_restrictions, injuries';
+const PLAN_PROFILE_FIELDS = 'name, age, sex, height_cm, weight_kg, goal, experience, days_per_week, preferred_days, equipment, diet_style, diet_restrictions, injuries, session_duration_mins, session_duration_varies, session_duration_by_day';
+// The live plan WITHOUT the heavy translations blob (chat/checkin only edit the plan):
+const PLAN_CORE_FIELDS = 'id, workout_plan, nutrition_plan';
+// Exercise-history columns the prompt builders read:
+const HISTORY_PROMPT_FIELDS = 'exercise_name, sets, reps, weight_kg, logged_at';
+
 // ── SUBSCRIPTION HELPERS ───────────────────────
 const TIER_RANK = { iron: 0, steel: 1, forge: 2 };
 
@@ -863,7 +1048,7 @@ async function loadSubscription(req, res, next) {
     // Use cached profile from requireAuth if available, otherwise fetch
     const profile = req.profileCache || (await supabase
       .from('profiles')
-      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt, is_frozen, name')
+      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt, is_frozen')
       .eq('id', req.user.id)
       .maybeSingle()).data;
 
@@ -871,17 +1056,10 @@ async function loadSubscription(req, res, next) {
     const status = profile?.subscription_status || 'trial';
     const isExempt = profile?.is_exempt || false;
 
-    // If profile name is missing, try to fill from auth user metadata
-    if (!profile?.name && req.user?.user_metadata?.name) {
-      await supabase.from('profiles').update({ name: req.user.user_metadata.name }).eq('id', req.user.id);
-      if (profile) profile.name = req.user.user_metadata.name;
-    }
-
-    // If trial but no trial_ends_at set — set it now and return it in this response
+    // If trial but no trial_ends_at set (old account), set it now
     if (status === 'trial' && !profile?.trial_ends_at && profile?.id) {
       const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      await supabase.from('profiles').update({ trial_ends_at: trialEndsAt }).eq('id', req.user.id);
-      profile.trial_ends_at = trialEndsAt;
+      supabase.from('profiles').update({ trial_ends_at: trialEndsAt }).eq('id', req.user.id).then(() => {});
     }
 
     // Check trial expiry
@@ -898,6 +1076,18 @@ async function loadSubscription(req, res, next) {
           .eq('id', req.user.id)
           .then(() => {});
       }
+    }
+
+    // ── ENTITLEMENT GUARD (security) ──────────────────────────────────────
+    // A stored subscription_tier must only grant paid access when the subscription
+    // is actually paid/active. PATCH /api/subscription/tier lets a user set a
+    // cosmetic tier "preference" during the trial; without this guard that value
+    // would persist as a real entitlement after the trial ends, letting anyone keep
+    // Steel/Forge access for free. Trial access is granted separately below
+    // (accessTier='forge'). Exempt accounts bypass this.
+    const PAID_STATUSES = ['active', 'past_due', 'lifetime'];
+    if (!isExempt && effectiveStatus !== 'trial' && !PAID_STATUSES.includes(effectiveStatus)) {
+      effectiveTier = 'iron';
     }
 
     // During trial, full access to everything — best sales tool
@@ -1068,7 +1258,7 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
     res.json({ requires_confirmation: true, email });
   } catch (err) {
     console.error('Signup error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1085,7 +1275,7 @@ app.post('/api/reset-password', resetLimiter, async (req, res) => {
     if (error) console.error('Reset password error:', error.message);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1109,7 +1299,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
   try {
     const { data: profile, error: profileErr } = await supabase
       .from('profiles')
-      .select('*')
+      .select(PLAN_PROFILE_FIELDS) // only the fields buildPlanPrompt reads — not all 30+ columns
       .eq('id', req.user.id)
       .maybeSingle();
 
@@ -1118,10 +1308,6 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       return sendResponse(404, { error: 'Profile not found. Please try again.' });
     }
 
-    console.log('=== GENERATE PLAN START ===');
-    console.log('User:', profile.name, '| goal:', profile.goal, '| language:', req.body?.language);
-    console.log('ANTHROPIC_API_KEY set:', !!process.env.ANTHROPIC_API_KEY);
-    console.log('SUPABASE_URL set:', !!process.env.SUPABASE_URL);
 
     const language = req.body?.language || 'en';
 
@@ -1135,14 +1321,12 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        console.log(`Attempt ${attempt}: calling Anthropic...`);
         const message = await anthropic.messages.create({
           model: 'claude-haiku-4-5-20251001',
           max_tokens: 8000,
           messages: [{ role: 'user', content: prompt }]
         });
         const raw = message.content[0].text;
-        console.log(`Attempt ${attempt}: Anthropic responded, length:`, raw.length);
 
         // Strip markdown fences
         let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -1196,11 +1380,9 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     }
 
     // Delete any existing plan for this user first (clean slate)
-    console.log('Deleting existing plan...');
     await supabase.from('plans').delete().eq('user_id', req.user.id);
 
     // Save to DB — reset translations cache, store source language
-    console.log('Inserting new plan...');
     const { data, error } = await supabase
       .from('plans')
       .insert({ user_id: req.user.id, workout_plan: plan.workout, nutrition_plan: plan.nutrition, translations: {}, source_language: language || 'en' })
@@ -1211,22 +1393,29 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       console.error('DB insert error:', error.message, error.details, error.hint);
       throw error;
     }
-    console.log('Plan saved to DB successfully');
 
     // Also save to programmes table (deactivate existing, add new active one)
     const planName = `${profile?.goal || 'My'} Plan — ${new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
     await supabase.from('programmes').update({ is_active: false }).eq('user_id', req.user.id);
-    await supabase.from('programmes').insert({
+    const { data: obProg } = await supabase.from('programmes').insert({
       user_id: req.user.id,
       name: planName,
       plan_data: { workout: plan.workout, nutrition: plan.nutrition },
       is_active: true
-    });
+    }).select('id').maybeSingle();
+    // One-line AI description for the My Programmes list — async, doesn't block onboarding.
+    if (obProg?.id) {
+      generateProgrammeDescription(obProg.id, {
+        goal: Array.isArray(profile?.goal) ? profile.goal.join(', ') : String(profile?.goal || ''),
+        days_per_week: profile?.days_per_week,
+        experience: profile?.experience,
+        day_labels: plan.workout?.days?.map(d => d.label),
+      });
+    }
 
     // Mark onboarding complete
     await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
 
-    console.log('Plan generated successfully for:', profile.name);
     sendResponse(200, { plan: data });
   } catch (err) {
     console.error('Generate plan error:', err.message);
@@ -1391,7 +1580,6 @@ async function getPlanForLanguage(planRow, lang) {
     if (cached._v === TRANSLATION_CACHE_VERSION) {
       return { workout_plan: cached.workout_plan, nutrition_plan: cached.nutrition_plan };
     }
-    console.log(`Cache for lang=${lang} is version ${cached._v || 1}, current is ${TRANSLATION_CACHE_VERSION} — re-translating...`);
   }
 
   if (lang === 'en') {
@@ -1433,7 +1621,7 @@ app.post('/api/translate-plan', requireAuth, async (req, res) => {
     res.json({ ok: true, ...result });
   } catch (err) {
     console.error('translate-plan error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1471,7 +1659,7 @@ app.get('/api/plan', requireAuth, async (req, res) => {
     res.json({ plan: { ...planWithoutCache, workout_plan, nutrition_plan } });
   } catch (err) {
     console.error('Get plan error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1485,24 +1673,9 @@ app.get('/api/profile', requireAuth, async (req, res) => {
       .maybeSingle();
 
     if (error) throw error;
-
-    // Backfill name from user_metadata if profile name is empty
-    if (data && !data.name && req.user?.user_metadata?.name) {
-      const backfillName = req.user.user_metadata.name;
-      await supabase.from('profiles').update({ name: backfillName }).eq('id', req.user.id);
-      data.name = backfillName;
-    }
-
-    // Backfill trial_ends_at if missing
-    if (data && data.subscription_status === 'trial' && !data.trial_ends_at) {
-      const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      await supabase.from('profiles').update({ trial_ends_at: trialEndsAt }).eq('id', req.user.id);
-      data.trial_ends_at = trialEndsAt;
-    }
-
     res.json({ profile: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1512,9 +1685,32 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     // Only update columns that exist in the schema — ignore unknowns
     const allowed = ['name','age','sex','height_cm','weight_kg','goal','experience',
       'days_per_week','preferred_days','equipment','diet_style','diet_restrictions',
-      'injuries','target_weight_kg','onboarding_complete','preferred_language'];
+      'injuries','target_weight_kg','onboarding_complete','preferred_language','units',
+      'enabled_features','session_duration_mins','session_duration_varies','session_duration_by_day'];
     const update = { updated_at: new Date().toISOString() };
     allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
+    // Units may only be 'kg' or 'lbs' — drop anything else so a bad value can't persist.
+    if (update.units !== undefined && update.units !== 'kg' && update.units !== 'lbs') delete update.units;
+    // session_duration_by_day must be a plain object (e.g. { monday: 60 }) or null — drop
+    // anything else so a bad value can't poison the jsonb column.
+    if (update.session_duration_by_day !== undefined &&
+        update.session_duration_by_day !== null &&
+        (typeof update.session_duration_by_day !== 'object' || Array.isArray(update.session_duration_by_day))) {
+      delete update.session_duration_by_day;
+    }
+    // session_duration_varies is a boolean.
+    if (update.session_duration_varies !== undefined) update.session_duration_varies = !!update.session_duration_varies;
+    // session_duration_mins is an int — drop a non-numeric value rather than persist NaN.
+    if (update.session_duration_mins !== undefined) {
+      const n = parseInt(update.session_duration_mins, 10);
+      if (isNaN(n)) delete update.session_duration_mins; else update.session_duration_mins = n;
+    }
+    // enabled_features must be an array of strings — drop anything else so a bad value
+    // can't poison the jsonb column. (Validated here, not just trusted from the client.)
+    if (update.enabled_features !== undefined &&
+        !(Array.isArray(update.enabled_features) && update.enabled_features.every(f => typeof f === 'string'))) {
+      delete update.enabled_features;
+    }
 
     const { data, error } = await supabase
       .from('profiles')
@@ -1524,9 +1720,15 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      // If error is about missing column (preferred_days not migrated yet), retry without it
-      if (error.message?.includes('preferred_days')) {
+      // If error is about a column the DB doesn't have yet (preferred_days, units, or
+      // enabled_features not migrated), retry without it so the rest of the update still lands.
+      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features') || error.message?.includes('session_duration')) {
         delete update.preferred_days;
+        delete update.units;
+        delete update.enabled_features;
+        delete update.session_duration_mins;
+        delete update.session_duration_varies;
+        delete update.session_duration_by_day;
         const { data: data2, error: err2 } = await supabase
           .from('profiles').update(update).eq('id', req.user.id).select().maybeSingle();
         if (err2) throw err2;
@@ -1537,7 +1739,7 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     res.json({ profile: data });
   } catch (err) {
     console.error('Profile update error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1566,18 +1768,24 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     const sanitised = messages.slice(-20).map(m => ({ ...m, content: String(m.content || '').slice(0, 2000) }));
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', req.user.id).maybeSingle(),
-      supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
+      supabase.from('profiles').select(COACH_PROFILE_FIELDS).eq('id', req.user.id).maybeSingle(),
+      // PLAN_CORE_FIELDS skips the heavy `translations` cache the coach prompt never reads
+      supabase.from('plans').select(PLAN_CORE_FIELDS).eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
     const { data: recentHistory } = await supabase
       .from('exercise_history')
-      .select('*')
+      .select(HISTORY_PROMPT_FIELDS)
       .eq('user_id', req.user.id)
       .order('logged_at', { ascending: false })
       .limit(20);
 
-    const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context, language);
+    let activeProgramme = null;
+    try {
+      const { data: _ap } = await supabase.from('programmes').select('name, plan_data').eq('user_id', req.user.id).eq('is_active', true).maybeSingle();
+      if (_ap && _ap.name) activeProgramme = { name: _ap.name, goal: (_ap.plan_data && (_ap.plan_data.goal || (_ap.plan_data.workout && _ap.plan_data.workout.goal))) || (profile && profile.goal) || null };
+    } catch(e) { /* programme context is best-effort */ }
+    const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context, language, activeProgramme);
 
     // Retry up to 3 times on 529 overloaded errors
     let response;
@@ -1610,7 +1818,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     if (planUpdateMatches.length > 0 && planData) {
       // Fetch the absolute latest plan from DB (not from earlier Promise.all)
       const { data: freshPlan } = await supabase
-        .from('plans').select('*').eq('user_id', req.user.id)
+        .from('plans').select(PLAN_CORE_FIELDS).eq('user_id', req.user.id)
         .order('generated_at', { ascending: false }).limit(1).maybeSingle();
 
       const currentPlan = {
@@ -1655,7 +1863,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
   } catch (err) {
     console.error('Chat error:', err.message);
     console.error('Chat stack:', err.stack);
-    res.status(500).json({ error: err.message, detail: err.stack?.split('\n')[1] });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1759,21 +1967,69 @@ function applyPlanUpdate(plan, instruction) {
     }
   }
 
+  if (instruction.type === 'replace_entire_plan') {
+    // Completely replaces the entire workout plan
+    if (instruction.workout) updated.workout = instruction.workout;
+    if (instruction.nutrition) updated.nutrition = instruction.nutrition;
+  }
+
+  if (instruction.type === 'replace_workout_plan') {
+    // Replaces entire workout plan only
+    if (instruction.workout) updated.workout = instruction.workout;
+  }
+
+  if (instruction.type === 'replace_nutrition_plan') {
+    // Replaces entire nutrition plan only
+    if (instruction.nutrition) updated.nutrition = instruction.nutrition;
+  }
+
+  if (instruction.type === 'add_day') {
+    // Adds a new training day
+    if (!updated.workout) updated.workout = { days: [] };
+    if (!updated.workout.days) updated.workout.days = [];
+    updated.workout.days.push(instruction.day);
+    updated.workout.days.sort((a, b) => a.day_index - b.day_index);
+  }
+
+  if (instruction.type === 'remove_day') {
+    // Removes a training day by day_index
+    if (updated.workout?.days) {
+      updated.workout.days = updated.workout.days.filter(d => d.day_index !== instruction.day_index);
+    }
+  }
+
+  if (instruction.type === 'update_goals') {
+    // Updates the plan's goals/objectives metadata
+    if (updated.workout) {
+      if (instruction.goal) updated.workout.goal = instruction.goal;
+      if (instruction.experience) updated.workout.experience = instruction.experience;
+      if (instruction.days_per_week !== undefined) updated.workout.days_per_week = instruction.days_per_week;
+      if (instruction.split_type) updated.workout.split_type = instruction.split_type;
+    }
+  }
+
   return updated;
 }
 
 // ── POST-WORKOUT CHECK-IN ──────────────────────
 app.post('/api/checkin', requireAuth, async (req, res) => {
   try {
+    // If this user's coach has disabled post-workout check-ins, skip silently
+    // and tell the client there's nothing to show.
+    if (await isReviewDisabledByCoach(req.user.id, 'post_workout_checkin_enabled')) {
+      return res.json({ disabled: true });
+    }
+
     const { session_summary, feeling, difficulty, messages, language } = req.body;
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', req.user.id).maybeSingle(),
-      supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
+      supabase.from('profiles').select(COACH_PROFILE_FIELDS).eq('id', req.user.id).maybeSingle(),
+      // PLAN_CORE_FIELDS skips the heavy `translations` cache the checkin prompt never reads
+      supabase.from('plans').select(PLAN_CORE_FIELDS).eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
     const { data: recentHistory } = await supabase
-      .from('exercise_history').select('*').eq('user_id', req.user.id)
+      .from('exercise_history').select(HISTORY_PROMPT_FIELDS).eq('user_id', req.user.id)
       .order('logged_at', { ascending: false }).limit(10);
 
     const systemPrompt = buildCheckinPrompt(profile, planData, recentHistory, session_summary, feeling, difficulty, language);
@@ -1831,7 +2087,7 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
     if (err.message?.includes('overloaded') || err.status === 529) {
       return res.status(503).json({ error: 'AI is busy — please try again in a moment.' });
     }
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1875,7 +2131,15 @@ app.post('/api/log', requireAuth, async (req, res) => {
       throw logError;
     }
 
-    const prUpdates = [];
+    // ── Batched history + PR writes ──────────────────────────────────────
+    // Was N+1: per exercise we ran delete + insert + PR-select + PR-upsert
+    // (≈4 sequential round-trips × N exercises). Now: 1 delete + 1 insert +
+    // 1 PR-select + 1 PR-upsert total, regardless of exercise count.
+    // Per-exercise stats are still computed in JS; only the DB calls are batched.
+    // Keyed by exercise_name (last entry wins) to preserve the original
+    // delete-then-insert "last write wins" semantics for any duplicate names.
+    const historyByName = new Map(); // name -> history row
+    const statByName = new Map();     // name -> { bestSet, est1rm, setsLen }
     for (const ex of exercises) {
       // exercises now have a sets_data array: [{weight, reps}, ...]
       // Use best set for PR calculation, total volume across all sets
@@ -1887,14 +2151,7 @@ app.post('/api/log', requireAuth, async (req, res) => {
       }, setsData[0]);
       const est1rm = Math.round(bestSet.weight * (1 + bestSet.reps / 30));
 
-      // Delete existing history entry for today then insert fresh
-      await supabase.from('exercise_history')
-        .delete()
-        .eq('user_id', req.user.id)
-        .eq('exercise_name', ex.name)
-        .eq('logged_at', today);
-
-      await supabase.from('exercise_history').insert({
+      historyByName.set(ex.name, {
         user_id: req.user.id,
         exercise_name: ex.name,
         logged_at: today,
@@ -1905,33 +2162,61 @@ app.post('/api/log', requireAuth, async (req, res) => {
         est_1rm: est1rm,
         sets_data: setsData // store full per-set breakdown
       });
+      statByName.set(ex.name, { bestSet, est1rm, setsLen: setsData.length });
+    }
 
-      // Check & update PR
-      const { data: existingPR } = await supabase
-        .from('personal_records')
-        .select('*')
-        .eq('user_id', req.user.id)
-        .eq('exercise_name', ex.name)
-        .maybeSingle();
+    const exerciseNames = [...historyByName.keys()];
 
-      if (!existingPR || est1rm > (existingPR.est_1rm || 0)) {
-        await supabase.from('personal_records').upsert({
+    // Replace today's history for these exercises in one delete + one insert
+    await supabase.from('exercise_history')
+      .delete()
+      .eq('user_id', req.user.id)
+      .eq('logged_at', today)
+      .in('exercise_name', exerciseNames);
+
+    const { error: histErr } = await supabase
+      .from('exercise_history')
+      .insert([...historyByName.values()]);
+    if (histErr) console.warn('exercise_history insert warning:', histErr.message);
+
+    // Fetch all existing PRs for these exercises in one query (was one per exercise)
+    const { data: existingPRs } = await supabase
+      .from('personal_records')
+      .select('exercise_name, est_1rm') // only field used for the PR comparison
+      .eq('user_id', req.user.id)
+      .in('exercise_name', exerciseNames);
+
+    const prByName = {};
+    for (const p of (existingPRs || [])) prByName[p.exercise_name] = p;
+
+    // Decide which exercises are new PRs, then upsert them all at once
+    const prUpdates = [];
+    const prRows = [];
+    for (const name of exerciseNames) {
+      const st = statByName.get(name);
+      const existing = prByName[name];
+      if (!existing || st.est1rm > (existing.est_1rm || 0)) {
+        prRows.push({
           user_id: req.user.id,
-          exercise_name: ex.name,
-          weight_kg: bestSet.weight,
-          reps: bestSet.reps,
-          sets: setsData.length,
-          est_1rm: est1rm,
+          exercise_name: name,
+          weight_kg: st.bestSet.weight,
+          reps: st.bestSet.reps,
+          sets: st.setsLen,
+          est_1rm: st.est1rm,
           achieved_at: today
-        }, { onConflict: 'user_id,exercise_name' });
-        prUpdates.push(ex.name);
+        });
+        prUpdates.push(name);
       }
+    }
+    if (prRows.length) {
+      await supabase.from('personal_records')
+        .upsert(prRows, { onConflict: 'user_id,exercise_name' });
     }
 
     res.json({ success: true, new_prs: prUpdates });
   } catch (err) {
     console.error('Log error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1949,23 +2234,55 @@ app.get('/api/history/:exerciseName', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ history: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ── GET ALL HISTORY ────────────────────────────
 app.get('/api/history', requireAuth, async (req, res) => {
   try {
+    // exercise_history grows several rows per session — cap to the most recent 750
+    // rows so a long-tenured user can't pull thousands. Fetch newest-first to apply
+    // the cap, then reverse to the ascending order the progress charts expect.
     const { data, error } = await supabase
       .from('exercise_history')
       .select('*')
       .eq('user_id', req.user.id)
-      .order('logged_at', { ascending: true });
+      .order('logged_at', { ascending: false })
+      .limit(750);
 
     if (error) throw error;
-    res.json({ history: data });
+    res.json({ history: (data || []).reverse() });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── GET SESSION LOGS ──────────────────────────────
+// Returns full session_logs rows (with day_label + exercises jsonb) so the progress
+// panel can render workouts grouped by session rather than flattened by exercise.
+app.get('/api/sessions', requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    // ROOT CAUSE OF THE 500: this select used to request `feeling, difficulty`, but
+    // session_logs has no such columns (schema: id, user_id, day_index, day_label,
+    // logged_at, exercises, created_at). feeling/difficulty are only fed to the
+    // post-workout check-in AI prompt — they are never persisted. PostgREST then
+    // threw "column session_logs.feeling does not exist", the catch returned 500,
+    // and the progress panel's session history never refreshed after a workout.
+    const { data, error } = await supabase
+      .from('session_logs')
+      .select('id, logged_at, day_index, day_label, exercises')
+      .eq('user_id', req.user.id)
+      .order('logged_at', { ascending: false })
+      .limit(limit);
+    // Log the count (not the full jsonb payload) plus the error so the cause is
+    // visible in Railway logs without flooding them on every progress-panel open.
+    if (error) throw error;
+    res.json({ sessions: data || [] });
+  } catch (err) {
+    console.error('[sessions] error:', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1974,14 +2291,42 @@ app.get('/api/prs', requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('personal_records')
-      .select('*')
+      .select('exercise_name, weight_kg, reps, sets, est_1rm, achieved_at')
       .eq('user_id', req.user.id)
-      .order('achieved_at', { ascending: false });
+      .order('achieved_at', { ascending: false })
+      .limit(100); // one PR per exercise — 100 is comfortably above any real catalogue
 
     if (error) throw error;
     res.json({ prs: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── SEARCH PRs BY EXERCISE NAME ────────────────
+app.get('/api/prs/search', requireAuth, async (req, res) => {
+  try {
+    const q = (req.query.q || '').toString().trim();
+    if (!q) return res.json({ prs: [] });
+    // FIX 5: tolerant multi-word matching. Normalise the query, split into words, and
+    // match ANY word via OR(ilike) so "benchpress" → bench OR press finds "Bench Press".
+    const normalised = q.toLowerCase().replace(/\s+/g, ' ').trim().replace(/[^a-z0-9 ]/g, '');
+    const words = normalised.split(' ').filter(w => w.length > 1);
+    let prQuery = supabase
+      .from('personal_records')
+      .select('exercise_name, weight_kg, reps, est_1rm, achieved_at')
+      .eq('user_id', req.user.id);
+    prQuery = words.length
+      ? prQuery.or(words.map(w => `exercise_name.ilike.%${w}%`).join(','))
+      : prQuery.ilike('exercise_name', `%${q}%`);
+    const { data, error } = await prQuery
+      .order('achieved_at', { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+    res.json({ prs: data || [] });
+  } catch (err) {
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1989,24 +2334,51 @@ app.get('/api/prs', requireAuth, async (req, res) => {
 app.post('/api/bodyweight', requireAuth, async (req, res) => {
   try {
     const { weight_kg } = req.body;
+    const w = parseFloat(weight_kg);
+    if (isNaN(w)) return res.status(400).json({ error: 'invalid_weight' });
     const today = new Date().toISOString().split('T')[0];
 
-    await supabase.from('bodyweight_log').upsert({
-      user_id: req.user.id,
-      weight_kg,
-      logged_at: today
-    }, { onConflict: 'user_id,logged_at' });
+    // Manual upsert instead of .upsert({ onConflict: 'user_id,logged_at' }) — the
+    // onConflict form silently failed (its result was never captured, so the route
+    // always returned success even when the write errored, e.g. if the matching
+    // unique constraint was missing). Check-then-update/insert needs no DB constraint.
+    const { data: existing } = await supabase
+      .from('bodyweight_log')
+      .select('id')
+      .eq('user_id', req.user.id)
+      .eq('logged_at', today)
+      .maybeSingle();
 
-    res.json({ success: true });
+    let data, error;
+    if (existing) {
+      ({ data, error } = await supabase
+        .from('bodyweight_log')
+        .update({ weight_kg: w })
+        .eq('id', existing.id)
+        .select()
+        .maybeSingle());
+    } else {
+      ({ data, error } = await supabase
+        .from('bodyweight_log')
+        .insert({ user_id: req.user.id, weight_kg: w, logged_at: today })
+        .select()
+        .maybeSingle());
+    }
+
+    if (error) { console.error('Server error:', error); return res.status(500).json({ error: 'Internal server error' }); }
+    res.json({ success: true, entry: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[bodyweight] save exception:', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ── GET STREAK & BADGES ────────────────────────
 app.get('/api/stats', requireAuth, async (req, res) => {
   try {
-    // Get all session logs to compute streak and monthly counts
+    // Intentionally unlimited: lifetime monthly-badge counts and the longest-streak
+    // history need every logged day. Selecting only the `logged_at` date column (one
+    // small string per session) keeps the payload tiny even for multi-year users.
     const { data: sessions } = await supabase
       .from('session_logs')
       .select('logged_at')
@@ -2089,23 +2461,74 @@ app.get('/api/stats', requireAuth, async (req, res) => {
     res.json({ streak, longest_streak, badges, monthly_counts });
   } catch (err) {
     console.error('Stats error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ── GET BODYWEIGHT HISTORY ─────────────────────
 app.get('/api/bodyweight', requireAuth, async (req, res) => {
   try {
+    // bodyweight_log is capped at one row per day, so it is naturally self-bounding.
+    // The ascending+limit(1825) (≈5 years) guard keeps the earliest entry — which the
+    // chart/summary use as the starting weight — while still capping any runaway read.
     const { data, error } = await supabase
       .from('bodyweight_log')
-      .select('*')
+      .select('weight_kg, logged_at')
       .eq('user_id', req.user.id)
-      .order('logged_at', { ascending: true });
+      .order('logged_at', { ascending: true })
+      .limit(1825);
 
     if (error) throw error;
     res.json({ history: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── BODYWEIGHT HISTORY + SUMMARY ───────────────
+// Reads bodyweight_log (the same source as the progress bodyweight card and
+// POST /api/bodyweight), NOT body_metrics — body_metrics holds chest/waist/etc
+// measurements and would not match what the card shows. logged_at is mapped to
+// recorded_at so the frontend contract uses one field name.
+app.get('/api/bodyweight/history', requireAuth, async (req, res) => {
+  try {
+    // Self-bounding (one row/day); ascending+limit(1825) keeps the earliest entry as
+    // the starting weight while capping reads at ≈5 years of daily logs.
+    const { data, error } = await supabase
+      .from('bodyweight_log')
+      .select('weight_kg, logged_at')
+      .eq('user_id', req.user.id)
+      .order('logged_at', { ascending: true })
+      .limit(1825);
+
+    if (error) throw error;
+
+    const history = (data || []).map(r => ({ weight_kg: r.weight_kg, recorded_at: r.logged_at }));
+
+    if (!history.length) {
+      return res.json({
+        history: [],
+        starting_weight: null, current_weight: null,
+        total_change: null, lowest_weight: null, highest_weight: null
+      });
+    }
+
+    const weights = history.map(r => Number(r.weight_kg));
+    const starting_weight = history[0].weight_kg;
+    const current_weight = history[history.length - 1].weight_kg;
+    const change = Number(current_weight) - Number(starting_weight);
+    const total_change = (change >= 0 ? '+' : '−') + Math.abs(change).toFixed(1);
+
+    res.json({
+      history,
+      starting_weight,
+      current_weight,
+      total_change,
+      lowest_weight: Math.min(...weights),
+      highest_weight: Math.max(...weights)
+    });
+  } catch (err) {
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2115,6 +2538,12 @@ function buildPlanPrompt(profile, language, mwExercises) {
   const langName = (language && language !== 'en') ? (langNames[language] || 'English') : 'English';
   // Sanitise all string fields to prevent JSON issues
   const safe = (v, fallback = 'not specified') => String(v || fallback).replace(/["""'']/g, '').substring(0, 200).trim();
+
+  // Session-duration context: tell the AI how long each session should run so it sizes
+  // the per-day exercise count and total volume to fit (warm-up + working sets + rest).
+  const durationContext = profile.session_duration_varies
+    ? `Session durations vary by day (minutes): ${JSON.stringify(profile.session_duration_by_day || {})}`
+    : `Each session is approximately ${profile.session_duration_mins || 60} minutes.`;
 
   return `You are an expert strength and conditioning coach. Generate a completely personalised workout and nutrition plan.
 
@@ -2126,6 +2555,7 @@ PROFILE:
 - Experience: ${safe(profile.experience, 'intermediate')}
 - Training days per week: ${profile.days_per_week || 4}
 - Preferred training days: ${safe(profile.preferred_days, 'flexible')}
+- Session length: ${durationContext} Size each day's exercise count and total volume to fit the available time (account for warm-up and rest between sets).
 - Equipment: ${safe(profile.equipment, 'full_gym')}
 - Diet style: ${safe(profile.diet_style, 'anything')}
 - Diet restrictions: ${safe(profile.diet_restrictions, 'none')}
@@ -2218,7 +2648,7 @@ The "meals" array is just a fallback — the "weekly_meals" object is what gets 
 Keep total daily macros consistent across all 7 days but vary the actual foods.`;
 }
 
-function buildCoachPrompt(profile, planData, recentHistory, context, language) {
+function buildCoachPrompt(profile, planData, recentHistory, context, language, activeProgramme) {
   const plan = planData?.workout_plan;
   const nutrition = planData?.nutrition_plan;
 
@@ -2230,7 +2660,10 @@ function buildCoachPrompt(profile, planData, recentHistory, context, language) {
     ? plan.days.map(d => `[day_index:${d.day_index}] ${d.day_name} — ${d.label}: ${d.exercises?.map(e => `${e.name} ${e.sets}x${e.reps}`).join(', ') || 'Rest'}`).join('\n')
     : 'Not generated';
 
-  const contextStr = context ? `\nCURRENT CONTEXT: ${context}` : '';
+  const progCtx = (activeProgramme && activeProgramme.name)
+    ? `\nACTIVE PROGRAMME: The user is currently following their '${activeProgramme.name}' programme.` + (activeProgramme.goal ? ` Their goal for this programme is ${activeProgramme.goal}.` : '') + ` Coach them in the context of this specific programme and goal. If they ask about switching goals or programmes, acknowledge that they have multiple saved programmes available.`
+    : '';
+  const contextStr = (context ? `\nCURRENT CONTEXT: ${context}` : '') + progCtx;
 
   const langNames = { en:'English', es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese', nl:'Dutch', uk:'Ukrainian', fi:'Finnish', ar:'Arabic', zh:'Chinese', ja:'Japanese' };
   const langStr = language && language !== 'en'
@@ -2306,6 +2739,28 @@ PLAN UPDATE TYPES — use exactly as shown:
 8. REPLACE ALL EXERCISES ON A DAY:
 <PLAN_UPDATE>{"type":"update_day","day_index":0,"exercises":[{"name":"Exercise","note":"cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8}],"summary":"Replaced Monday workout"}</PLAN_UPDATE>
 
+- Add a training day: <PLAN_UPDATE>{"type":"add_day","day":{"day_index":4,"day_name":"Friday","label":"Lower Body B","exercises":[{"name":"Squat","note":"Full depth","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]},"summary":"Added Friday lower body session"}</PLAN_UPDATE>
+
+- Remove a training day: <PLAN_UPDATE>{"type":"remove_day","day_index":4,"summary":"Removed Friday session"}</PLAN_UPDATE>
+
+- Update goals/split: <PLAN_UPDATE>{"type":"update_goals","goal":"hypertrophy","days_per_week":4,"split_type":"Upper/Lower","summary":"Updated to 4-day upper/lower split"}</PLAN_UPDATE>
+
+- Replace entire workout plan: <PLAN_UPDATE>{"type":"replace_workout_plan","workout":{"days_per_week":4,"split_type":"Push/Pull/Legs","goal":"muscle","days":[{"day_index":0,"day_name":"Monday","label":"Push A","exercises":[{"name":"Bench Press","note":"Controlled descent","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]}]},"summary":"Complete new 4-day Push/Pull/Legs programme"}</PLAN_UPDATE>
+
+- Replace entire nutrition plan: <PLAN_UPDATE>{"type":"replace_nutrition_plan","nutrition":{"calories":3000,"protein_g":180,"carbs_g":350,"fat_g":85,"meals":[{"name":"Breakfast","time":"7:00 AM","kcal":700,"protein_g":50,"carbs_g":80,"fat_g":20,"foods":[{"name":"Oats","amount":"80g"},{"name":"Whey protein","amount":"1 scoop"}]}]},"summary":"New nutrition plan at 3000 kcal"}</PLAN_UPDATE>
+
+- Replace entire plan (workout + nutrition): <PLAN_UPDATE>{"type":"replace_entire_plan","workout":{...},"nutrition":{...},"summary":"Complete programme overhaul"}</PLAN_UPDATE>
+
+CRITICAL RULES FOR PLAN EDITING:
+- When user asks to change goals, training days, split, or wants a completely different programme — use replace_workout_plan with the full new plan
+- When user asks to change calories, macros, or wants a completely new diet — use replace_nutrition_plan
+- Never refuse to make changes. Never say you need to regenerate. Just make the change directly.
+- Always confirm what you changed in plain language after the PLAN_UPDATE tag
+- ONLY OUTPUT ONE <PLAN_UPDATE> TAG PER RESPONSE — never multiple tags for the same action
+- Before adding a day, check the existing days in the plan. Do not add a day that already exists at that day_index
+- Before removing a day, verify it exists in the plan first
+- The plan shown in your context is the current live plan — treat it as ground truth
+
 RULES:
 - ALWAYS use the OCCUPIED and FREE day_index lists above — never guess
 - NEVER move a workout to an OCCUPIED day_index unless the user specifically asks to swap two days
@@ -2379,7 +2834,7 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ conversations: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2396,7 +2851,7 @@ app.get('/api/conversations/:id', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ conversation: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2412,7 +2867,7 @@ app.get('/api/plan/days', requireAuth, async (req, res) => {
     })) || [];
     res.json({ days });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2445,7 +2900,7 @@ app.post('/api/plan/repair-days', requireAuth, async (req, res) => {
     await supabase.from('plans').update({ workout_plan: plan, translations: {} }).eq('id', planData.id);
     res.json({ success: true, days: plan.days.map(d => ({ day_index: d.day_index, day_name: d.day_name, label: d.label })) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2478,7 +2933,7 @@ app.post('/api/conversations', requireAuth, async (req, res) => {
       res.json({ conversation: data });
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2494,7 +2949,7 @@ app.delete('/api/conversations/:id', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2541,7 +2996,7 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
       renewalDate,
     });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2610,7 +3065,7 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
     res.json({ url: session.url, session_id: session.id });
   } catch (err) {
     console.error('Stripe checkout error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2633,7 +3088,7 @@ app.post('/api/stripe/portal', requireAuth, async (req, res) => {
     if (err.message?.includes('configuration')) {
       return res.status(500).json({ error: 'Billing portal not configured. Go to Stripe Dashboard → Settings → Billing → Customer portal and save the settings.' });
     }
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2653,7 +3108,7 @@ app.post('/api/stripe/sync-subscription', requireAuth, async (req, res) => {
     res.json({ ok: true, synced: true, tier, status });
   } catch(err) {
     console.error('Sync subscription error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2668,7 +3123,7 @@ app.post('/api/admin/clear-translation-cache', requireAuth, requireAdmin, async 
     if (error) throw error;
     res.json({ success: true, message: 'All translation caches cleared' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2706,7 +3161,7 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     res.json({ users });
   } catch (err) {
     console.error('Admin users error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2730,7 +3185,7 @@ app.patch('/api/admin/users/:userId/freeze', requireAuth, requireAdmin, async (r
 
     res.json({ success: true, profile: data });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2776,13 +3231,18 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
     res.json({ success: true });
   } catch (err) {
     console.error('Delete user error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 
 // ── ADMIN — Set user tier ──────────────────────
 // ── USER TIER SELECTION (preview — Stripe not yet live) ──
+// NOTE: This sets a COSMETIC tier preference only (used during the free trial so the
+// UI can show "you're on Steel"). It does NOT grant paid entitlement: loadSubscription's
+// ENTITLEMENT GUARD ignores subscription_tier unless the status is actually paid/active,
+// so a user cannot escalate to Steel/Forge for free by calling this. Real upgrades go
+// through Stripe (/api/stripe/create-checkout → webhook).
 app.patch('/api/subscription/tier', requireAuth, async (req, res) => {
   const { tier } = req.body;
   const validTiers = ['iron', 'steel', 'forge'];
@@ -2797,7 +3257,7 @@ app.patch('/api/subscription/tier', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, tier: data.subscription_tier, trialEndsAt: data.trial_ends_at });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2813,7 +3273,7 @@ app.patch('/api/admin/users/:userId/expire-trial', requireAuth, requireAdmin, as
     if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2844,86 +3304,441 @@ app.patch('/api/admin/users/:userId/tier', requireAuth, requireAdmin, async (req
     if (error) throw error;
     res.json({ success: true, profile: data });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ── ADMIN — Coach plan controls (trial expiry / extend / activate) ──
+app.patch('/api/admin/users/:userId/coach-plan', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { action } = req.body || {};
+    const updates = {};
+    if (action === 'expire_trial') {
+      updates.coach_plan_status = 'cancelled';
+    } else if (action === 'extend_trial') {
+      // Trial is a fixed 14-day window from coach_trial_start; setting start to 7 days ago
+      // leaves 7 days remaining.
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      updates.coach_trial_start = sevenDaysAgo;
+      updates.coach_plan_status = 'trial';
+    } else if (action === 'set_active') {
+      updates.coach_plan_status = 'active';
+    } else {
+      return res.status(400).json({ error: 'bad_action' });
+    }
+    const { data, error } = await supabase.from('profiles')
+      .update(updates).eq('id', userId).select().maybeSingle();
+    if (error) throw error;
+    res.json({ success: true, profile: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── ADMIN — Coach exempt toggle (bypasses requireCoach plan-status check) ──
+app.patch('/api/admin/users/:userId/coach-exempt', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { exempt } = req.body || {};
+    if (typeof exempt !== 'boolean') return res.status(400).json({ error: 'bad_exempt' });
+    const { data, error } = await supabase.from('profiles')
+      .update({ is_coach_exempt: exempt }).eq('id', userId).select().maybeSingle();
+    if (error) throw error;
+    res.json({ success: true, profile: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── App version (used by frontend auto-update banner) ──
+app.get('/api/version', (req, res) => {
+  res.json({
+    version: process.env.APP_VERSION || '1.0.0',
+    deployed_at: process.env.DEPLOYED_AT || new Date().toISOString(),
+  });
 });
 
 
 // ── PROGRAMMES — Multiple saved plans ─────────
+// NOTE: table is `programmes` (pre-existing live feature + data), NOT
+// `saved_programmes` from the task spec. Extended in place with a `description`
+// column rather than forking a parallel table. Tier limits: Iron = 1 (upgrade
+// prompt), Steel = 3, Forge/exempt = unlimited. See decisions.md.
+const PROGRAMME_TIER_LIMIT = { iron: 1, steel: 3, forge: Infinity };
+
+// Generate a one-line AI description (Haiku, max ~12 words) for a programme and store
+// it on the row. Fire-and-forget: callers do NOT await this — it runs after the
+// response is sent and the frontend picks the description up on the next
+// /api/programmes load. Best-effort: any failure is logged and swallowed.
+async function generateProgrammeDescription(programmeId, data) {
+  try {
+    const descPrompt = `In one sentence of maximum 12 words, describe this fitness programme. Be specific about the goal, structure and focus. No fluff.\nProgramme data: ${JSON.stringify({
+      goal: data.goal,
+      days_per_week: data.days_per_week,
+      experience: data.experience,
+      sport: data.sport || null,
+      day_labels: data.day_labels || null
+    })}`;
+    const descMsg = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 60,
+      messages: [{ role: 'user', content: descPrompt }]
+    });
+    const aiDesc = descMsg.content?.[0]?.text?.trim();
+    if (aiDesc) await supabase.from('programmes').update({ description: aiDesc.slice(0, 300) }).eq('id', programmeId);
+  } catch (e) { console.warn('generateProgrammeDescription failed:', e.message); }
+}
+
 app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    // FIX 8: exclude archived programmes by default. ?include_archived=true returns all
+    // (the frontend uses that to render the collapsed "Archived" section).
+    const includeArchived = req.query.include_archived === 'true';
+    let pq = supabase
       .from('programmes')
-      .select('id, name, created_at, is_active')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false });
+      .select('id, name, description, created_at, is_active, is_archived, plan_data, programme_type')
+      .eq('user_id', req.user.id);
+    if (!includeArchived) pq = pq.or('is_archived.is.null,is_archived.eq.false');
+    const { data, error } = await pq.order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ programmes: data || [] });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Full single programme including plan_data — used by the editor to pre-populate the
+// custom builder, and by the read-only "View" for AI programmes. User-scoped.
+app.get('/api/programmes/:id/full', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('programmes')
+      .select('id, name, description, created_at, is_active, is_archived, plan_data, programme_type')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'programme_not_found' });
+    res.json({ programme: data });
+  } catch(err) {
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   try {
-    const { name, plan_data } = req.body;
+    const { name, description, plan_data, programme_type } = req.body;
     if (!plan_data) return res.status(400).json({ error: 'No plan data provided' });
 
-    // Check programme limit for Iron users
     const { accessTier, isExempt } = req.subscription;
-    if (!hasAccess('multiple_programmes', accessTier, isExempt)) {
-      const { count } = await supabase
-        .from('programmes')
-        .select('id', { count: 'exact', head: true })
-        .eq('user_id', req.user.id);
-      if (count >= 1) {
-        return res.status(403).json({
-          error: 'programme_limit_reached',
-          message: 'Multiple programmes unlock on Steel. Upgrade to save more than one programme.'
+    const tier = isExempt ? 'forge' : (accessTier || 'iron');
+    const limit = PROGRAMME_TIER_LIMIT[tier] ?? 1;
+
+    const { count } = await supabase
+      .from('programmes')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', req.user.id)
+      .or('is_archived.is.null,is_archived.eq.false'); // FIX 8: archived don't count toward the limit
+
+    if ((count || 0) >= limit) {
+      // Iron → upgrade prompt; Steel → at its 3-programme cap.
+      if (tier === 'iron') {
+        return res.status(409).json({
+          error: 'upgrade_required',
+          message: 'Save multiple programmes for different goals — available on Steel and Forge.'
         });
       }
+      return res.status(409).json({
+        error: 'programme_limit_reached',
+        message: `You've reached your ${limit} programme limit on ${tier[0].toUpperCase() + tier.slice(1)}. Upgrade to Forge for unlimited programmes.`
+      });
     }
 
-    const { data, error } = await supabase
+    // programme_type: 'custom' for the manual builder, defaults to 'workout' for everything
+    // else. Stored so the My Programmes list / Log panel can distinguish custom builds.
+    const insertRow = {
+      user_id: req.user.id,
+      name: (name || 'My Programme').toString().slice(0, 80),
+      description: description ? description.toString().slice(0, 300) : null,
+      plan_data,
+      is_active: false,
+      programme_type: (programme_type || 'workout').toString().slice(0, 40)
+    };
+    let { data, error } = await supabase
       .from('programmes')
-      .insert({ user_id: req.user.id, name: name || 'My Programme', plan_data, is_active: false })
-      .select()
+      .insert(insertRow)
+      .select('id, name, description, created_at, is_active, programme_type')
       .maybeSingle();
+    // Graceful fallback if the programmes.programme_type column has not been migrated yet
+    // (mirrors the units/enabled_features degrade-without-column pattern).
+    if (error && /programme_type/.test(error.message || '')) {
+      delete insertRow.programme_type;
+      ({ data, error } = await supabase
+        .from('programmes')
+        .insert(insertRow)
+        .select('id, name, description, created_at, is_active')
+        .maybeSingle());
+    }
     if (error) throw error;
     res.json({ programme: data });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+// Activate a programme: flips this one active + all others inactive, AND writes
+// its stored plan_data into the live `plans` table so the rest of the app loads it.
+// Generate a brand-new programme from a full onboarding questionnaire (Feature 1).
+// Builds a synthetic profile from the supplied answers (physical stats fall back to
+// the user's saved profile), runs the same AI plan generation as onboarding, and
+// saves the result to `programmes` with is_active:false. Tier-gated: Iron locked,
+// Steel max 3, Forge unlimited.
+app.post('/api/programmes/generate', requireAuth, loadSubscription, async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const heartbeat = setInterval(() => { try { res.write(''); } catch(e) { clearInterval(heartbeat); } }, 20000);
+  const sendResponse = (status, data) => { clearInterval(heartbeat); res.status(status).end(JSON.stringify(data)); };
+  try {
+    const { accessTier, isExempt } = req.subscription;
+    const tier = isExempt ? 'forge' : (accessTier || 'iron');
+    const limit = PROGRAMME_TIER_LIMIT[tier] != null ? PROGRAMME_TIER_LIMIT[tier] : 1;
+    if (tier === 'iron') {
+      return sendResponse(409, { error: 'upgrade_required', message: 'Save multiple programmes for different goals — available on Steel and Forge.' });
+    }
+    const { count } = await supabase.from('programmes')
+      .select('id', { count: 'exact', head: true }).eq('user_id', req.user.id)
+      .or('is_archived.is.null,is_archived.eq.false'); // FIX 8: archived don't count toward the limit
+    if ((count || 0) >= limit) {
+      return sendResponse(409, { error: 'programme_limit_reached', message: `You've reached your ${limit} programme limit on ${tier[0].toUpperCase() + tier.slice(1)}. Upgrade to Forge for unlimited programmes.` });
+    }
+
+    const b = req.body || {};
+    const name = (b.name || 'My Programme').toString().slice(0, 80);
+    const language = b.language || 'en';
+
+    // Saved profile supplies the physical stats the questionnaire does not collect.
+    const { data: baseProfile } = await supabase.from('profiles')
+      .select(PLAN_PROFILE_FIELDS).eq('id', req.user.id).maybeSingle();
+
+    let injuries = (b.injuries || baseProfile?.injuries || 'none');
+    if (b.sport) {
+      const sp = typeof b.sport === 'string' ? b.sport : (b.sport.name || '');
+      if (sp) injuries = [(injuries && injuries !== 'none') ? injuries : '', 'Sport: ' + sp].filter(Boolean).join('. ') || 'none';
+    }
+
+    const profile = {
+      name: baseProfile?.name || 'User',
+      age: baseProfile?.age, sex: baseProfile?.sex,
+      height_cm: baseProfile?.height_cm, weight_kg: baseProfile?.weight_kg,
+      goal: b.goal || baseProfile?.goal || 'muscle',
+      experience: b.experience || baseProfile?.experience || 'intermediate',
+      days_per_week: b.days_per_week || baseProfile?.days_per_week || 4,
+      preferred_days: b.preferred_days || baseProfile?.preferred_days || 'flexible',
+      equipment: b.equipment || baseProfile?.equipment || 'full_gym',
+      diet_style: b.diet_style || baseProfile?.diet_style || 'anything',
+      diet_restrictions: b.diet_restrictions || baseProfile?.diet_restrictions || 'none',
+      injuries,
+      // Inherit the user's saved session-duration preference so generated programmes
+      // are sized to the same schedule as their onboarding plan.
+      session_duration_varies: baseProfile?.session_duration_varies,
+      session_duration_mins: baseProfile?.session_duration_mins,
+      session_duration_by_day: baseProfile?.session_duration_by_day,
+    };
+
+    const mwExercises = await getMuscleWikiExercises();
+    const prompt = buildPlanPrompt(profile, language, mwExercises);
+
+    let plan = null, lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const message = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001', max_tokens: 8000,
+          messages: [{ role: 'user', content: prompt }]
+        });
+        let clean = message.content[0].text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        const start = clean.indexOf('{'), end = clean.lastIndexOf('}');
+        if (start === -1 || end === -1) throw new Error('No JSON object found');
+        plan = JSON.parse(clean.substring(start, end + 1));
+        if (!plan.workout?.days?.length) throw new Error('Plan missing workout days');
+        if (!plan.nutrition?.meals?.length) throw new Error('Plan missing nutrition meals');
+        if (mwExercises && plan.workout?.days) {
+          for (const day of plan.workout.days) {
+            for (const ex of (day.exercises || [])) {
+              const exact = mwExercises.find(e => e.name.toLowerCase() === ex.name.toLowerCase());
+              if (exact) { ex.name = exact.name; ex.mw_id = exact.id; continue; }
+              const mwName = await resolveExerciseName(ex.name, mwExercises);
+              if (mwName) { const mwEx = mwExercises.find(e => e.name === mwName); ex.name = mwName; if (mwEx) ex.mw_id = mwEx.id; }
+            }
+          }
+        }
+        break;
+      } catch (err) { lastError = err; if (attempt < 2) await new Promise(r => setTimeout(r, 1000)); }
+    }
+    if (!plan) return sendResponse(500, { error: 'generation_failed', detail: lastError?.message });
+
+    const goalLabel = Array.isArray(profile.goal) ? profile.goal.join(', ') : String(profile.goal || '');
+    const plan_data = { workout: plan.workout, nutrition: plan.nutrition, goal: goalLabel, experience: profile.experience, days_per_week: profile.days_per_week };
+    const description = b.description ? b.description.toString().slice(0, 300) : `${goalLabel} · ${profile.days_per_week} days/week`;
+
+    const { data: saved, error: saveErr } = await supabase.from('programmes').insert({
+      user_id: req.user.id, name, description, plan_data, is_active: false,
+    }).select('id, name, description, created_at, is_active').maybeSingle();
+    if (saveErr) throw saveErr;
+
+    sendResponse(200, { programme_id: saved.id, programme: saved, plan_data });
+
+    // Replace the template description with a one-line AI description, async (only
+    // when the caller didn't supply their own). Picked up on next /api/programmes load.
+    if (!b.description && saved?.id) {
+      generateProgrammeDescription(saved.id, {
+        goal: goalLabel,
+        days_per_week: profile.days_per_week,
+        experience: profile.experience,
+        sport: b.sport || null,
+        day_labels: plan.workout?.days?.map(d => d.label),
+      });
+    }
+  } catch (err) {
+    console.error('programmes/generate error:', err.message);
+    sendResponse(500, { error: err.message });
+  }
+});
+
+app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: prog, error: progErr } = await supabase
+      .from('programmes')
+      .select('id, name, plan_data')
+      .eq('id', id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (progErr) throw progErr;
+    if (!prog) return res.status(404).json({ error: 'programme_not_found' });
+
+    // Pull workout/nutrition out of plan_data (stored as {workout, nutrition},
+    // tolerate {workout_plan, nutrition_plan} too).
+    const pd = prog.plan_data || {};
+    const workout_plan = pd.workout ?? pd.workout_plan ?? null;
+    let nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
+    if (!workout_plan) return res.status(400).json({ error: 'programme_has_no_plan' });
+
+    // Workout-only programmes (e.g. the custom builder, programme_type 'custom') carry no
+    // nutrition. Preserve the user's existing nutrition_plan instead of wiping it to null
+    // when activating one. AI/onboarding programmes carry their own nutrition and override.
+    if (!nutrition_plan) {
+      const { data: existingPlan } = await supabase
+        .from('plans').select('nutrition_plan').eq('user_id', req.user.id).maybeSingle();
+      if (existingPlan && existingPlan.nutrition_plan) nutrition_plan = existingPlan.nutrition_plan;
+    }
+
+    // Replace the live plan (same clean-slate pattern as plan generation).
+    await supabase.from('plans').delete().eq('user_id', req.user.id);
+    const { error: planErr } = await supabase
+      .from('plans')
+      .insert({ user_id: req.user.id, workout_plan, nutrition_plan, translations: {}, source_language: 'en' });
+    if (planErr) throw planErr;
+
+    // Flip active flags.
+    await supabase.from('programmes').update({ is_active: false }).eq('user_id', req.user.id);
+    await supabase.from('programmes').update({ is_active: true, updated_at: new Date().toISOString() })
+      .eq('id', id).eq('user_id', req.user.id);
+
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update name/description, and (for the workout editor) full plan_data. When the
+// edited programme is the active one, its new workout/nutrition is also written
+// through to the live `plans` table so the Plan/Log panels reflect the edit at once.
 app.patch('/api/programmes/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, is_active } = req.body;
-
-    if (is_active) {
-      // Deactivate all other programmes first
-      await supabase.from('programmes')
-        .update({ is_active: false })
-        .eq('user_id', req.user.id);
-    }
+    const { name, description, plan_data } = req.body;
+    const patch = { updated_at: new Date().toISOString() };
+    if (name !== undefined) patch.name = (name || '').toString().slice(0, 80);
+    if (description !== undefined) patch.description = description ? description.toString().slice(0, 300) : null;
+    if (plan_data !== undefined && plan_data && typeof plan_data === 'object') patch.plan_data = plan_data;
 
     const { data, error } = await supabase
       .from('programmes')
-      .update({ ...(name && { name }), ...(is_active !== undefined && { is_active }) })
+      .update(patch)
       .eq('id', id)
       .eq('user_id', req.user.id)
-      .select()
+      .select('id, name, description, created_at, is_active, plan_data, programme_type')
       .maybeSingle();
     if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'programme_not_found' });
+
+    // If plan_data changed AND this programme is the active one, push it into the live
+    // plans table (same shape/clean-slate as the activate endpoint). Nutrition is
+    // preserved when the (custom) programme carries none.
+    if (patch.plan_data && data.is_active) {
+      const pd = data.plan_data || {};
+      const workout_plan = pd.workout ?? pd.workout_plan ?? null;
+      let nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
+      if (workout_plan) {
+        if (!nutrition_plan) {
+          const { data: existingPlan } = await supabase
+            .from('plans').select('nutrition_plan').eq('user_id', req.user.id).maybeSingle();
+          if (existingPlan && existingPlan.nutrition_plan) nutrition_plan = existingPlan.nutrition_plan;
+        }
+        await supabase.from('plans').delete().eq('user_id', req.user.id);
+        await supabase.from('plans').insert({ user_id: req.user.id, workout_plan, nutrition_plan, translations: {}, source_language: 'en' });
+      }
+    }
+
     res.json({ programme: data });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// FIX 8: archive a programme (over-limit resolution after a trial/tier downgrade).
+// Archived programmes are kept but excluded from the active list and the tier-limit count.
+app.patch('/api/programmes/:id/archive', requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('programmes')
+      .update({ is_archived: true, is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// FIX 8: restore an archived programme back to the active (inactive) list.
+app.patch('/api/programmes/:id/restore', requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('programmes')
+      .update({ is_archived: false, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.delete('/api/programmes/:id', requireAuth, async (req, res) => {
   try {
+    const { data: prog } = await supabase
+      .from('programmes')
+      .select('is_active')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!prog) return res.status(404).json({ error: 'programme_not_found' });
+    if (prog.is_active) {
+      return res.status(400).json({ error: 'cannot_delete_active', message: 'Switch to another programme before deleting this one.' });
+    }
+
     const { error } = await supabase
       .from('programmes')
       .delete()
@@ -2932,7 +3747,7 @@ app.delete('/api/programmes/:id', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2948,9 +3763,11 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
       });
     }
 
+    // Full export — intentionally unlimited (the user is downloading their whole
+    // history). Selecting only the columns the CSV emits instead of every column.
     const { data: sessions, error } = await supabase
       .from('session_logs')
-      .select('*')
+      .select('logged_at, exercises, feeling, difficulty')
       .eq('user_id', req.user.id)
       .order('logged_at', { ascending: false });
 
@@ -2988,7 +3805,7 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csv);
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3003,6 +3820,12 @@ app.post('/api/review/generate', requireAuth, loadSubscription, async (req, res)
     }
 
     const userId = req.user.id;
+
+    // Coach review guard — if client has an active coach who disabled weekly reviews, skip.
+    if (await isReviewDisabledByCoach(userId, 'weekly_review_enabled')) {
+      return res.status(403).json({ error: 'disabled_by_coach', message: 'Your coach has paused weekly AI reviews.' });
+    }
+
     const now = new Date();
     const weekStart = new Date(now);
     weekStart.setDate(now.getDate() - now.getDay()); // Sunday
@@ -3010,9 +3833,9 @@ app.post('/api/review/generate', requireAuth, loadSubscription, async (req, res)
     const weekStartStr = weekStart.toISOString().split('T')[0];
 
     const [profileRes, sessionsRes, prsRes] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', userId).maybeSingle(),
+      supabase.from('profiles').select('name, goal, days_per_week').eq('id', userId).maybeSingle(),
       supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', weekStart.toISOString()),
-      supabase.from('personal_records').select('*').eq('user_id', userId).gte('achieved_at', weekStartStr),
+      supabase.from('personal_records').select('exercise_name, weight_kg, reps').eq('user_id', userId).gte('achieved_at', weekStartStr),
     ]);
 
     const profile = profileRes.data;
@@ -3066,7 +3889,7 @@ Write a concise weekly review (100-150 words) covering: how the week went, any h
     res.json({ review: { summary, workouts_completed: sessions.length, prs_hit: prs.length, week_start: weekStartStr } });
   } catch (err) {
     console.error('Weekly review generate error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3089,7 +3912,7 @@ app.get('/api/review/latest', requireAuth, loadSubscription, async (req, res) =>
     if (data && !data.summary && data.ai_insights) data.summary = data.ai_insights;
     res.json({ review: data || null });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3118,7 +3941,7 @@ app.get('/api/monthly-review/latest', requireAuth, loadSubscription, async (req,
 
     res.json({ review: data || null });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3132,16 +3955,21 @@ app.post('/api/monthly-review/generate', requireAuth, loadSubscription, async (r
 
     const userId = req.user.id;
 
+    // Coach review guard — if client has an active coach who disabled monthly reviews, skip.
+    if (await isReviewDisabledByCoach(userId, 'monthly_review_enabled')) {
+      return res.status(403).json({ error: 'disabled_by_coach', message: 'Your coach has paused monthly AI reviews.' });
+    }
+
     // Gather monthly data
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
     const monthName = now.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
 
     const [profileRes, sessionsRes, prsRes, metricsRes] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', userId).maybeSingle(),
+      supabase.from('profiles').select('name, goal, experience, days_per_week').eq('id', userId).maybeSingle(),
       supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', monthStart).order('created_at', { ascending: false }),
-      supabase.from('personal_records').select('*').eq('user_id', userId).gte('achieved_at', monthStart),
-      supabase.from('body_metrics').select('*').eq('user_id', userId).gte('recorded_at', monthStart).order('recorded_at', { ascending: false }),
+      supabase.from('personal_records').select('exercise_name, weight_kg, reps').eq('user_id', userId).gte('achieved_at', monthStart),
+      supabase.from('body_metrics').select('weight_kg, logged_at').eq('user_id', userId).gte('logged_at', monthStart).order('logged_at', { ascending: false }),
     ]);
 
     const profile = profileRes.data;
@@ -3223,7 +4051,70 @@ Be direct, specific, and use their actual numbers. No generic filler. Write like
     res.json({ review: { summary, workouts_completed: sessions.length, prs_hit: prs.length, month_start: monthStart } });
   } catch(err) {
     console.error('Monthly review error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── ONBOARDING MISSIONS — mark complete (robust override) ──
+// The retention router ALSO defines POST /missions/:key/complete, but its handler
+// returns 404 ("Mission not found") whenever the user has no seeded onboarding_missions
+// row — which is the case for accounts created before the seed trigger existed (or any
+// environment where the trigger was never installed). The frontend fires these on login
+// and panel-open, so those users saw a stream of 404s in the console.
+//
+// This override is registered BEFORE the retention mount below, so Express matches it
+// first and the router's update-only handler never runs for this path. It creates the
+// mission row on demand (check-then-insert — NOT an onConflict upsert, which has bitten
+// us before when the unique constraint was missing; see the bodyweight fix in
+// known-bugs.md) and, because missions are non-critical gamification, it always resolves
+// to a 200 so the client never sees a console error.
+app.post('/api/missions/:missionId/complete', requireAuth, async (req, res) => {
+  const key = req.params.missionId;
+  try {
+    const now = new Date().toISOString();
+    const { data: existing } = await supabase
+      .from('onboarding_missions')
+      .select('id')
+      .eq('user_id', req.user.id)
+      .eq('mission_key', key)
+      .maybeSingle();
+
+    let row;
+    if (existing) {
+      const { data, error } = await supabase
+        .from('onboarding_missions')
+        .update({ completed: true, completed_at: now })
+        .eq('id', existing.id)
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      row = data;
+    } else {
+      const { data, error } = await supabase
+        .from('onboarding_missions')
+        .insert({ user_id: req.user.id, mission_key: key, completed: true, completed_at: now })
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      row = data;
+    }
+
+    // Keep profiles.onboarding_score in sync (best-effort — never fail on this).
+    let score = null;
+    try {
+      const { data: all } = await supabase
+        .from('onboarding_missions')
+        .select('completed')
+        .eq('user_id', req.user.id);
+      score = (all || []).filter(m => m.completed).length;
+      await supabase.from('profiles').update({ onboarding_score: score }).eq('id', req.user.id);
+    } catch (e) { /* onboarding_score is non-critical */ }
+
+    res.json({ ok: true, mission: row || { mission_key: key, completed: true }, score });
+  } catch (err) {
+    // Non-critical feature — log it but never surface a 404/500 to the client.
+    console.warn('[missions] complete fallback for', key, '—', err.message);
+    res.json({ ok: true, mission: key, completed: true });
   }
 });
 
@@ -3231,7 +4122,6 @@ Be direct, specific, and use their actual numbers. No generic filler. Write like
 try {
   const retentionRoutes = require('./routes/retention')(supabase, anthropic);
   app.use('/api', requireAuth, retentionRoutes);
-  console.log('Retention routes loaded OK');
 } catch (err) {
   console.error('Failed to load retention routes:', err.message);
 }
@@ -3318,13 +4208,13 @@ app.get('/api/exercise/video/*', requireAuth, (req, res) => {
 
     proxyRes.on('error', (e) => {
       console.error('proxyRes error:', e.message);
-      if (!res.headersSent) res.status(500).json({ error: e.message });
+      if (!res.headersSent) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
     });
   });
 
   proxyReq.on('error', (e) => {
     console.error('proxyReq error:', e.message);
-    if (!res.headersSent) res.status(500).json({ error: e.message });
+    if (!res.headersSent) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
   });
 
   proxyReq.setTimeout(30000, () => {
@@ -3337,7 +4227,7 @@ app.get('/api/exercise/video/*', requireAuth, (req, res) => {
 
 
 // ── EXERCISE DEBUG — see raw MuscleWiki response ───────
-app.get('/api/exercise/debug', requireAuth, async (req, res) => {
+app.get('/api/exercise/debug', requireAuth, requireAdmin, async (req, res) => {
   const { name } = req.query;
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.json({ error: 'No MUSCLEWIKI_API_KEY set' });
@@ -3387,14 +4277,14 @@ app.get('/api/exercise/debug', requireAuth, async (req, res) => {
       apiKeyPresent: !!apiKey,
     });
   } catch(err) {
-    res.json({ error: err.message });
+    console.error('Server error:', err); res.json({ error: 'Internal server error' });
   }
 });
 
 
 // ── EXERCISE VIDEO TRACE — full debug trace for video lookup ──
 // ── YOUTUBE VIDEO TEST ────────────────────────────────
-app.get('/api/exercise/yt-test', requireAuth, async (req, res) => {
+app.get('/api/exercise/yt-test', requireAuth, requireAdmin, async (req, res) => {
   const name = req.query.name || 'Barbell Bench Press';
   const force = req.query.force === '1'; // ?force=1 bypasses cache
   if (force) {
@@ -3408,7 +4298,7 @@ app.get('/api/exercise/yt-test', requireAuth, async (req, res) => {
 });
 
 // ── MUSCLEWIKI RAW DIAGNOSTIC ─────────────────────────
-app.get('/api/exercise/mw-debug', requireAuth, async (req, res) => {
+app.get('/api/exercise/mw-debug', requireAuth, requireAdmin, async (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.json({ error: 'No API key' });
   try {
@@ -3470,11 +4360,11 @@ app.get('/api/exercise/mw-debug', requireAuth, async (req, res) => {
 
     res.json(results);
   } catch(e) {
-    res.json({ error: e.message, stack: e.stack?.split('\n').slice(0,3) });
+    console.error('Server error:', e); res.json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/exercise/test-video', requireAuth, async (req, res) => {
+app.get('/api/exercise/test-video', requireAuth, requireAdmin, async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name param required' });
   const trace = [];
@@ -3558,14 +4448,15 @@ app.get('/api/exercise/test-video', requireAuth, async (req, res) => {
       result: { name: detail.name || match.name, videoFilename: frontFile, videoFilename2: sideFile }
     });
   } catch(err) {
-    trace.push({ step: 'error', message: err.message, stack: err.stack?.split('\n').slice(0, 3) });
-    return res.json({ trace, error: err.message });
+    console.error('buftest error:', err);
+    trace.push({ step: 'error' });
+    return res.json({ trace, error: 'Internal server error' });
   }
 });
 
 
 // ── EXERCISE VIDEO TEST — check API key + cache status ──
-app.get('/api/exercise/video-test', requireAuth, async (req, res) => {
+app.get('/api/exercise/video-test', requireAuth, requireAdmin, async (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.json({ error: 'No API key set', status: 0 });
 
@@ -3599,12 +4490,12 @@ app.get('/api/exercise/video-test', requireAuth, async (req, res) => {
       message: testReq.statusCode === 200 ? 'API key valid, cache ready' : 'API key issue: status ' + testReq.statusCode,
     });
   } catch(e) {
-    res.json({ error: e.message, status: 0 });
+    console.error('Server error:', e); res.json({ error: 'Internal server error', status: 0 });
   }
 });
 
 // ── VIDEO BUFFER — works (confirmed 752902 bytes) ────────
-app.get('/api/exercise/buftest', requireAuth, async (req, res) => {
+app.get('/api/exercise/buftest', requireAuth, requireAdmin, async (req, res) => {
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   // If filename param provided, serve that file as video
   const filename = req.query.f;
@@ -3642,7 +4533,7 @@ app.get('/api/exercise/buftest', requireAuth, async (req, res) => {
       res.json({ success: true, bytes: buf.length });
     }
   } catch(e) {
-    res.json({ success: false, error: e.message });
+    console.error('Server error:', e); res.json({ success: false, error: 'Internal server error' });
   }
 });
 
@@ -3676,7 +4567,7 @@ app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
 
     res.json({ success: true, remapped: changed });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3740,7 +4631,7 @@ app.post('/api/launch-pricing/record-subscription', requireAuth, async (req, res
       ...(tier === 'forge' && nowEnded ? { forge_active: false } : {}),
     });
     res.json({ ok: true, promo_active: !nowEnded, remaining: LAUNCH_PROMO_THRESHOLD - newSold });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Admin: view and control launch pricing
@@ -3761,7 +4652,7 @@ app.patch('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, re
       forge_sold: config?.forge_sold || 0,
     });
     res.json({ ok: true });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 const server = app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
@@ -3777,7 +4668,7 @@ app.get('/api/debug/plan', requireAuth, requireAdmin, async (req, res) => {
 });
 
 // ── EXERCISE ID FINDER — dev tool ─────────────────────
-app.get('/api/exercise/find-ids', requireAuth, async (req, res) => {
+app.get('/api/exercise/find-ids', requireAuth, requireAdmin, async (req, res) => {
   const exercises = await getMuscleWikiExercises();
   if (!exercises) return res.json({ error: 'Cache not loaded' });
   const names = (req.query.names || '').split(',').map(n => n.trim().toLowerCase());
@@ -3827,7 +4718,7 @@ app.post('/api/push/subscribe', requireAuth, async (req, res) => {
     }, { onConflict: 'user_id' });
     res.json({ ok: true });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3894,7 +4785,7 @@ app.post('/api/push/founding-member-notify', requireAuth, async (req, res) => {
     await sendPushToUser(userId, 'Founding Member access — limited slots', 'Pay once, train forever. First 500 members only. You\'re eligible now.');
     await supabase.from('profiles').update({ founding_notified_at: new Date().toISOString() }).eq('id', userId);
     res.json({ ok: true });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -3907,7 +4798,7 @@ app.get('/api/testimonial', async (req, res) => {
       quote: "Built me a full programme in under 2 minutes. I've tried four other apps. This is the first one that felt like it actually knew what I needed.",
       attribution: "— James, training for football season"
     });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/admin/testimonial', requireAuth, requireAdmin, async (req, res) => {
@@ -3915,7 +4806,7 @@ app.patch('/api/admin/testimonial', requireAuth, requireAdmin, async (req, res) 
     const { quote, attribution } = req.body;
     await supabase.from('app_config').upsert({ key: 'paywall_testimonial', value: { quote, attribution } }, { onConflict: 'key' });
     res.json({ ok: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -3926,7 +4817,7 @@ app.post('/api/trial-feedback', requireAuth, async (req, res) => {
     const { feedback } = req.body;
     await supabase.from('trial_feedback').insert({ user_id: req.user.id, feedback, created_at: new Date().toISOString() });
     res.json({ ok: true });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -3941,7 +4832,7 @@ app.get('/api/founding-member/slots', async (req, res) => {
       steel_total: data?.steel_total || 250,
       steel_sold: data?.steel_sold || 0,
     });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
@@ -3966,7 +4857,7 @@ app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
       lifetime_tier: tier,
     }).eq('id', req.user.id);
     res.json({ ok: true, tier });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -3983,7 +4874,7 @@ app.get('/api/referral', requireAuth, async (req, res) => {
     }
     const stats = profile.referral_stats || { clicks: 0, signups: 0, conversions: 0, credits: 0 };
     res.json({ code: profile.referral_code, stats });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Apply referral code on signup — called after account creation
@@ -4002,7 +4893,7 @@ app.post('/api/referral/apply', requireAuth, async (req, res) => {
     stats.signups = (stats.signups || 0) + 1;
     await supabase.from('profiles').update({ referral_stats: stats }).eq('id', referrer.id);
     res.json({ ok: true, trialDays: 14 });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -4018,7 +4909,7 @@ app.post('/api/creator-code/validate', async (req, res) => {
     if (data.expires_at && new Date(data.expires_at) < new Date()) return res.status(400).json({ error: 'Code expired' });
     if (data.max_uses && data.uses_count >= data.max_uses) return res.status(400).json({ error: 'Code fully redeemed' });
     res.json({ ok: true, trial_days: data.trial_days || 14, name: data.name });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/creator-code/redeem', requireAuth, async (req, res) => {
@@ -4038,7 +4929,7 @@ app.post('/api/creator-code/redeem', requireAuth, async (req, res) => {
       code_id: data.id, user_id: req.user.id, used_at: new Date().toISOString()
     });
     res.json({ ok: true, trial_days: data.trial_days || 14 });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Admin: create creator code
@@ -4051,12 +4942,1548 @@ app.post('/api/admin/creator-codes', requireAuth, requireAdmin, async (req, res)
     }).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, code: data });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/admin/creator-codes', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { data } = await supabase.from('creator_codes').select('*').order('created_at', { ascending: false });
     res.json({ codes: data || [] });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// COACH FEATURE
+// ═══════════════════════════════════════════════════════
+
+// ── Coach helpers ──────────────────────────────────────
+
+// Is this user's relevant review type disabled by their active coach?
+// settingField is the column name in coach_ai_review_settings, e.g. 'weekly_review_enabled'.
+async function isReviewDisabledByCoach(userId, settingField) {
+  try {
+    const { data: link } = await supabase
+      .from('coach_clients')
+      .select('coach_id')
+      .eq('client_id', userId)
+      .eq('status', 'active')
+      .maybeSingle();
+    if (!link?.coach_id) return false;
+    const { data: settings } = await supabase
+      .from('coach_ai_review_settings')
+      .select(settingField)
+      .eq('coach_id', link.coach_id)
+      .eq('client_id', userId)
+      .maybeSingle();
+    if (!settings) return false; // no row = defaults to enabled
+    return settings[settingField] === false;
+  } catch(e) {
+    console.error('isReviewDisabledByCoach error:', e.message);
+    return false;
+  }
+}
+
+// Middleware — user must be an active or trialling coach
+async function requireCoach(req, res, next) {
+  try {
+    const { data: profile } = await supabase.from('profiles')
+      .select('account_type, coach_plan, coach_plan_status, coach_trial_start, name, coach_title, coach_commission_rate, is_coach_exempt')
+      .eq('id', req.user.id).maybeSingle();
+    if (profile?.account_type !== 'coach') {
+      return res.status(403).json({ error: 'not_coach', message: 'Coach account required.' });
+    }
+    // Exempt accounts bypass ALL coach plan-status / trial-expiry checks
+    if (profile.is_coach_exempt) {
+      req.coachProfile = profile;
+      return next();
+    }
+    if (!['active','trial'].includes(profile?.coach_plan_status)) {
+      // If they were already marked expired/cancelled, surface that to the client
+      if (profile?.coach_plan_status === 'expired') {
+        return res.status(403).json({ error: 'coach_trial_expired', message: 'Your coach trial has ended.' });
+      }
+      return res.status(403).json({ error: 'not_coach', message: 'Coach account required.' });
+    }
+    // Active trial — check the 14-day window
+    if (profile.coach_plan_status === 'trial' && profile.coach_trial_start) {
+      const trialEnd = new Date(profile.coach_trial_start);
+      trialEnd.setDate(trialEnd.getDate() + 14);
+      if (new Date() > trialEnd) {
+        await supabase.from('profiles')
+          .update({ coach_plan_status: 'expired' })
+          .eq('id', req.user.id);
+        return res.status(403).json({ error: 'coach_trial_expired', message: 'Your coach trial has ended.' });
+      }
+    }
+    req.coachProfile = profile;
+    next();
+  } catch(e) {
+    console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+// Verify coach has an active connection with this client. Returns true/false.
+async function verifyClientConnection(coachId, clientId) {
+  const { data } = await supabase.from('coach_clients')
+    .select('id').eq('coach_id', coachId).eq('client_id', clientId).eq('status', 'active').maybeSingle();
+  return !!data;
+}
+
+// Count active clients for a coach
+async function countActiveClients(coachId) {
+  const { count } = await supabase
+    .from('coach_clients')
+    .select('id', { count: 'exact', head: true })
+    .eq('coach_id', coachId)
+    .in('status', ['active','pending']);
+  return count || 0;
+}
+
+// Generates a private, coach-facing overview of a client and stores it on the
+// coach_clients connection row. Declared as a function declaration so it is
+// hoisted and callable from the connection-accept handler defined earlier.
+async function generateClientSummary(coachId, clientId) {
+  // Full profile (only columns that exist on profiles — there is no `sport` column)
+  const { data: prof } = await supabase
+    .from('profiles')
+    .select('name, age, goal, experience, days_per_week, preferred_days, weight_kg, height_cm, injuries, equipment, diet_style, diet_restrictions, subscription_tier')
+    .eq('id', clientId)
+    .maybeSingle();
+  if (!prof) throw new Error('client_profile_not_found');
+
+  // Latest body metrics (weight, body fat if tracked)
+  const { data: metrics } = await supabase
+    .from('body_metrics')
+    .select('weight_kg, body_fat, logged_at')
+    .eq('user_id', clientId)
+    .order('logged_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  // Session count, last 30 days
+  const monthAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const { count: sessionCount } = await supabase
+    .from('session_logs')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', clientId)
+    .gte('logged_at', monthAgo);
+
+  // Current streak
+  const { data: streakRow } = await supabase
+    .from('streaks')
+    .select('current_streak')
+    .eq('user_id', clientId)
+    .maybeSingle();
+
+  const clientData = {
+    ...prof,
+    latest_weight_kg: metrics?.weight_kg ?? prof.weight_kg ?? null,
+    latest_body_fat: metrics?.body_fat ?? null,
+    sessions_last_30_days: sessionCount || 0,
+    current_streak: streakRow?.current_streak || 0,
+  };
+
+  const prompt = `You are writing a private client overview for a fitness coach.
+Based on the following client data, write a concise 3-4 paragraph
+professional summary that covers:
+1. Who they are and their primary goal (be specific — if goal is
+   'sport', name the sport and what they are training for)
+2. Their starting point — current stats, experience level,
+   any injuries or limitations to be aware of
+3. Their schedule and availability — which days they can train,
+   how many sessions per week, any equipment constraints
+4. Nutrition context — diet style, restrictions, calorie targets
+   if set
+Write in second person addressed to the coach, not the client.
+Be direct and factual. Use the client's actual name.
+Client data: ${JSON.stringify(clientData)}`;
+
+  const msg = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1200,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const summary = (msg.content?.[0]?.text || '').trim();
+  if (!summary) throw new Error('empty_summary');
+
+  await supabase
+    .from('coach_clients')
+    .update({ client_summary: summary, client_summary_generated_at: new Date().toISOString() })
+    .eq('coach_id', coachId)
+    .eq('client_id', clientId);
+
+  return summary;
+}
+
+// On-demand summary generation / regeneration for a coach viewing a client.
+app.post('/api/coach/clients/:clientId/generate-summary', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const summary = await generateClientSummary(req.user.id, clientId);
+    res.json({ summary, summary_generated_at: new Date().toISOString() });
+  } catch(err) {
+    console.error('[generate-summary]', err.message);
+    res.status(500).json({ error: 'summary_failed' });
+  }
+});
+
+// ── Coach setup — Stripe checkout for new coach plan ──
+// ── Coach setup — activates trial immediately, NO Stripe at this step.
+// Card is collected only after the 14-day trial expires (see /api/coach/create-checkout).
+app.post('/api/coach/setup', requireAuth, async (req, res) => {
+  try {
+    const { title, bio, plan, billing } = req.body;
+    if (!title) return res.status(400).json({ error: 'Missing title' });
+    if (!plan || !COACH_PLAN_CONFIG[plan]) return res.status(400).json({ error: 'Invalid plan' });
+
+    const planConfig = COACH_PLAN_CONFIG[plan];
+    const userId = req.user.id;
+
+    const updates = {
+      account_type: 'coach',
+      coach_plan: plan,
+      coach_plan_status: 'trial',
+      coach_trial_start: new Date().toISOString(),
+      coach_commission_rate: planConfig.commissionRate,
+      coach_bio: (bio || '').toString().slice(0, 200) || null,
+      coach_title: (title || '').toString().slice(0, 100),
+    };
+    // Remember the billing preference for when the user hits Stripe at trial end.
+    if (['monthly', 'annual'].includes(billing)) updates.coach_billing_preference = billing;
+
+    const { error } = await supabase.from('profiles').update(updates).eq('id', userId);
+    if (error) throw error;
+
+    res.json({ ok: true, plan, status: 'trial' });
+  } catch(err) {
+    console.error('Coach setup error:', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Coach checkout — called only when the trial has expired (or user upgrades early).
+// Creates a Stripe subscription session with NO trial (the in-app trial was already used).
+app.post('/api/coach/create-checkout', requireAuth, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+    const { plan, billing } = req.body || {};
+
+    const { data: profile } = await supabase.from('profiles')
+      .select('stripe_customer_id, name, coach_plan, coach_billing_preference').eq('id', req.user.id).maybeSingle();
+
+    const chosenPlan = plan || profile?.coach_plan;
+    const chosenBilling = billing || profile?.coach_billing_preference || 'annual';
+    if (!chosenPlan || !COACH_PLAN_CONFIG[chosenPlan]) return res.status(400).json({ error: 'Invalid plan' });
+    if (!['monthly','annual'].includes(chosenBilling)) return res.status(400).json({ error: 'Invalid billing' });
+
+    const priceKey = `coach_${chosenPlan}_${chosenBilling}`;
+    const priceId = STRIPE_PRICES[priceKey];
+    if (!priceId) return res.status(400).json({ error: `Coach price ID not configured for ${priceKey}` });
+
+    // Get or create Stripe customer
+    let customerId = profile?.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: req.user.email, name: profile?.name || '', metadata: { user_id: req.user.id },
+      });
+      customerId = customer.id;
+      await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', req.user.id);
+    }
+
+    const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
+    const appUrl = frontendUrl.replace(/\/$/, '') + '/app.html';
+
+    const coachMetadata = {
+      user_id: req.user.id,
+      account_type: 'coach',
+      coach_plan: chosenPlan,
+      coach_billing: chosenBilling,
+      coach_post_trial: 'true', // signals to webhook: don't reset coach_trial_start
+    };
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      mode: 'subscription',
+      success_url: `${appUrl}?coach_payment=success`,
+      cancel_url: `${appUrl}?coach_payment=cancelled`,
+      metadata: coachMetadata,
+      // trial already used — charge immediately
+      subscription_data: { metadata: coachMetadata },
+      allow_promotion_codes: true,
+    });
+
+    res.json({ url: session.url, session_id: session.id });
+  } catch(err) {
+    console.error('Coach create-checkout error:', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Downgrade a coach account back to individual user (called from trial-expired paywall)
+app.post('/api/coach/downgrade', requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase.from('profiles').update({
+      account_type: 'user',
+      coach_plan_status: 'cancelled',
+    }).eq('id', req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Coach profile ──────────────────────────────────────
+app.get('/api/coach/profile', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { data } = await supabase.from('profiles')
+      .select('account_type, coach_plan, coach_plan_status, coach_trial_start, coach_commission_rate, coach_bio, coach_title, coach_stripe_subscription_id, name')
+      .eq('id', req.user.id).maybeSingle();
+    res.json({ profile: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.patch('/api/coach/profile', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { bio, title } = req.body;
+    const update = {};
+    if (typeof bio === 'string') update.coach_bio = bio.slice(0, 500);
+    if (typeof title === 'string') update.coach_title = title.slice(0, 100);
+    if (Object.keys(update).length === 0) return res.status(400).json({ error: 'Nothing to update' });
+    await supabase.from('profiles').update(update).eq('id', req.user.id);
+    res.json({ ok: true });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Client management ──────────────────────────────────
+app.get('/api/coach/clients', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { data: links } = await supabase
+      .from('coach_clients')
+      .select('id, client_id, invited_email, status, connected_at, created_at')
+      .eq('coach_id', req.user.id)
+      .neq('status', 'disconnected')
+      .order('created_at', { ascending: false });
+    const rows = links || [];
+    const clientIds = rows.filter(r => r.client_id).map(r => r.client_id);
+    let profilesById = {};
+    if (clientIds.length) {
+      const { data: profiles } = await supabase.from('profiles')
+        .select('id, name, goal, experience, subscription_tier').in('id', clientIds);
+      for (const p of (profiles || [])) profilesById[p.id] = p;
+    }
+    // Last active per client — most recent session_log (logged_at is YYYY-MM-DD).
+    // NOTE: bounded to the last 180 days of client logs. "first occurrence wins" below
+    // still yields each client's most-recent date; a client with zero logs in the
+    // window simply reports last_active=null (matches the no-logs display anyway).
+    // This prevents the query from scanning every client's entire history at scale.
+    let lastActiveById = {};
+    if (clientIds.length) {
+      const since180 = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      const { data: logs } = await supabase.from('session_logs')
+        .select('user_id, logged_at')
+        .in('user_id', clientIds)
+        .gte('logged_at', since180)
+        .order('logged_at', { ascending: false });
+      for (const log of (logs || [])) {
+        if (!lastActiveById[log.user_id]) lastActiveById[log.user_id] = log.logged_at;
+      }
+    }
+    const clients = rows.map(r => ({
+      connection_id: r.id,
+      client_id: r.client_id,
+      invited_email: r.invited_email,
+      status: r.status,
+      connected_at: r.connected_at,
+      created_at: r.created_at,
+      profile: r.client_id ? (profilesById[r.client_id] || null) : null,
+      last_active: r.client_id ? (lastActiveById[r.client_id] || null) : null,
+    }));
+    res.json({ clients });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || !email.includes('@')) return res.status(400).json({ error: 'Invalid email' });
+
+    // Seat-limit check (active + pending count toward limit)
+    const plan = req.coachProfile.coach_plan;
+    const limit = COACH_PLAN_CONFIG[plan]?.seatLimit ?? 10;
+    const used = await countActiveClients(req.user.id);
+    if (used >= limit) {
+      return res.status(403).json({ error: 'seat_limit', plan, limit, used });
+    }
+
+    // Does the email match an existing user? `profiles` has NO email column —
+    // it must come from auth.users via auth.admin.listUsers(). DO NOT change this to
+    // `profiles.ilike('email', …)` — that returns null for every real user and breaks
+    // every invite silently. See decisions.md: "PERMANENT: Coach invite existing-user lookup".
+    const cleanEmail = email.trim().toLowerCase();
+    let existingUser = null;
+    try {
+      const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+      const matchedAuthUser = (authList?.users || []).find(
+        u => u.email?.toLowerCase() === cleanEmail
+      );
+      if (matchedAuthUser) {
+        const { data: profileRow } = await supabase
+          .from('profiles')
+          .select('id, name')
+          .eq('id', matchedAuthUser.id)
+          .maybeSingle();
+        if (profileRow) existingUser = profileRow;
+      }
+    } catch(e) {
+      console.warn('[invite] auth.admin.listUsers failed:', e.message);
+    }
+
+    let newLink = null;
+
+    if (existingUser) {
+      // Block coach-to-coach invites — a coach account cannot be a client of another coach.
+      const { data: inviteeProfile } = await supabase
+        .from('profiles')
+        .select('account_type')
+        .eq('id', existingUser.id)
+        .maybeSingle();
+
+      if (inviteeProfile?.account_type === 'coach') {
+        return res.status(409).json({
+          error: 'cannot_invite_coach',
+          message: 'Coach accounts cannot be invited as clients.'
+        });
+      }
+
+      // Block if the client already has an active coach (any coach, not just this one)
+      const { data: activeCoach } = await supabase.from('coach_clients')
+        .select('id, coach_id').eq('client_id', existingUser.id).eq('status', 'active').maybeSingle();
+      if (activeCoach && activeCoach.coach_id !== req.user.id) {
+        return res.status(409).json({
+          error: 'already_has_coach',
+          message: 'This user already has an active coach.'
+        });
+      }
+
+      // Look for any prior link between this coach and this client
+      const { data: existing } = await supabase.from('coach_clients')
+        .select('id, status').eq('coach_id', req.user.id).eq('client_id', existingUser.id).maybeSingle();
+
+      if (existing) {
+        if (existing.status === 'pending') {
+          return res.json({ type: 'existing', message: 'Invite already sent.', connection_id: existing.id });
+        }
+        if (existing.status === 'active') {
+          return res.status(409).json({ error: 'already_connected', message: 'You are already connected with this client.' });
+        }
+        if (existing.status === 'disconnected') {
+          // Re-invite: update the existing row in place rather than insert a new one
+          const { data: updated, error: updateErr } = await supabase.from('coach_clients').update({
+            status: 'pending',
+            disconnected_at: null,
+            created_at: new Date().toISOString(),
+            coach_seen: false,
+          }).eq('id', existing.id).select().maybeSingle();
+          if (updateErr) throw updateErr;
+          newLink = updated;
+        }
+      }
+
+      if (!newLink) {
+        const insertRow = {
+          coach_id: req.user.id,
+          client_id: existingUser.id,
+          status: 'pending',
+          created_at: new Date().toISOString(),
+        };
+        const { data: inserted, error: insertErr } = await supabase
+          .from('coach_clients').insert(insertRow).select().maybeSingle();
+        if (insertErr) throw insertErr;
+        newLink = inserted;
+      }
+
+      await sendPushToUser(
+        existingUser.id,
+        'New coach request',
+        `A FORGE coach has requested to connect with you.`,
+        `/app.html?coach_request=${newLink.id}`
+      ).catch(() => {});
+      return res.json({ type: 'existing', message: 'Connection request sent.', connection_id: newLink.id });
+    } else {
+      // No existing user — invite by email
+      const { data: existingInvite } = await supabase.from('coach_clients')
+        .select('id').eq('coach_id', req.user.id).eq('invited_email', cleanEmail)
+        .neq('status', 'disconnected').maybeSingle();
+      if (existingInvite) return res.status(400).json({ error: 'already_invited', status: 'pending' });
+
+      const insertRow = {
+        coach_id: req.user.id,
+        invited_email: cleanEmail,
+        status: 'pending',
+        created_at: new Date().toISOString(),
+      };
+      const { data: inserted, error: insertErr } = await supabase
+        .from('coach_clients').insert(insertRow).select().maybeSingle();
+      if (insertErr) throw insertErr;
+      newLink = inserted;
+      // Email send is wired up to existing email system when available.
+      // For now we log and rely on the recipient signing up — they'll see the invite on first login.
+      return res.json({ type: 'new', message: 'Invitation recorded. They\'ll see it when they join FORGE.', connection_id: newLink.id });
+    }
+  } catch(err) {
+    console.error('Coach invite error:', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/coach/clients/:clientId', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    // Find the link — clientId param may be a profile id OR a connection id
+    const { data: link } = await supabase.from('coach_clients')
+      .select('id, client_id').eq('coach_id', req.user.id)
+      .or(`client_id.eq.${clientId},id.eq.${clientId}`).neq('status', 'disconnected').maybeSingle();
+    if (!link) return res.status(404).json({ error: 'Not found' });
+    await supabase.from('coach_clients').update({
+      status: 'disconnected', disconnected_at: new Date().toISOString()
+    }).eq('id', link.id);
+    if (link.client_id) {
+      await sendPushToUser(link.client_id, 'Coach disconnected',
+        'Your coach has ended the connection. Your training data stays yours.',
+        '/app.html?panel=account').catch(() => {});
+    }
+    res.json({ ok: true });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Client data — coach reads client data ─────────────
+app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+
+    const now = new Date();
+    // Week starts Monday — use date strings since logged_at is YYYY-MM-DD
+    const dayOfWeek = now.getDay(); // 0=Sun
+    const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const weekStartDate = new Date(now);
+    weekStartDate.setDate(now.getDate() - daysFromMonday);
+    const weekStartStr = weekStartDate.toISOString().split('T')[0];
+    const monthStartStr = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+    const thirtyDaysAgoStr = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    const [lastSessionRes, weekSessionsRes, prsRes, metricsRes, streakRes, profileRes] = await Promise.all([
+      supabase.from('session_logs').select('id, logged_at, day_label, exercises').eq('user_id', clientId).order('logged_at', { ascending: false }).limit(1),
+      supabase.from('session_logs').select('id, logged_at, day_label, exercises').eq('user_id', clientId).gte('logged_at', weekStartStr).order('logged_at', { ascending: false }),
+      supabase.from('personal_records').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('achieved_at', monthStartStr),
+      supabase.from('body_metrics').select('*').eq('user_id', clientId).gte('logged_at', thirtyDaysAgoStr).order('logged_at', { ascending: true }),
+      supabase.from('streaks').select('current_streak, longest_streak').eq('user_id', clientId).maybeSingle(),
+      supabase.from('profiles').select('name, goal, experience, days_per_week').eq('id', clientId).maybeSingle(),
+    ]);
+
+    const weekSessions = weekSessionsRes.data || [];
+
+    // Streak fallback — if no streaks row, count consecutive days back from today using session_logs
+    let currentStreak = streakRes.data?.current_streak ?? null;
+    if (currentStreak === null || currentStreak === undefined) {
+      const { data: allLogs } = await supabase.from('session_logs')
+        .select('logged_at').eq('user_id', clientId).order('logged_at', { ascending: false }).limit(120);
+      const dateSet = new Set((allLogs || []).map(l => (l.logged_at + '').split('T')[0]));
+      let streak = 0;
+      const cursor = new Date();
+      // allow today OR yesterday as the starting anchor so a streak doesn't break before today is logged
+      const todayStr = cursor.toISOString().split('T')[0];
+      if (!dateSet.has(todayStr)) cursor.setDate(cursor.getDate() - 1);
+      while (dateSet.has(cursor.toISOString().split('T')[0])) {
+        streak++;
+        cursor.setDate(cursor.getDate() - 1);
+      }
+      currentStreak = streak;
+    }
+
+    // Upcoming sessions — pull from active plan
+    let upcoming = [];
+    try {
+      const { data: plan } = await supabase.from('plans')
+        .select('workout_plan').eq('user_id', clientId).order('created_at', { ascending: false }).limit(1).maybeSingle();
+      const days = plan?.workout_plan?.days || plan?.workout_plan || [];
+      if (Array.isArray(days)) upcoming = days.slice(0, 3);
+    } catch(e) { /* plan structure may vary */ }
+
+    // AI client summary (loaded with the overview so it renders in one call)
+    const { data: connRow } = await supabase.from('coach_clients')
+      .select('client_summary, client_summary_generated_at')
+      .eq('coach_id', req.user.id).eq('client_id', clientId).eq('status', 'active').maybeSingle();
+
+    res.json({
+      profile: profileRes.data,
+      sessions_this_week: weekSessions.length,
+      recent_sessions: weekSessions,
+      current_streak: currentStreak,
+      last_session: lastSessionRes.data?.[0] || null,
+      prs_this_month: prsRes.count || 0,
+      body_metrics: metricsRes.data || [],
+      upcoming_sessions: upcoming,
+      summary: connRow?.client_summary || null,
+      summary_generated_at: connRow?.client_summary_generated_at || null,
+    });
+  } catch(err) {
+    console.error('Coach overview error:', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+app.get('/api/coach/clients/:clientId/plan', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: plan } = await supabase.from('plans')
+      .select('workout_plan, generated_at')
+      .eq('user_id', clientId)
+      .order('generated_at', { ascending: false })
+      .limit(1).maybeSingle();
+    res.json({ plan: plan?.workout_plan || null });
+  } catch(err) {
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/coach/clients/:clientId/ai-activity', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const [convsRes, weeklyRes, monthlyRes, settingsRes] = await Promise.all([
+      supabase.from('chat_conversations').select('*').eq('user_id', clientId).order('created_at', { ascending: false }).limit(50),
+      supabase.from('weekly_reviews').select('*').eq('user_id', clientId).order('created_at', { ascending: false }).limit(12),
+      supabase.from('monthly_reviews').select('*').eq('user_id', clientId).order('generated_at', { ascending: false }).limit(12),
+      supabase.from('coach_ai_review_settings').select('*').eq('coach_id', req.user.id).eq('client_id', clientId).maybeSingle(),
+    ]);
+    res.json({
+      conversations: convsRes.data || [],
+      weekly_reviews: weeklyRes.data || [],
+      monthly_reviews: monthlyRes.data || [],
+      review_settings: settingsRes.data || {
+        post_workout_checkin_enabled: true,
+        weekly_review_enabled: true,
+        monthly_review_enabled: true,
+      },
+    });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data } = await supabase.from('coach_notes')
+      .select('*').eq('coach_id', req.user.id).eq('client_id', clientId).maybeSingle();
+    res.json({ notes: data || null });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    const { content } = req.body;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data, error } = await supabase.from('coach_notes').upsert({
+      coach_id: req.user.id, client_id: clientId, content: content || '',
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'coach_id,client_id' }).select().maybeSingle();
+    if (error) throw error;
+    res.json({ ok: true, notes: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Coach session feedback ────────────────────────────
+app.get('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data, error } = await supabase.from('coach_session_feedback')
+      .select('id, feedback_text, session_log_id, is_general, created_at, updated_at')
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ feedback: data || [] });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { feedback_text, session_log_id, is_general, visible_to_client } = req.body;
+    const text = (feedback_text || '').toString().trim();
+    if (!text) return res.status(400).json({ error: 'empty_feedback' });
+    if (text.length > 1000) return res.status(400).json({ error: 'too_long' });
+    const row = {
+      coach_id: req.user.id,
+      client_id: clientId,
+      feedback_text: text,
+      session_log_id: session_log_id || null,
+      is_general: !!is_general,
+      visible_to_client: !!visible_to_client,
+    };
+    const { data, error } = await supabase.from('coach_session_feedback').insert(row).select().maybeSingle();
+    if (error) throw error;
+    res.json({ ok: true, feedback: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.patch('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { feedbackId } = req.params;
+    const { feedback_text, visible_to_client } = req.body || {};
+    const { data: existing } = await supabase.from('coach_session_feedback')
+      .select('id, coach_id').eq('id', feedbackId).maybeSingle();
+    if (!existing || existing.coach_id !== req.user.id) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    const patch = { updated_at: new Date().toISOString() };
+    if (typeof feedback_text === 'string') {
+      const text = feedback_text.trim();
+      if (!text) return res.status(400).json({ error: 'empty_feedback' });
+      if (text.length > 1000) return res.status(400).json({ error: 'too_long' });
+      patch.feedback_text = text;
+    }
+    if (typeof visible_to_client === 'boolean') {
+      patch.visible_to_client = visible_to_client;
+    }
+    if (Object.keys(patch).length === 1) return res.status(400).json({ error: 'no_changes' });
+    const { data, error } = await supabase.from('coach_session_feedback')
+      .update(patch).eq('id', feedbackId).select().maybeSingle();
+    if (error) throw error;
+    res.json({ ok: true, feedback: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.delete('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { feedbackId } = req.params;
+    const { data: existing } = await supabase.from('coach_session_feedback')
+      .select('id, coach_id').eq('id', feedbackId).maybeSingle();
+    if (!existing || existing.coach_id !== req.user.id) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    const { error } = await supabase.from('coach_session_feedback').delete().eq('id', feedbackId);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Client-facing: feedback shared by my coach ────────
+app.get('/api/my-coach-feedback', requireAuth, async (req, res) => {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    if (!link) return res.json({ feedback: [] });
+    const { data, error } = await supabase.from('coach_session_feedback')
+      .select('id, feedback_text, session_log_id, is_general, created_at, updated_at')
+      .eq('coach_id', link.coach_id).eq('client_id', req.user.id).eq('visible_to_client', true)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    const items = data || [];
+    const sessionIds = items.map(f => f.session_log_id).filter(Boolean);
+    let sessionLabelById = {};
+    if (sessionIds.length) {
+      const { data: sessions } = await supabase.from('session_logs')
+        .select('id, day_label, logged_at').in('id', sessionIds);
+      for (const s of (sessions || [])) sessionLabelById[s.id] = { day_label: s.day_label, logged_at: s.logged_at };
+    }
+    res.json({
+      feedback: items.map(f => ({
+        ...f,
+        session_label: f.session_log_id ? (sessionLabelById[f.session_log_id]?.day_label || null) : null,
+        session_logged_at: f.session_log_id ? (sessionLabelById[f.session_log_id]?.logged_at || null) : null,
+      })),
+    });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Coach ↔ Client messaging ──────────────────────────
+app.get('/api/my-coach-messages', requireAuth, async (req, res) => {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    if (!link) return res.json({ messages: [], coach_id: null });
+    // Cap to the most recent 300 messages (fetch newest-first, return oldest-first
+    // for display) so a long-running thread can't pull an unbounded row count.
+    const { data, error } = await supabase.from('coach_messages')
+      .select('id, sender_role, message_text, read_at, created_at')
+      .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .limit(300);
+    if (error) throw error;
+    // Mark unread coach-sent messages as read
+    await supabase.from('coach_messages')
+      .update({ read_at: new Date().toISOString() })
+      .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
+      .eq('sender_role', 'coach').is('read_at', null);
+    res.json({ messages: (data || []).reverse(), coach_id: link.coach_id });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/my-coach-messages', requireAuth, async (req, res) => {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    if (!link) return res.status(403).json({ error: 'no_coach' });
+    const text = (req.body?.message_text || '').toString().trim();
+    if (!text) return res.status(400).json({ error: 'empty_message' });
+    if (text.length > 2000) return res.status(400).json({ error: 'too_long' });
+    const { data, error } = await supabase.from('coach_messages').insert({
+      coach_id: link.coach_id, client_id: req.user.id,
+      sender_role: 'client', message_text: text,
+    }).select().maybeSingle();
+    if (error) throw error;
+    // Push to coach
+    const { data: clientProfile } = await supabase.from('profiles').select('name').eq('id', req.user.id).maybeSingle();
+    const clientName = clientProfile?.name || 'Your client';
+    await sendPushToUser(link.coach_id, 'New client message',
+      `${clientName} sent you a message`,
+      '/app.html?panel=clients').catch(() => {});
+    res.json({ ok: true, message: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    // Cap to the most recent 300 messages (newest-first fetch, oldest-first display).
+    const { data, error } = await supabase.from('coach_messages')
+      .select('id, sender_role, message_text, read_at, created_at')
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .order('created_at', { ascending: false })
+      .limit(300);
+    if (error) throw error;
+    // Mark unread client-sent messages as read
+    await supabase.from('coach_messages')
+      .update({ read_at: new Date().toISOString() })
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .eq('sender_role', 'client').is('read_at', null);
+    res.json({ messages: (data || []).reverse() });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const text = (req.body?.message_text || '').toString().trim();
+    if (!text) return res.status(400).json({ error: 'empty_message' });
+    if (text.length > 2000) return res.status(400).json({ error: 'too_long' });
+    const { data, error } = await supabase.from('coach_messages').insert({
+      coach_id: req.user.id, client_id: clientId,
+      sender_role: 'coach', message_text: text,
+    }).select().maybeSingle();
+    if (error) throw error;
+    const coachName = req.coachProfile?.name || 'Your coach';
+    await sendPushToUser(clientId, 'Coach replied',
+      `${coachName} replied to your message`,
+      '/app.html?panel=my-coach').catch(() => {});
+    res.json({ ok: true, message: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Manual coach reviews (when AI review disabled) ────
+app.post('/api/coach/clients/:clientId/manual-review', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { review_type, review_content, review_period } = req.body || {};
+    if (!['weekly', 'monthly'].includes(review_type)) return res.status(400).json({ error: 'bad_type' });
+    const content = (review_content || '').toString().trim();
+    if (!content) return res.status(400).json({ error: 'empty_content' });
+    if (content.length > 2000) return res.status(400).json({ error: 'too_long' });
+    const period = (review_period || '').toString().slice(0, 32) || null;
+
+    // Upsert on (coach_id, client_id, review_type, review_period) — find first, then update or insert
+    const { data: existing } = await supabase.from('coach_manual_reviews')
+      .select('id').eq('coach_id', req.user.id).eq('client_id', clientId)
+      .eq('review_type', review_type).eq('review_period', period).maybeSingle();
+    let row;
+    if (existing) {
+      const { data, error } = await supabase.from('coach_manual_reviews')
+        .update({ review_content: content, updated_at: new Date().toISOString() })
+        .eq('id', existing.id).select().maybeSingle();
+      if (error) throw error;
+      row = data;
+    } else {
+      const { data, error } = await supabase.from('coach_manual_reviews').insert({
+        coach_id: req.user.id, client_id: clientId,
+        review_type, review_content: content, review_period: period,
+      }).select().maybeSingle();
+      if (error) throw error;
+      row = data;
+    }
+    // Push the client so they see it
+    await sendPushToUser(clientId, 'Coach review',
+      `Your coach posted a ${review_type} review`,
+      '/app.html?panel=coach').catch(() => {});
+    res.json({ ok: true, review: row });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/coach/clients/:clientId/manual-reviews', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data, error } = await supabase.from('coach_manual_reviews')
+      .select('id, review_type, review_content, review_period, created_at, updated_at')
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ reviews: data || [] });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/my-manual-reviews', requireAuth, async (req, res) => {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    if (!link) return res.json({ reviews: [] });
+    const { data, error } = await supabase.from('coach_manual_reviews')
+      .select('id, review_type, review_content, review_period, created_at, updated_at')
+      .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ reviews: data || [] });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Notifications: unread counts ──────────────────────
+app.get('/api/notifications/unread-counts', requireAuth, async (req, res) => {
+  try {
+    const uid = req.user.id;
+    const [profileRes, msgsRes, fbRes, revRes, coachReqRes] = await Promise.all([
+      supabase.from('profiles').select('account_type, coach_plan_status').eq('id', uid).maybeSingle(),
+      supabase.from('coach_messages').select('id', { count: 'exact', head: true })
+        .eq('client_id', uid).eq('sender_role', 'coach').is('read_at', null),
+      supabase.from('coach_session_feedback').select('id', { count: 'exact', head: true })
+        .eq('client_id', uid).eq('visible_to_client', true).eq('seen_by_client', false),
+      supabase.from('coach_manual_reviews').select('id', { count: 'exact', head: true })
+        .eq('client_id', uid).eq('seen_by_client', false),
+      supabase.from('coach_clients').select('id', { count: 'exact', head: true })
+        .eq('client_id', uid).eq('status', 'pending'),
+    ]);
+
+    const out = {
+      coach_messages_unread: msgsRes.count || 0,
+      coach_feedback_unread: fbRes.count || 0,
+      coach_review_unread: revRes.count || 0,
+      coach_requests_pending: coachReqRes.count || 0,
+    };
+
+    const profile = profileRes.data;
+    const isCoach = profile?.account_type === 'coach' && ['active', 'trial'].includes(profile?.coach_plan_status);
+
+    if (isCoach) {
+      const fortyEightHoursAgoIso = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      const fortyEightHoursAgoDateStr = fortyEightHoursAgoIso.split('T')[0];
+
+      // Active client IDs to scope activity queries
+      const { data: links } = await supabase.from('coach_clients')
+        .select('client_id').eq('coach_id', uid).eq('status', 'active');
+      const clientIds = (links || []).map(l => l.client_id).filter(Boolean);
+
+      const [coachMsgsRes, newConnRes, sessionsRes, prsRes, metricsRes, convRes, weeklyRes, monthlyRes, manualRes] = await Promise.all([
+        supabase.from('coach_messages').select('client_id')
+          .eq('coach_id', uid).eq('sender_role', 'client').is('read_at', null),
+        supabase.from('coach_clients').select('id', { count: 'exact', head: true })
+          .eq('coach_id', uid).eq('status', 'active').eq('coach_seen', false),
+        clientIds.length
+          ? supabase.from('session_logs').select('user_id').in('user_id', clientIds).gte('logged_at', fortyEightHoursAgoDateStr)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('personal_records').select('user_id').in('user_id', clientIds).gte('achieved_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('body_metrics').select('user_id').in('user_id', clientIds).gte('logged_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('chat_conversations').select('user_id').in('user_id', clientIds).gte('created_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('weekly_reviews').select('user_id').in('user_id', clientIds).gte('created_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('monthly_reviews').select('user_id').in('user_id', clientIds).gte('generated_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('coach_manual_reviews').select('client_id').eq('coach_id', uid).in('client_id', clientIds).gte('created_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+      ]);
+
+      const byClient = {};
+      for (const row of (coachMsgsRes.data || [])) {
+        byClient[row.client_id] = (byClient[row.client_id] || 0) + 1;
+      }
+
+      const activityByClient = {};
+      const bump = (cid, key) => {
+        if (!cid) return;
+        if (!activityByClient[cid]) activityByClient[cid] = { workouts: 0, prs: 0, metrics: 0, ai: 0 };
+        activityByClient[cid][key]++;
+      };
+      for (const r of (sessionsRes.data || [])) bump(r.user_id, 'workouts');
+      for (const r of (prsRes.data || [])) bump(r.user_id, 'prs');
+      for (const r of (metricsRes.data || [])) bump(r.user_id, 'metrics');
+      for (const r of (convRes.data || [])) bump(r.user_id, 'ai');
+      for (const r of (weeklyRes.data || [])) bump(r.user_id, 'ai');
+      for (const r of (monthlyRes.data || [])) bump(r.user_id, 'ai');
+      for (const r of (manualRes.data || [])) bump(r.client_id, 'ai');
+
+      out.client_messages_unread = (coachMsgsRes.data || []).length;
+      out.client_messages_by_client = byClient;
+      out.new_client_connections = newConnRes.count || 0;
+      out.client_new_activity = activityByClient;
+    }
+
+    res.json(out);
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/notifications/mark-seen', requireAuth, async (req, res) => {
+  try {
+    const { type } = req.body || {};
+    const uid = req.user.id;
+    if (type === 'coach_messages') {
+      await supabase.from('coach_messages')
+        .update({ read_at: new Date().toISOString() })
+        .eq('client_id', uid).eq('sender_role', 'coach').is('read_at', null);
+    } else if (type === 'coach_feedback') {
+      await supabase.from('coach_session_feedback')
+        .update({ seen_by_client: true })
+        .eq('client_id', uid).eq('seen_by_client', false);
+    } else if (type === 'coach_review') {
+      await supabase.from('coach_manual_reviews')
+        .update({ seen_by_client: true })
+        .eq('client_id', uid).eq('seen_by_client', false);
+    } else if (type === 'client_connection') {
+      await supabase.from('coach_clients')
+        .update({ coach_seen: true })
+        .eq('coach_id', uid).eq('status', 'active').eq('coach_seen', false);
+    } else {
+      return res.status(400).json({ error: 'bad_type' });
+    }
+    res.json({ ok: true });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/notifications/mark-client-messages-seen/:clientId', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    await supabase.from('coach_messages')
+      .update({ read_at: new Date().toISOString() })
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .eq('sender_role', 'client').is('read_at', null);
+    res.json({ ok: true });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.patch('/api/coach/clients/:clientId/review-settings', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { post_workout_checkin_enabled, weekly_review_enabled, monthly_review_enabled } = req.body;
+    const row = {
+      coach_id: req.user.id,
+      client_id: clientId,
+      updated_at: new Date().toISOString(),
+    };
+    if (typeof post_workout_checkin_enabled === 'boolean') row.post_workout_checkin_enabled = post_workout_checkin_enabled;
+    if (typeof weekly_review_enabled === 'boolean') row.weekly_review_enabled = weekly_review_enabled;
+    if (typeof monthly_review_enabled === 'boolean') row.monthly_review_enabled = monthly_review_enabled;
+    const { data, error } = await supabase.from('coach_ai_review_settings')
+      .upsert(row, { onConflict: 'coach_id,client_id' }).select().maybeSingle();
+    if (error) throw error;
+    res.json({ ok: true, settings: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Programmes ────────────────────────────────────────
+app.get('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { data } = await supabase.from('coach_programmes')
+      .select('*').eq('coach_id', req.user.id).order('updated_at', { ascending: false });
+    res.json({ programmes: data || [] });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { client_id, name, programme_data, nutrition_data, programme_type, is_template } = req.body;
+    if (!name) return res.status(400).json({ error: 'Missing name' });
+    const ptype = programme_type || 'workout';
+
+    if (client_id && !is_template) {
+      if (!await verifyClientConnection(req.user.id, client_id)) {
+        return res.status(403).json({ error: 'no_connection' });
+      }
+    }
+
+    const row = {
+      coach_id: req.user.id,
+      client_id: client_id || null,
+      name: name.slice(0, 200),
+      is_template: !!is_template,
+      programme_type: ptype,
+      programme_data: programme_data || {},
+      nutrition_data: nutrition_data || null,
+      assigned_at: (client_id && !is_template) ? new Date().toISOString() : null,
+      updated_at: new Date().toISOString(),
+    };
+    const { data, error } = await supabase.from('coach_programmes').insert(row).select().maybeSingle();
+    if (error) throw error;
+
+    // Workout assignment → write workout_plan into the client's live plan
+    if (client_id && !is_template && ptype !== 'nutrition') {
+      await sendPushToUser(client_id, 'New programme assigned',
+        `Your coach has assigned you a new programme: ${name}`,
+        '/app.html?panel=workout').catch(() => {});
+
+      // Also update the client's actual plan so it shows in their workout panel
+      const coachPlanData = {
+        days: (programme_data?.sessions || []).map((s, i) => ({
+          day_index: i,
+          day_name: s.name || `Day ${i + 1}`,
+          label: s.name || `Day ${i + 1}`,
+          coach_note: s.note || null,
+          exercises: (s.exercises || []).map(e => ({
+            name: e.name,
+            sets: e.sets,
+            reps: e.reps,
+            rest: e.rpe || e.weight || null,
+            note: `${e.rpe ? 'RPE ' + e.rpe : ''}${e.weight ? e.weight : ''}`.trim() || null,
+          }))
+        })),
+        coach_assigned: true,
+        coach_name: req.coachProfile.name || 'Your coach',
+        programme_name: name,
+      };
+
+      // Get existing plan to update or create new
+      const { data: existingPlan } = await supabase.from('plans')
+        .select('id').eq('user_id', client_id)
+        .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+
+      if (existingPlan?.id) {
+        await supabase.from('plans').update({
+          workout_plan: coachPlanData,
+          translations: {},
+          generated_at: new Date().toISOString(),
+        }).eq('id', existingPlan.id);
+      } else {
+        await supabase.from('plans').insert({
+          user_id: client_id,
+          workout_plan: coachPlanData,
+          generated_at: new Date().toISOString(),
+        });
+      }
+    }
+
+    // Nutrition assignment → write nutrition_plan into the client's live plan
+    if (client_id && !is_template && nutrition_data && (ptype === 'nutrition' || ptype === 'both')) {
+      const coachName = req.coachProfile.coach_title || req.coachProfile.name || 'Your coach';
+      const { data: existingPlanN } = await supabase.from('plans')
+        .select('id, nutrition_plan').eq('user_id', client_id)
+        .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+      const prevN = existingPlanN?.nutrition_plan || null;
+      // Preserve the original AI nutrition so "Reset to AI plan" can restore it.
+      const aiBackup = prevN ? (prevN.coach_assigned ? (prevN._ai_backup || null) : prevN) : null;
+      const liveNutrition = {
+        ...nutrition_data,
+        coach_assigned: true,
+        coach_name: coachName,
+        assigned_at: new Date().toISOString(),
+        _ai_backup: aiBackup,
+      };
+      if (existingPlanN?.id) {
+        await supabase.from('plans').update({
+          nutrition_plan: liveNutrition,
+          translations: {},
+          generated_at: new Date().toISOString(),
+        }).eq('id', existingPlanN.id);
+      } else {
+        await supabase.from('plans').insert({
+          user_id: client_id,
+          nutrition_plan: liveNutrition,
+          generated_at: new Date().toISOString(),
+        });
+      }
+      await sendPushToUser(client_id, 'Nutrition plan updated',
+        'Your coach has updated your nutrition plan',
+        '/app.html?panel=nutrition').catch(() => {});
+    }
+
+    res.json({ ok: true, programme: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// FIX 7: generate a weekly shopping list from a coach-built nutrition plan's meals.
+// Called from the coach nutrition builder when the "Include shopping list" toggle is on.
+// Returns plain-text grouped list which is stored on nutrition_data.shopping_list and
+// surfaced in the client's Food panel.
+app.post('/api/coach/generate-shopping-list', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { meals, client_name } = req.body || {};
+    if (!Array.isArray(meals) || !meals.length) {
+      return res.status(400).json({ error: 'no_meals', message: 'No meals to build a shopping list from.' });
+    }
+    const mealsForPrompt = meals.map(m => ({
+      name: m.name || '',
+      foods: m.foods || m.note || m.notes || '',
+      kcal: m.kcal != null ? m.kcal : m.calories,
+      protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g,
+    }));
+    const prompt = `Based on these meals for a client's weekly nutrition plan, generate a practical weekly shopping list grouped by category (Proteins, Vegetables, Fruits, Grains/Carbs, Dairy, Fats/Oils, Other). Assume a full 7-day week and be specific with quantities where possible. Return ONLY the shopping list as plain text: each category as an UPPERCASE heading on its own line, followed by "- item (quantity)" bullet lines. No preamble, no closing remarks.\n\nMeals: ${JSON.stringify(mealsForPrompt)}`;
+    const message = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const shopping_list = (message.content?.[0]?.text || '').trim();
+    if (!shopping_list) return res.status(500).json({ error: 'generation_failed' });
+    res.json({ shopping_list });
+  } catch (err) {
+    console.error('generate-shopping-list error:', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { programmeId } = req.params;
+    const { name, programme_data } = req.body;
+    const update = { updated_at: new Date().toISOString() };
+    if (typeof name === 'string') update.name = name.slice(0, 200);
+    if (programme_data) update.programme_data = programme_data;
+    const { data, error } = await supabase.from('coach_programmes')
+      .update(update).eq('id', programmeId).eq('coach_id', req.user.id).select().maybeSingle();
+    if (error) throw error;
+    if (data?.client_id) {
+      await sendPushToUser(data.client_id, 'Programme updated',
+        'Your coach has updated your programme.', '/app.html?panel=workout').catch(() => {});
+
+      // Update client's actual plan
+      if (programme_data) {
+        const updatedPlanData = {
+          days: (programme_data?.sessions || []).map((s, i) => ({
+            day_index: i,
+            day_name: s.name || `Day ${i + 1}`,
+            label: s.name || `Day ${i + 1}`,
+            coach_note: s.note || null,
+            exercises: (s.exercises || []).map(e => ({
+              name: e.name, sets: e.sets, reps: e.reps,
+              rest: e.rpe || e.weight || null,
+            }))
+          })),
+          coach_assigned: true,
+          coach_name: req.coachProfile.name || 'Your coach',
+          programme_name: data.name,
+        };
+        const { data: existingPlan } = await supabase.from('plans')
+          .select('id').eq('user_id', data.client_id)
+          .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+        if (existingPlan?.id) {
+          await supabase.from('plans').update({
+            workout_plan: updatedPlanData, translations: {},
+            generated_at: new Date().toISOString(),
+          }).eq('id', existingPlan.id);
+        }
+      }
+    }
+    res.json({ ok: true, programme: data });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.delete('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { programmeId } = req.params;
+    await supabase.from('coach_programmes')
+      .delete().eq('id', programmeId).eq('coach_id', req.user.id);
+    res.json({ ok: true });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Returns the client's current live nutrition plan (coach-assigned or AI).
+app.get('/api/coach/clients/:clientId/nutrition-plan', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: planRow } = await supabase.from('plans')
+      .select('nutrition_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    res.json({ nutrition_plan: planRow?.nutrition_plan || null });
+  } catch(err) {
+    console.error('[nutrition-plan GET]', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Restores the client's AI nutrition plan and removes the coach's nutrition programme.
+app.post('/api/coach/clients/:clientId/reset-nutrition', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: planRow } = await supabase.from('plans')
+      .select('id, nutrition_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const restored = planRow?.nutrition_plan?._ai_backup || null;
+    if (planRow?.id) {
+      await supabase.from('plans').update({
+        nutrition_plan: restored,
+        translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', planRow.id);
+    }
+    await supabase.from('coach_programmes')
+      .delete().eq('coach_id', req.user.id).eq('client_id', clientId).eq('programme_type', 'nutrition');
+    await sendPushToUser(clientId, 'Nutrition plan reset',
+      'Your coach reset your nutrition plan to the AI plan.',
+      '/app.html?panel=nutrition').catch(() => {});
+    res.json({ ok: true, nutrition_plan: restored });
+  } catch(err) {
+    console.error('[reset-nutrition]', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Client-facing endpoints ───────────────────────────
+app.get('/api/my-coach', requireAuth, async (req, res) => {
+  try {
+    // Active coach
+    const { data: link } = await supabase.from('coach_clients')
+      .select('id, coach_id, connected_at, status')
+      .eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    // Pending request (most recent)
+    const { data: pending } = await supabase.from('coach_clients')
+      .select('id, coach_id, created_at, status')
+      .eq('client_id', req.user.id).eq('status', 'pending').order('created_at', { ascending: false }).limit(1).maybeSingle();
+
+    let coach = null;
+    let pendingCoach = null;
+    if (link?.coach_id) {
+      const { data: coachProfile } = await supabase.from('profiles')
+        .select('name, coach_title, coach_bio').eq('id', link.coach_id).maybeSingle();
+      coach = { coach_id: link.coach_id, connected_at: link.connected_at, ...coachProfile };
+    }
+    if (pending?.coach_id) {
+      const { data: coachProfile } = await supabase.from('profiles')
+        .select('name, coach_title, coach_bio').eq('id', pending.coach_id).maybeSingle();
+      pendingCoach = { connection_id: pending.id, coach_id: pending.coach_id, requested_at: pending.created_at, ...coachProfile };
+    }
+    res.json({ coach, pending: pendingCoach });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Lightweight check used by the Account panel every time it opens — returns the most recent
+// pending coach connection request for this user (or { pending: false }).
+app.get('/api/my-pending-coach-request', requireAuth, async (req, res) => {
+  try {
+    const { data: row } = await supabase.from('coach_clients')
+      .select('id, coach_id, created_at')
+      .eq('client_id', req.user.id)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!row) return res.json({ pending: false });
+    const { data: coachProfile } = await supabase.from('profiles')
+      .select('name, coach_title, coach_bio').eq('id', row.coach_id).maybeSingle();
+    res.json({
+      pending: true,
+      coach: {
+        id: row.coach_id,
+        name: coachProfile?.name || null,
+        title: coachProfile?.coach_title || null,
+        bio: coachProfile?.coach_bio || null,
+        connection_id: row.id,
+        requested_at: row.created_at,
+      }
+    });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/coach-connection/:connectionId/respond', requireAuth, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+    const { action } = req.body;
+    if (!['accept','decline'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
+
+    const { data: link } = await supabase.from('coach_clients')
+      .select('*').eq('id', connectionId).eq('client_id', req.user.id).eq('status', 'pending').maybeSingle();
+    if (!link) return res.status(404).json({ error: 'Not found' });
+
+    if (action === 'accept') {
+      await supabase.from('coach_clients').update({
+        status: 'active', connected_at: new Date().toISOString(),
+        coach_seen: false,
+      }).eq('id', connectionId);
+      // Default review settings (enabled)
+      await supabase.from('coach_ai_review_settings').upsert({
+        coach_id: link.coach_id, client_id: req.user.id,
+        post_workout_checkin_enabled: true,
+        weekly_review_enabled: true,
+        monthly_review_enabled: true,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'coach_id,client_id' });
+      await sendPushToUser(link.coach_id, 'Client connected',
+        'A client has accepted your connection request.',
+        '/app.html?panel=clients').catch(() => {});
+      // Auto-generate the coach's private client overview in the background (do not await)
+      generateClientSummary(link.coach_id, req.user.id).catch(e =>
+        console.warn('[summary] generation failed:', e.message));
+    } else {
+      await supabase.from('coach_clients').update({
+        status: 'disconnected', disconnected_at: new Date().toISOString()
+      }).eq('id', connectionId);
+      await sendPushToUser(link.coach_id, 'Connection declined',
+        'A client declined your connection request.',
+        '/app.html?panel=clients').catch(() => {});
+    }
+    res.json({ ok: true, action });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/coach-connection/disconnect', requireAuth, async (req, res) => {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('id, coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    if (!link) return res.status(404).json({ error: 'No active coach' });
+    await supabase.from('coach_clients').update({
+      status: 'disconnected', disconnected_at: new Date().toISOString()
+    }).eq('id', link.id);
+    await sendPushToUser(link.coach_id, 'Client disconnected',
+      'A client has ended your coaching connection.',
+      '/app.html?panel=clients').catch(() => {});
+    res.json({ ok: true });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Commission ────────────────────────────────────────
+app.get('/api/coach/commissions', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+    const [thisMonthRes, allTimeRes, pendingRes, clientsRes] = await Promise.all([
+      supabase.from('coach_commissions').select('commission_amount').eq('coach_id', req.user.id).gte('payment_date', monthStart),
+      supabase.from('coach_commissions').select('commission_amount').eq('coach_id', req.user.id),
+      supabase.from('coach_commissions').select('commission_amount').eq('coach_id', req.user.id).eq('payout_status', 'pending'),
+      supabase.from('coach_clients').select('client_id').eq('coach_id', req.user.id).eq('status', 'active'),
+    ]);
+
+    const sum = (rows) => (rows || []).reduce((acc, r) => acc + (parseFloat(r.commission_amount) || 0), 0);
+
+    // Active commission-generating clients
+    const clientIds = (clientsRes.data || []).map(r => r.client_id).filter(Boolean);
+    let clientList = [];
+    if (clientIds.length) {
+      const { data: profs } = await supabase.from('profiles')
+        .select('id, name, subscription_tier').in('id', clientIds);
+      clientList = (profs || []).map(p => ({
+        id: p.id,
+        name: p.name,
+        tier: p.subscription_tier,
+        commission_rate: req.coachProfile.coach_commission_rate,
+      }));
+    }
+
+    res.json({
+      this_month: sum(thisMonthRes.data),
+      all_time: sum(allTimeRes.data),
+      pending: sum(pendingRes.data),
+      clients: clientList,
+    });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Seat count ────────────────────────────────────────
+app.get('/api/coach/seat-count', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const used = await countActiveClients(req.user.id);
+    const plan = req.coachProfile.coach_plan;
+    const limit = COACH_PLAN_CONFIG[plan]?.seatLimit ?? 10;
+    res.json({
+      active: used,
+      limit: limit === Infinity ? null : limit,
+      plan,
+    });
+  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Cron — inactive client check ──────────────────────
+// Call from Railway cron daily; sends a single push to coaches whose clients
+// have been inactive for exactly 5 days. Authenticated with a shared secret.
+app.post('/api/coach/check-inactive-clients', async (req, res) => {
+  try {
+    const secret = req.headers['x-cron-secret'];
+    if (!secret || secret !== process.env.CRON_SECRET) return res.status(401).json({ error: 'Unauthorised' });
+
+    const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000);
+
+    const { data: links } = await supabase.from('coach_clients')
+      .select('coach_id, client_id').eq('status', 'active');
+    let notified = 0;
+    for (const link of (links || [])) {
+      if (!link.client_id) continue;
+      const { data: lastLog } = await supabase.from('workout_logs')
+        .select('created_at').eq('user_id', link.client_id)
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
+      if (!lastLog?.created_at) continue;
+      const ts = new Date(lastLog.created_at).getTime();
+      if (ts < fiveDaysAgo.getTime() && ts >= fiveDaysAgo.getTime() - 24 * 60 * 60 * 1000) {
+        // Last session was between 5 and 6 days ago — single notification
+        const { data: clientProfile } = await supabase.from('profiles').select('name').eq('id', link.client_id).maybeSingle();
+        await sendPushToUser(link.coach_id, 'Client inactive',
+          `${clientProfile?.name || 'A client'} hasn't trained in 5 days.`,
+          `/app.html?panel=clients`).catch(() => {});
+        notified++;
+      }
+    }
+    res.json({ ok: true, notified });
+  } catch(err) {
+    console.error('check-inactive-clients error:', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
 });
