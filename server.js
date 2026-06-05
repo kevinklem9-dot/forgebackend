@@ -105,6 +105,7 @@ async function getYouTubeVideoId(exerciseName) {
       updated_at: new Date().toISOString()
     }, { onConflict: 'exercise_name' }).then(() => {}).catch(() => {});
 
+    console.log('YouTube found for', exerciseName, ':', result.videoId, '|', result.title);
     return result;
   } catch(e) {
     console.warn('YouTube lookup error:', e.message);
@@ -504,6 +505,7 @@ async function prewarmDetailCache(exercises) {
     'EZ Bar Curl','EZ Bar Skull Crusher',
   ];
   const toFetch = exercises.filter(e => commonNames.some(n => e.name === n) && !_detailCache.has(e.id));
+  console.log('Pre-warming detail cache for', toFetch.length, 'common exercises...');
   // Fetch in small batches of 5 to avoid rate limits
   for (let i = 0; i < toFetch.length; i += 5) {
     const batch = toFetch.slice(i, i + 5);
@@ -517,6 +519,7 @@ async function prewarmDetailCache(exercises) {
     }));
     await new Promise(r => setTimeout(r, 300)); // small delay between batches
   }
+  console.log('Detail cache pre-warmed:', _detailCache.size, 'exercises ready');
 }
 
 // ── PERSISTENT EXERCISE LOOKUP CACHE (Supabase) ──────────────────────
@@ -714,7 +717,6 @@ app.options('*', cors(corsOptions)); // Handle all preflight requests
 // Stripe webhook needs raw body — must come BEFORE express.json()
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
-  // TODO: set STRIPE_WEBHOOK_SECRET env var to whsec_live_... in production Railway
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
   let event;
   try {
@@ -994,7 +996,10 @@ async function requireAuth(req, res, next) {
 function requireAdmin(req, res, next) {
   const adminEmail = process.env.ADMIN_EMAIL;
   if (!adminEmail) return res.status(500).json({ error: 'ADMIN_EMAIL not configured' });
-  if (req.user?.email !== adminEmail) return res.status(403).json({ error: 'Forbidden' });
+  if (req.user?.email !== adminEmail) {
+    console.error('[admin] Unauthorised access attempt');
+    return res.status(403).json({ error: 'Forbidden' });
+  }
   next();
 }
 
@@ -1297,17 +1302,54 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
   };
 
   try {
-    const { data: profile, error: profileErr } = await supabase
+    // `let` so we can reassign `profile` after a self-heal upsert below — the rest of the
+    // function reads `profile` whether it already existed or was just created.
+    let { data: profile, error: profileErr } = await supabase
       .from('profiles')
       .select(PLAN_PROFILE_FIELDS) // only the fields buildPlanPrompt reads — not all 30+ columns
       .eq('id', req.user.id)
       .maybeSingle();
 
-    if (profileErr || !profile) {
-      console.error('Profile fetch error:', profileErr?.message);
-      return sendResponse(404, { error: 'Profile not found. Please try again.' });
+    if (profileErr) {
+      console.error('Profile fetch error:', profileErr.message);
+      return sendResponse(500, { error: 'Internal server error' });
     }
 
+    if (!profile) {
+      // Profile row missing — create it now as a fallback (self-heal) instead of 404ing.
+      const { error: upsertErr } = await supabase
+        .from('profiles')
+        .upsert({
+          id: req.user.id,
+          name: req.user.email?.split('@')[0] || '',
+          subscription_tier: 'iron',
+          subscription_status: 'trial',
+          trial_ends_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date().toISOString()
+        }, { onConflict: 'id' });
+
+      if (upsertErr) {
+        console.error('Profile create error:', upsertErr.message);
+        return sendResponse(500, { error: 'Internal server error' });
+      }
+
+      // Re-fetch after creating, then continue with the same `profile` variable below.
+      const { data: newProfile, error: refetchErr } = await supabase
+        .from('profiles')
+        .select(PLAN_PROFILE_FIELDS)
+        .eq('id', req.user.id)
+        .maybeSingle();
+
+      if (refetchErr || !newProfile) {
+        return sendResponse(500, { error: 'Internal server error' });
+      }
+      profile = newProfile;
+    }
+
+    console.log('=== GENERATE PLAN START ===');
+    console.log('User:', profile.name, '| goal:', profile.goal, '| language:', req.body?.language);
+    console.log('ANTHROPIC_API_KEY set:', !!process.env.ANTHROPIC_API_KEY);
+    console.log('SUPABASE_URL set:', !!process.env.SUPABASE_URL);
 
     const language = req.body?.language || 'en';
 
@@ -1321,12 +1363,14 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
+        console.log(`Attempt ${attempt}: calling Anthropic...`);
         const message = await anthropic.messages.create({
           model: 'claude-haiku-4-5-20251001',
           max_tokens: 8000,
           messages: [{ role: 'user', content: prompt }]
         });
         const raw = message.content[0].text;
+        console.log(`Attempt ${attempt}: Anthropic responded, length:`, raw.length);
 
         // Strip markdown fences
         let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -1380,9 +1424,11 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     }
 
     // Delete any existing plan for this user first (clean slate)
+    console.log('Deleting existing plan...');
     await supabase.from('plans').delete().eq('user_id', req.user.id);
 
     // Save to DB — reset translations cache, store source language
+    console.log('Inserting new plan...');
     const { data, error } = await supabase
       .from('plans')
       .insert({ user_id: req.user.id, workout_plan: plan.workout, nutrition_plan: plan.nutrition, translations: {}, source_language: language || 'en' })
@@ -1393,6 +1439,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       console.error('DB insert error:', error.message, error.details, error.hint);
       throw error;
     }
+    console.log('Plan saved to DB successfully');
 
     // Also save to programmes table (deactivate existing, add new active one)
     const planName = `${profile?.goal || 'My'} Plan — ${new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
@@ -1416,6 +1463,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     // Mark onboarding complete
     await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
 
+    console.log('Plan generated successfully for:', profile.name);
     sendResponse(200, { plan: data });
   } catch (err) {
     console.error('Generate plan error:', err.message);
@@ -1580,6 +1628,7 @@ async function getPlanForLanguage(planRow, lang) {
     if (cached._v === TRANSLATION_CACHE_VERSION) {
       return { workout_plan: cached.workout_plan, nutrition_plan: cached.nutrition_plan };
     }
+    console.log(`Cache for lang=${lang} is version ${cached._v || 1}, current is ${TRANSLATION_CACHE_VERSION} — re-translating...`);
   }
 
   if (lang === 'en') {
@@ -1714,8 +1763,7 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
 
     const { data, error } = await supabase
       .from('profiles')
-      .update(update)
-      .eq('id', req.user.id)
+      .upsert({ id: req.user.id, ...update }, { onConflict: 'id' })
       .select()
       .maybeSingle();
 
@@ -2264,6 +2312,7 @@ app.get('/api/history', requireAuth, async (req, res) => {
 app.get('/api/sessions', requireAuth, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    console.log('[sessions] fetching for user:', req.user.id);
     // ROOT CAUSE OF THE 500: this select used to request `feeling, difficulty`, but
     // session_logs has no such columns (schema: id, user_id, day_index, day_label,
     // logged_at, exercises, created_at). feeling/difficulty are only fed to the
@@ -2278,6 +2327,7 @@ app.get('/api/sessions', requireAuth, async (req, res) => {
       .limit(limit);
     // Log the count (not the full jsonb payload) plus the error so the cause is
     // visible in Railway logs without flooding them on every progress-panel open.
+    console.log('[sessions] query result:', { rows: data?.length ?? 0, error });
     if (error) throw error;
     res.json({ sessions: data || [] });
   } catch (err) {
@@ -2335,6 +2385,7 @@ app.post('/api/bodyweight', requireAuth, async (req, res) => {
   try {
     const { weight_kg } = req.body;
     const w = parseFloat(weight_kg);
+    console.log('[bodyweight] save attempt:', { user_id: req.user.id, weight_kg });
     if (isNaN(w)) return res.status(400).json({ error: 'invalid_weight' });
     const today = new Date().toISOString().split('T')[0];
 
@@ -2365,6 +2416,7 @@ app.post('/api/bodyweight', requireAuth, async (req, res) => {
         .maybeSingle());
     }
 
+    console.log('[bodyweight] save result:', data, error);
     if (error) { console.error('Server error:', error); return res.status(500).json({ error: 'Internal server error' }); }
     res.json({ success: true, entry: data });
   } catch (err) {
@@ -2478,6 +2530,7 @@ app.get('/api/bodyweight', requireAuth, async (req, res) => {
       .order('logged_at', { ascending: true })
       .limit(1825);
 
+    console.log('[bodyweight] fetch for user:', req.user.id, 'rows:', data?.length);
     if (error) throw error;
     res.json({ history: data });
   } catch (err) {
@@ -4122,6 +4175,7 @@ app.post('/api/missions/:missionId/complete', requireAuth, async (req, res) => {
 try {
   const retentionRoutes = require('./routes/retention')(supabase, anthropic);
   app.use('/api', requireAuth, retentionRoutes);
+  console.log('Retention routes loaded OK');
 } catch (err) {
   console.error('Failed to load retention routes:', err.message);
 }
@@ -5341,6 +5395,7 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
     } catch(e) {
       console.warn('[invite] auth.admin.listUsers failed:', e.message);
     }
+    console.log('[invite] existingUser lookup result:', existingUser);
 
     let newLink = null;
 
@@ -5390,6 +5445,7 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
           }).eq('id', existing.id).select().maybeSingle();
           if (updateErr) throw updateErr;
           newLink = updated;
+          console.log('[invite] re-invited disconnected coach_clients row:', newLink?.id);
         }
       }
 
@@ -5404,6 +5460,10 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
           .from('coach_clients').insert(insertRow).select().maybeSingle();
         if (insertErr) throw insertErr;
         newLink = inserted;
+        console.log('[invite] coach_clients insert result:', JSON.stringify(inserted));
+        console.log('[invite] client_id stored:', insertRow.client_id);
+        console.log('[invite] invited_email stored:', insertRow.invited_email);
+        console.log('[invite] created coach_clients row:', newLink?.id, 'for client', existingUser.id);
       }
 
       await sendPushToUser(
@@ -5430,8 +5490,13 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
         .from('coach_clients').insert(insertRow).select().maybeSingle();
       if (insertErr) throw insertErr;
       newLink = inserted;
+      console.log('[invite] coach_clients insert result:', JSON.stringify(inserted));
+      console.log('[invite] client_id stored:', insertRow.client_id);
+      console.log('[invite] invited_email stored:', insertRow.invited_email);
+      console.log('[invite] created coach_clients row:', newLink?.id, 'for email', cleanEmail);
       // Email send is wired up to existing email system when available.
       // For now we log and rely on the recipient signing up — they'll see the invite on first login.
+      console.log(`[coach invite] new-user invite recorded for ${cleanEmail} from coach ${req.user.id}`);
       return res.json({ type: 'new', message: 'Invitation recorded. They\'ll see it when they join FORGE.', connection_id: newLink.id });
     }
   } catch(err) {
@@ -6326,6 +6391,7 @@ app.get('/api/my-pending-coach-request', requireAuth, async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
+    console.log('[my-pending] result for user', req.user.id, ':', JSON.stringify(row));
     if (!row) return res.json({ pending: false });
     const { data: coachProfile } = await supabase.from('profiles')
       .select('name, coach_title, coach_bio').eq('id', row.coach_id).maybeSingle();
