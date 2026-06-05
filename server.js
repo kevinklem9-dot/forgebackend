@@ -1326,7 +1326,10 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
           subscription_status: 'trial',
           trial_ends_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
           created_at: new Date().toISOString()
-        }, { onConflict: 'id' });
+        // FIX 2: ignoreDuplicates so a transient read-miss on an EXISTING profile can't
+        // overwrite a real trial_ends_at / paid status with a fresh 7-day trial. On conflict
+        // this becomes a no-op and the re-fetch below picks up the true row.
+        }, { onConflict: 'id', ignoreDuplicates: true });
 
       if (upsertErr) {
         console.error('Profile create error:', upsertErr.message);
@@ -1345,6 +1348,32 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       }
       profile = newProfile;
     }
+
+    // ── TRIAL BACKSTOP (FIX 2) ────────────────────────────────────────────────
+    // New-user race: the profile row can be created by the DB trigger before the signup
+    // handler's trial_ends_at write lands (or if that write failed), leaving trial_ends_at
+    // NULL — which made some brand-new users see "trial ended" on first load. Set a fresh
+    // 7-day trial ONLY when trial_ends_at is NULL and the account is still a trial (or has no
+    // status yet). We deliberately do NOT touch a trial_ends_at that is merely in the past —
+    // that is a legitimately ENDED trial, and re-granting it would bypass the paywall (see the
+    // loadSubscription entitlement guard).
+    try {
+      const { data: trialCheck } = await supabase
+        .from('profiles')
+        .select('trial_ends_at, subscription_status')
+        .eq('id', req.user.id)
+        .maybeSingle();
+      if (trialCheck && !trialCheck.trial_ends_at &&
+          (!trialCheck.subscription_status || trialCheck.subscription_status === 'trial')) {
+        await supabase.from('profiles')
+          .update({
+            trial_ends_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+            subscription_status: 'trial',
+            subscription_tier: 'iron'
+          })
+          .eq('id', req.user.id);
+      }
+    } catch (e) { console.error('Trial backstop check failed:', e.message); }
 
     console.log('=== GENERATE PLAN START ===');
     console.log('User:', profile.name, '| goal:', profile.goal, '| language:', req.body?.language);
@@ -2358,16 +2387,25 @@ app.get('/api/prs/search', requireAuth, async (req, res) => {
   try {
     const q = (req.query.q || '').toString().trim();
     if (!q) return res.json({ prs: [] });
-    // FIX 5: tolerant multi-word matching. Normalise the query, split into words, and
-    // match ANY word via OR(ilike) so "benchpress" → bench OR press finds "Bench Press".
+    // FIX 5: tolerant matching. Normalise the query, split into words, and match ANY word
+    // (and its singular/stem) via OR(ilike) so "benchpress" → bench OR press finds "Bench
+    // Press", and a plural like "curls" → "curl" finds "Barbell Curl". The frontend has a
+    // Levenshtein fallback for typos when this returns nothing.
     const normalised = q.toLowerCase().replace(/\s+/g, ' ').trim().replace(/[^a-z0-9 ]/g, '');
     const words = normalised.split(' ').filter(w => w.length > 1);
+    const stemWord = (w) => w.replace(/ies$/, 'y').replace(/ing$/, '').replace(/ed$/, '').replace(/es$/, '').replace(/s$/, '');
+    const terms = new Set();
+    words.forEach(w => {
+      terms.add(w);
+      const s = stemWord(w);
+      if (s.length >= 3 && s !== w) terms.add(s);
+    });
     let prQuery = supabase
       .from('personal_records')
       .select('exercise_name, weight_kg, reps, est_1rm, achieved_at')
       .eq('user_id', req.user.id);
-    prQuery = words.length
-      ? prQuery.or(words.map(w => `exercise_name.ilike.%${w}%`).join(','))
+    prQuery = terms.size
+      ? prQuery.or([...terms].map(w => `exercise_name.ilike.%${w}%`).join(','))
       : prQuery.ilike('exercise_name', `%${q}%`);
     const { data, error } = await prQuery
       .order('achieved_at', { ascending: false })
