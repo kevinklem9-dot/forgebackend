@@ -1289,53 +1289,125 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
     // Welcome email — fire-and-forget. Never awaited; never blocks/fails the signup response.
     sendEmail(
       email,
-      'Welcome to FORGE',
+      `Welcome to FORGE, ${name}.`,
       `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-  body { margin:0; padding:0; background:#0a0a0a; font-family:'Helvetica Neue',Arial,sans-serif; }
-  .wrap { max-width:560px; margin:0 auto; padding:40px 24px; }
-  .logo { font-size:36px; font-weight:900; color:#e8ff3d; letter-spacing:3px; margin-bottom:4px; }
-  .tagline { font-size:11px; color:#555; letter-spacing:2px; text-transform:uppercase; margin-bottom:32px; }
-  .card { background:#111; border-radius:16px; padding:28px; margin-bottom:20px; }
-  h1 { font-size:22px; color:#f0f0f0; font-weight:600; margin:0 0 12px; }
-  p { font-size:14px; color:#888; line-height:1.7; margin:0 0 16px; }
-  .step { display:flex; gap:12px; margin-bottom:16px; align-items:flex-start; }
-  .step-num { background:#e8ff3d; color:#000; font-weight:700; font-size:12px; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
-  .step-text { font-size:13px; color:#aaa; line-height:1.5; padding-top:3px; }
-  .step-text strong { color:#f0f0f0; }
-  .cta { display:block; background:#e8ff3d; color:#000; text-align:center; font-weight:700; font-size:14px; letter-spacing:1px; text-transform:uppercase; padding:16px 24px; border-radius:12px; text-decoration:none; margin:24px 0; }
-  .footer { font-size:11px; color:#333; text-align:center; margin-top:32px; line-height:1.8; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#0a0a0a;font-family:-apple-system,
+    'Helvetica Neue',Arial,sans-serif}
+  .wrap{max-width:520px;margin:0 auto;padding:32px 20px}
+  .logo{font-size:42px;font-weight:900;color:#e8ff3d;
+    letter-spacing:4px;line-height:1}
+  .logo-sub{font-size:10px;color:#444;letter-spacing:3px;
+    text-transform:uppercase;margin-top:4px;
+    margin-bottom:40px}
+  .headline{font-size:24px;font-weight:700;color:#f0f0f0;
+    line-height:1.3;margin-bottom:12px}
+  .body{font-size:15px;color:#777;line-height:1.7;
+    margin-bottom:32px}
+  .steps{background:#111;border-radius:14px;
+    padding:24px;margin-bottom:28px}
+  .step{display:flex;gap:14px;margin-bottom:20px;
+    align-items:flex-start}
+  .step:last-child{margin-bottom:0}
+  .num{background:#e8ff3d;color:#000;font-weight:800;
+    font-size:11px;width:22px;height:22px;
+    border-radius:50%;display:flex;align-items:center;
+    justify-content:center;flex-shrink:0;margin-top:2px}
+  .step-body{flex:1}
+  .step-title{font-size:14px;font-weight:600;
+    color:#f0f0f0;margin-bottom:3px}
+  .step-desc{font-size:13px;color:#666;line-height:1.5}
+  .cta{display:block;background:#e8ff3d;color:#000;
+    text-align:center;font-weight:700;font-size:13px;
+    letter-spacing:1.5px;text-transform:uppercase;
+    padding:16px;border-radius:12px;
+    text-decoration:none;margin-bottom:24px}
+  .trial-note{background:#111;border-radius:10px;
+    padding:14px 16px;font-size:12px;color:#555;
+    text-align:center;line-height:1.6;
+    margin-bottom:32px}
+  .trial-note span{color:#e8ff3d}
+  .footer{font-size:11px;color:#333;text-align:center;
+    line-height:2}
+  .footer a{color:#444;text-decoration:none}
+  hr{border:none;border-top:1px solid #1a1a1a;
+    margin:0 0 24px}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="logo">FORGE</div>
-  <div class="tagline">AI Performance Coach</div>
-  <div class="card">
-    <h1>Welcome, ${name}. Let's get to work.</h1>
-    <p>Your programme is built. Your AI coach is ready. Here's how to get the most out of your trial.</p>
-    <div class="step">
-      <div class="step-num">1</div>
-      <div class="step-text"><strong>Open your coach</strong> — ask it anything. Form, nutrition, when to go heavier. It knows your plan.</div>
-    </div>
-    <div class="step">
-      <div class="step-num">2</div>
-      <div class="step-text"><strong>Log every session</strong> — the app tracks your progress and your coach adjusts the plan based on how you perform.</div>
-    </div>
-    <div class="step">
-      <div class="step-num">3</div>
-      <div class="step-text"><strong>Tell your coach your goals</strong> — want more volume? Less frequency? A complete programme change? Just ask.</div>
-    </div>
-    <a href="https://www.klemforge.com/app.html" class="cta">Open FORGE</a>
-    <p style="font-size:12px;color:#555;text-align:center;margin:0">Your 7-day free trial started today. No charge until it ends.</p>
+  <div class="logo-sub">AI Performance Coach</div>
+  <div class="headline">
+    Welcome, ${name}.<br>Let's get to work.
   </div>
+  <div class="body">
+    Your programme is built around you.
+    Your AI coach knows your goals, your schedule,
+    and your training history. Here's how to
+    make the most of your trial.
+  </div>
+  <div class="steps">
+    <div class="step">
+      <div class="num">1</div>
+      <div class="step-body">
+        <div class="step-title">
+          Talk to your coach</div>
+        <div class="step-desc">
+          Ask it anything — form, nutrition,
+          when to add weight. It can change your
+          exercises, adjust your sets, or rebuild
+          your programme entirely. Just ask.
+        </div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="num">2</div>
+      <div class="step-body">
+        <div class="step-title">
+          Log every session</div>
+        <div class="step-desc">
+          Your coach tracks what you lift and
+          adjusts the plan based on how you
+          perform. The more you log, the smarter
+          it gets.
+        </div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="num">3</div>
+      <div class="step-body">
+        <div class="step-title">
+          Set a daily reminder</div>
+        <div class="step-desc">
+          Go to Account → Workout Reminder and
+          set a time. You'll get a daily push
+          notification so you never miss a
+          session.
+        </div>
+      </div>
+    </div>
+  </div>
+  <a href="https://www.klemforge.com/app.html"
+    class="cta">Open FORGE →</a>
+  <div class="trial-note">
+    Your <span>7-day free trial</span> started
+    today. No card charged until it ends.
+    Cancel anytime.
+  </div>
+  <hr>
   <div class="footer">
     FORGE · AI Performance Coach<br>
-    <a href="https://www.klemforge.com" style="color:#444">klemforge.com</a>
+    <a href="https://www.klemforge.com">
+      klemforge.com</a><br>
+    <span style="color:#222">
+      You received this because you signed up
+      for FORGE.</span>
   </div>
 </div>
 </body>
