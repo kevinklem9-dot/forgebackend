@@ -583,6 +583,30 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ── EMAIL (Resend) ─────────────────────────────────────
+// Transactional email (welcome, referral, etc.) via Resend. Supabase Auth still sends
+// the password-reset + signup-confirmation emails. Defensive require: a missing module
+// or unset RESEND_API_KEY degrades to a logged no-op instead of crashing the server.
+// DEPLOY STEPS: add "resend" to package.json + `npm install`, then set RESEND_API_KEY
+// (and optionally FROM_EMAIL) in the Railway env. Until then, sendEmail() is a no-op.
+let _Resend = null;
+try { _Resend = require('resend').Resend; } catch (e) { console.warn('[email] resend module not installed — transactional emails disabled'); }
+const resend = (_Resend && process.env.RESEND_API_KEY) ? new _Resend(process.env.RESEND_API_KEY) : null;
+const FROM_EMAIL = process.env.FROM_EMAIL || 'noreply@klemforge.com';
+const FROM_NAME = 'FORGE';
+
+async function sendEmail(to, subject, html) {
+  if (!resend) { console.warn('[email] RESEND_API_KEY not set — skipping email:', subject); return false; }
+  try {
+    const { error } = await resend.emails.send({ from: `${FROM_NAME} <${FROM_EMAIL}>`, to, subject, html });
+    if (error) { console.error('[email] Send error:', error); return false; }
+    return true;
+  } catch (err) {
+    console.error('[email] Exception:', err.message);
+    return false;
+  }
+}
+
 // ── BOOT MIGRATIONS (best-effort) ──────────────────────
 // Adds columns newer features need. The Supabase JS client can't run raw DDL, so
 // this calls an optional `run_sql` RPC if the project defines one; if it doesn't,
@@ -607,6 +631,9 @@ const BOOT_MIGRATIONS = [
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_mins int DEFAULT 60`,
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_varies boolean DEFAULT false`,
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_by_day jsonb DEFAULT null`,
+  // Daily workout reminder: preferred LOCAL time ('HH:MM') + IANA timezone. NULL = no reminder.
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS reminder_time text DEFAULT NULL`,
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS reminder_timezone text DEFAULT 'UTC'`,
 ];
 (async () => {
   for (const sql of BOOT_MIGRATIONS) {
@@ -1259,6 +1286,62 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       }
     }
 
+    // Welcome email — fire-and-forget. Never awaited; never blocks/fails the signup response.
+    sendEmail(
+      email,
+      'Welcome to FORGE',
+      `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<style>
+  body { margin:0; padding:0; background:#0a0a0a; font-family:'Helvetica Neue',Arial,sans-serif; }
+  .wrap { max-width:560px; margin:0 auto; padding:40px 24px; }
+  .logo { font-size:36px; font-weight:900; color:#e8ff3d; letter-spacing:3px; margin-bottom:4px; }
+  .tagline { font-size:11px; color:#555; letter-spacing:2px; text-transform:uppercase; margin-bottom:32px; }
+  .card { background:#111; border-radius:16px; padding:28px; margin-bottom:20px; }
+  h1 { font-size:22px; color:#f0f0f0; font-weight:600; margin:0 0 12px; }
+  p { font-size:14px; color:#888; line-height:1.7; margin:0 0 16px; }
+  .step { display:flex; gap:12px; margin-bottom:16px; align-items:flex-start; }
+  .step-num { background:#e8ff3d; color:#000; font-weight:700; font-size:12px; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+  .step-text { font-size:13px; color:#aaa; line-height:1.5; padding-top:3px; }
+  .step-text strong { color:#f0f0f0; }
+  .cta { display:block; background:#e8ff3d; color:#000; text-align:center; font-weight:700; font-size:14px; letter-spacing:1px; text-transform:uppercase; padding:16px 24px; border-radius:12px; text-decoration:none; margin:24px 0; }
+  .footer { font-size:11px; color:#333; text-align:center; margin-top:32px; line-height:1.8; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo">FORGE</div>
+  <div class="tagline">AI Performance Coach</div>
+  <div class="card">
+    <h1>Welcome, ${name}. Let's get to work.</h1>
+    <p>Your programme is built. Your AI coach is ready. Here's how to get the most out of your trial.</p>
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-text"><strong>Open your coach</strong> — ask it anything. Form, nutrition, when to go heavier. It knows your plan.</div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-text"><strong>Log every session</strong> — the app tracks your progress and your coach adjusts the plan based on how you perform.</div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-text"><strong>Tell your coach your goals</strong> — want more volume? Less frequency? A complete programme change? Just ask.</div>
+    </div>
+    <a href="https://www.klemforge.com/app.html" class="cta">Open FORGE</a>
+    <p style="font-size:12px;color:#555;text-align:center;margin:0">Your 7-day free trial started today. No charge until it ends.</p>
+  </div>
+  <div class="footer">
+    FORGE · AI Performance Coach<br>
+    <a href="https://www.klemforge.com" style="color:#444">klemforge.com</a>
+  </div>
+</div>
+</body>
+</html>`
+    ).catch(() => {});
+
     // Return success — user must confirm email before logging in
     res.json({ requires_confirmation: true, email });
   } catch (err) {
@@ -1764,7 +1847,8 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     const allowed = ['name','age','sex','height_cm','weight_kg','goal','experience',
       'days_per_week','preferred_days','equipment','diet_style','diet_restrictions',
       'injuries','target_weight_kg','onboarding_complete','preferred_language','units',
-      'enabled_features','session_duration_mins','session_duration_varies','session_duration_by_day'];
+      'enabled_features','session_duration_mins','session_duration_varies','session_duration_by_day',
+      'reminder_time','reminder_timezone'];
     const update = { updated_at: new Date().toISOString() };
     allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
     // Units may only be 'kg' or 'lbs' — drop anything else so a bad value can't persist.
@@ -1799,13 +1883,15 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     if (error) {
       // If error is about a column the DB doesn't have yet (preferred_days, units, or
       // enabled_features not migrated), retry without it so the rest of the update still lands.
-      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features') || error.message?.includes('session_duration')) {
+      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features') || error.message?.includes('session_duration') || error.message?.includes('reminder_')) {
         delete update.preferred_days;
         delete update.units;
         delete update.enabled_features;
         delete update.session_duration_mins;
         delete update.session_duration_varies;
         delete update.session_duration_by_day;
+        delete update.reminder_time;
+        delete update.reminder_timezone;
         const { data: data2, error: err2 } = await supabase
           .from('profiles').update(update).eq('id', req.user.id).select().maybeSingle();
         if (err2) throw err2;
@@ -6553,6 +6639,52 @@ app.get('/api/coach/seat-count', requireAuth, requireCoach, async (req, res) => 
       plan,
     });
   } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Cron — daily workout reminders ─────────────────────
+// Call every ~5 min from Railway cron. Sends a push to users whose reminder_time
+// (their LOCAL HH:MM) matches the current time in their reminder_timezone, within a
+// 5-min window. Authenticated with the shared x-cron-secret.
+app.post('/api/cron/reminders', async (req, res) => {
+  try {
+    if (req.headers['x-cron-secret'] !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: 'Unauthorised' });
+    }
+    const now = new Date();
+    // Active + trial users with a reminder set (is_frozen filtered in JS for correct NULL handling).
+    const { data: users } = await supabase
+      .from('profiles')
+      .select('id, name, reminder_time, reminder_timezone, is_frozen, subscription_status')
+      .not('reminder_time', 'is', null)
+      .in('subscription_status', ['active', 'trial']);
+
+    let sent = 0;
+    for (const user of users || []) {
+      if (user.is_frozen === true) continue;
+      try {
+        // Current wall-clock time in the user's own timezone (reminder_time is LOCAL).
+        const tz = user.reminder_timezone || 'UTC';
+        const nowLocal = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(now);
+        const [nh, nm] = nowLocal.split(':').map(Number);
+        const [rh, rm] = String(user.reminder_time).split(':').map(Number);
+        if (rh === nh && Math.abs(rm - nm) <= 5) {
+          await sendPushToUser(
+            user.id,
+            'Time to train, ' + (user.name || 'champion'),
+            'Your programme is ready. Open FORGE.',
+            '/app.html'
+          ).catch(() => {});
+          sent++;
+        }
+      } catch (e) {
+        console.error('[reminder]', e.message);
+      }
+    }
+    res.json({ sent });
+  } catch (err) {
+    console.error('reminders cron error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ── Cron — inactive client check ──────────────────────
