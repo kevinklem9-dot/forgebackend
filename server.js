@@ -1291,83 +1291,108 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       email,
       `Welcome to FORGE, ${name}.`,
       `<!DOCTYPE html>
-<html lang="en" style="color-scheme:dark">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark only">
+<meta name="supported-color-schemes" content="dark">
 <title>Welcome to FORGE</title>
+<style>
+:root { color-scheme: dark only; }
+* { -webkit-text-size-adjust: 100%; }
+body, .email-bg {
+  background-color: #0a0a0a !important;
+  color: #f0f0f0 !important;
+}
+.step-card {
+  background-color: #1a1a1a !important;
+  border-color: #333 !important;
+}
+.step-row {
+  border-bottom-color: #2a2a2a !important;
+}
+.body-text { color: #d0d0d0 !important; }
+.muted-text { color: #aaa !important; }
+.accent { color: #e8ff3d !important; }
+.white { color: #ffffff !important; }
+@media (prefers-color-scheme: dark) {
+  body, .email-bg {
+    background-color: #0a0a0a !important;
+  }
+}
+</style>
 </head>
-<body style="margin:0;padding:0;background:#0a0a0a;-webkit-text-size-adjust:100%">
+<body class="email-bg" style="margin:0;padding:0;background-color:#0a0a0a">
 
 <div style="display:none;font-size:1px;color:#0a0a0a;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden">
 Your programme is ready to build. Here's where to start.
 </div>
 
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0a">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="email-bg" style="background-color:#0a0a0a">
 <tr><td align="center" style="padding:40px 20px">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#0a0a0a">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background-color:#0a0a0a">
 
 <!-- HEADER -->
-<tr><td style="padding:36px 24px 32px;text-align:center;border-bottom:1px solid #1a1a1a">
-  <div style="font-family:'Bebas Neue',Georgia,serif;font-size:36px;font-weight:700;color:#e8ff3d;letter-spacing:4px;line-height:1;margin-bottom:6px">FORGE</div>
-  <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#888;letter-spacing:4px;text-transform:uppercase">AI Performance Coach</div>
+<tr><td style="padding:36px 24px 32px;text-align:center;border-bottom:1px solid #333333">
+  <div style="font-family:'Courier New',Courier,monospace;font-size:36px;font-weight:700;color:#e8ff3d !important;letter-spacing:4px;line-height:1;margin-bottom:6px" class="accent">FORGE</div>
+  <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#aaaaaa;letter-spacing:4px;text-transform:uppercase" class="muted-text">AI Performance Coach</div>
 </td></tr>
 
 <!-- HERO -->
-<tr><td style="padding:36px 24px 28px">
-  <div style="font-family:'Bebas Neue',Georgia,serif;font-size:40px;font-weight:700;color:#f0f0f0;letter-spacing:1px;line-height:1;margin-bottom:10px">Welcome, ${name}.</div>
-  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:20px;color:#e8ff3d;font-weight:500;margin-bottom:12px">Let's build something.</div>
-  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;color:#c8c8c8;line-height:1.7"><span style="font-family:'Courier New',Courier,monospace;color:#e8ff3d;font-weight:500">7 days</span> of full access. Here's how to use every one.</div>
+<tr><td style="padding:36px 24px 28px;background-color:#0a0a0a">
+  <div style="font-family:'Courier New',Courier,monospace;font-size:40px;font-weight:700;color:#f0f0f0;letter-spacing:1px;line-height:1;margin-bottom:10px" class="white">Welcome, ${name}.</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:20px;color:#e8ff3d;font-weight:500;margin-bottom:12px" class="accent">Let's build something.</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;color:#d0d0d0;line-height:1.7" class="body-text"><span style="font-family:'Courier New',Courier,monospace;color:#e8ff3d;font-weight:500" class="accent">7 days</span> of full access. Here's how to use every one.</div>
 </td></tr>
 
 <!-- STEPS CARD -->
-<tr><td style="padding:0 24px">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#111111;border:1px solid #222;border-radius:16px;overflow:hidden">
+<tr><td style="padding:0 24px;background-color:#0a0a0a">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="step-card" style="background-color:#1a1a1a;border:1px solid #333333;border-radius:16px">
 
-  <tr><td style="padding:22px 24px;border-bottom:1px solid #1a1a1a">
-    <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#666;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">01</div>
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:600;color:#f0f0f0;margin-bottom:8px">Finish your onboarding</div>
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#bbbbbb;line-height:1.7">If you haven't completed your profile yet — do it now. Your sport, your schedule, your goals, your injury history. The more honest your answers, the sharper your programme. This is the step most people rush. <strong style="color:#f0f0f0;font-weight:600">Don't.</strong></div>
+  <tr><td class="step-row" style="padding:22px 24px;border-bottom:1px solid #2a2a2a">
+    <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#aaaaaa;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px" class="muted-text">01</div>
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:600;color:#f0f0f0;margin-bottom:8px" class="white">Finish your onboarding</div>
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#d0d0d0;line-height:1.7" class="body-text">If you haven't completed your profile yet — do it now. Your sport, your schedule, your goals, your injury history. The more honest your answers, the sharper your programme. This is the step most people rush. <strong style="color:#ffffff;font-weight:600" class="white">Don't.</strong></div>
   </td></tr>
 
-  <tr><td style="padding:22px 24px;border-bottom:1px solid #1a1a1a">
-    <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#666;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">02</div>
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:600;color:#f0f0f0;margin-bottom:8px">Talk to your coach</div>
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#bbbbbb;line-height:1.7">Your AI coach is live the moment onboarding is done. Ask it anything — form, nutrition, when to add weight, how to adjust your plan around an injury. It reads your data and gives you a real answer. <strong style="color:#f0f0f0;font-weight:600">Use it.</strong></div>
+  <tr><td class="step-row" style="padding:22px 24px;border-bottom:1px solid #2a2a2a">
+    <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#aaaaaa;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px" class="muted-text">02</div>
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:600;color:#f0f0f0;margin-bottom:8px" class="white">Talk to your coach</div>
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#d0d0d0;line-height:1.7" class="body-text">Your AI coach is live the moment onboarding is done. Ask it anything — form, nutrition, when to add weight, how to adjust your plan around an injury. It reads your data and gives you a real answer. <strong style="color:#ffffff;font-weight:600" class="white">Use it.</strong></div>
   </td></tr>
 
-  <tr><td style="padding:22px 24px;border-bottom:1px solid #1a1a1a">
-    <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#666;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">03</div>
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:600;color:#f0f0f0;margin-bottom:8px">Log every session</div>
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#bbbbbb;line-height:1.7">Every set you log makes your coach smarter. The programme adapts based on what your data actually shows — not what it guessed about you on day one. <strong style="color:#f0f0f0;font-weight:600">Log everything. Miss nothing.</strong></div>
+  <tr><td class="step-row" style="padding:22px 24px;border-bottom:1px solid #2a2a2a">
+    <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#aaaaaa;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px" class="muted-text">03</div>
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:600;color:#f0f0f0;margin-bottom:8px" class="white">Log every session</div>
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#d0d0d0;line-height:1.7" class="body-text">Every set you log makes your coach smarter. The programme adapts based on what your data actually shows — not what it guessed about you on day one. <strong style="color:#ffffff;font-weight:600" class="white">Log everything. Miss nothing.</strong></div>
   </td></tr>
 
   <tr><td style="padding:22px 24px">
-    <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#666;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">04</div>
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:600;color:#f0f0f0;margin-bottom:8px">Set a daily reminder</div>
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#bbbbbb;line-height:1.7">Go to <span style="font-family:'Courier New',Courier,monospace;color:#e8ff3d;font-size:13px;letter-spacing:0.5px">Account → Workout Reminder</span> and set a time. One push notification a day. The sessions you almost skip are the ones that matter most.</div>
+    <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#aaaaaa;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px" class="muted-text">04</div>
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:600;color:#f0f0f0;margin-bottom:8px" class="white">Set a daily reminder</div>
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#d0d0d0;line-height:1.7" class="body-text">Go to <span style="font-family:'Courier New',Courier,monospace;color:#e8ff3d;font-size:13px;letter-spacing:0.5px" class="accent">Account → Workout Reminder</span> and set a time. One push notification a day. The sessions you almost skip are the ones that matter most.</div>
   </td></tr>
 
 </table>
 </td></tr>
 
 <!-- CTA -->
-<tr><td style="padding:28px 24px 0">
+<tr><td style="padding:28px 24px 0;background-color:#0a0a0a">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-  <tr><td style="background:#e8ff3d;border-radius:10px;text-align:center;padding:18px">
+  <tr><td style="background-color:#e8ff3d;border-radius:10px;text-align:center;padding:18px">
     <a href="https://www.klemforge.com/app.html"
       style="font-family:'Courier New',Courier,monospace;font-size:13px;font-weight:700;color:#000000;text-decoration:none;letter-spacing:2px;text-transform:uppercase;display:block">OPEN FORGE</a>
   </td></tr>
   </table>
-  <div style="text-align:center;margin-top:14px;font-family:'Courier New',Courier,monospace;font-size:10px;color:#666;letter-spacing:1.5px;text-transform:uppercase">7-day free trial &nbsp;·&nbsp; no card charged &nbsp;·&nbsp; cancel anytime</div>
+  <div style="text-align:center;margin-top:14px;font-family:'Courier New',Courier,monospace;font-size:10px;color:#aaaaaa;letter-spacing:1.5px;text-transform:uppercase" class="muted-text">7-day free trial &nbsp;·&nbsp; no card charged &nbsp;·&nbsp; cancel anytime</div>
 </td></tr>
 
 <!-- FOOTER -->
-<tr><td style="padding:40px 24px 36px;border-top:1px solid #1a1a1a;margin-top:40px;text-align:center">
-  <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#666;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">FORGE · AI Performance Coach</div>
-  <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#e8ff3d;letter-spacing:1px;margin-bottom:10px"><a href="https://www.klemforge.com" style="color:#e8ff3d;text-decoration:none">klemforge.com</a></div>
-  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;color:#666">You received this because you signed up for FORGE.</div>
+<tr><td style="padding:40px 24px 36px;border-top:1px solid #333333;text-align:center;background-color:#0a0a0a">
+  <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#aaaaaa;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px" class="muted-text">FORGE · AI Performance Coach</div>
+  <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#e8ff3d;letter-spacing:1px;margin-bottom:10px" class="accent"><a href="https://www.klemforge.com" style="color:#e8ff3d;text-decoration:none">klemforge.com</a></div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;color:#888888" class="muted-text">You received this because you signed up for FORGE.</div>
 </td></tr>
 
 </table>
