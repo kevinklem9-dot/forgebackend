@@ -1291,125 +1291,117 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       email,
       `Welcome to FORGE, ${name}.`,
       `<!DOCTYPE html>
-<html>
+<html lang="en" style="color-scheme:light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{background:#0a0a0a;font-family:-apple-system,
-    'Helvetica Neue',Arial,sans-serif}
-  .wrap{max-width:520px;margin:0 auto;padding:32px 20px}
-  .logo{font-size:42px;font-weight:900;color:#e8ff3d;
-    letter-spacing:4px;line-height:1}
-  .logo-sub{font-size:10px;color:#444;letter-spacing:3px;
-    text-transform:uppercase;margin-top:4px;
-    margin-bottom:40px}
-  .headline{font-size:24px;font-weight:700;color:#f0f0f0;
-    line-height:1.3;margin-bottom:12px}
-  .body{font-size:15px;color:#777;line-height:1.7;
-    margin-bottom:32px}
-  .steps{background:#111;border-radius:14px;
-    padding:24px;margin-bottom:28px}
-  .step{display:flex;gap:14px;margin-bottom:20px;
-    align-items:flex-start}
-  .step:last-child{margin-bottom:0}
-  .num{background:#e8ff3d;color:#000;font-weight:800;
-    font-size:11px;width:22px;height:22px;
-    border-radius:50%;display:flex;align-items:center;
-    justify-content:center;flex-shrink:0;margin-top:2px}
-  .step-body{flex:1}
-  .step-title{font-size:14px;font-weight:600;
-    color:#f0f0f0;margin-bottom:3px}
-  .step-desc{font-size:13px;color:#666;line-height:1.5}
-  .cta{display:block;background:#e8ff3d;color:#000;
-    text-align:center;font-weight:700;font-size:13px;
-    letter-spacing:1.5px;text-transform:uppercase;
-    padding:16px;border-radius:12px;
-    text-decoration:none;margin-bottom:24px}
-  .trial-note{background:#111;border-radius:10px;
-    padding:14px 16px;font-size:12px;color:#555;
-    text-align:center;line-height:1.6;
-    margin-bottom:32px}
-  .trial-note span{color:#e8ff3d}
-  .footer{font-size:11px;color:#333;text-align:center;
-    line-height:2}
-  .footer a{color:#444;text-decoration:none}
-  hr{border:none;border-top:1px solid #1a1a1a;
-    margin:0 0 24px}
-</style>
+<meta name="color-scheme" content="light">
+<!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><![endif]-->
+<title>Welcome to FORGE</title>
 </head>
-<body>
-<div class="wrap">
-  <div class="logo">FORGE</div>
-  <div class="logo-sub">AI Performance Coach</div>
-  <div class="headline">
-    Welcome, ${name}.<br>Let's get to work.
-  </div>
-  <div class="body">
-    Your programme is built around you.
-    Your AI coach knows your goals, your schedule,
-    and your training history. Here's how to
-    make the most of your trial.
-  </div>
-  <div class="steps">
-    <div class="step">
-      <div class="num">1</div>
-      <div class="step-body">
-        <div class="step-title">
-          Talk to your coach</div>
-        <div class="step-desc">
-          Ask it anything — form, nutrition,
-          when to add weight. It can change your
-          exercises, adjust your sets, or rebuild
-          your programme entirely. Just ask.
-        </div>
-      </div>
-    </div>
-    <div class="step">
-      <div class="num">2</div>
-      <div class="step-body">
-        <div class="step-title">
-          Log every session</div>
-        <div class="step-desc">
-          Your coach tracks what you lift and
-          adjusts the plan based on how you
-          perform. The more you log, the smarter
-          it gets.
-        </div>
-      </div>
-    </div>
-    <div class="step">
-      <div class="num">3</div>
-      <div class="step-body">
-        <div class="step-title">
-          Set a daily reminder</div>
-        <div class="step-desc">
-          Go to Account → Workout Reminder and
-          set a time. You'll get a daily push
-          notification so you never miss a
-          session.
-        </div>
-      </div>
-    </div>
-  </div>
-  <a href="https://www.klemforge.com/app.html"
-    class="cta">Open FORGE →</a>
-  <div class="trial-note">
-    Your <span>7-day free trial</span> started
-    today. No card charged until it ends.
-    Cancel anytime.
-  </div>
-  <hr>
-  <div class="footer">
-    FORGE · AI Performance Coach<br>
-    <a href="https://www.klemforge.com">
-      klemforge.com</a><br>
-    <span style="color:#222">
-      You received this because you signed up
-      for FORGE.</span>
-  </div>
+<body style="margin:0;padding:0;background:#ffffff;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">
+
+<!-- Preheader -->
+<div style="display:none;font-size:1px;color:#ffffff;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden">
+Your programme is ready to build. Here's where to start.
 </div>
+
+<!-- Wrapper -->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff">
+<tr><td align="center" style="padding:0">
+
+<!-- Main container -->
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%">
+
+<!-- HEADER -->
+<tr><td style="background:#ffffff;padding:32px 40px 24px 40px;text-align:center">
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:28px;font-weight:700;color:#C8FF00;letter-spacing:0.15em;line-height:1">FORGE</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;color:#999999;letter-spacing:0.2em;text-transform:uppercase;margin-top:6px">AI Performance Coach</div>
+</td></tr>
+
+<!-- Divider -->
+<tr><td style="padding:0 0 0 0">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+  <tr><td style="border-top:1px solid #eeeeee;font-size:0;line-height:0">&nbsp;</td></tr>
+  </table>
+</td></tr>
+
+<!-- HERO -->
+<tr><td style="padding:32px 40px 8px 40px">
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:26px;font-weight:700;color:#1A1A1A;margin-bottom:4px;line-height:1.2">Welcome, ${name}.</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:26px;font-weight:700;color:#C8FF00;margin-bottom:20px;line-height:1.2">Let's build something.</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;color:#444444;line-height:1.6;margin-bottom:28px">You have <strong style="color:#1A1A1A">7 days</strong>. Here's how to make them count.</div>
+</td></tr>
+
+<!-- STEPS CARD -->
+<tr><td style="padding:0 40px 28px 40px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#111111;border-radius:12px">
+<tr><td style="padding:28px 32px">
+
+  <!-- Step 01 -->
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#C8FF00;letter-spacing:0.1em;margin-bottom:2px">01</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#ffffff;margin-bottom:6px">Finish your onboarding</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#AAAAAA;line-height:1.6;margin-bottom:24px">If you haven't completed your profile yet — do it now. Your sport, your schedule, your goals, your injury history. The more honest your answers, the sharper your programme. This is the step most people rush. <strong style="color:#ffffff">Don't.</strong></div>
+
+  <!-- Step 02 -->
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#C8FF00;letter-spacing:0.1em;margin-bottom:2px">02</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#ffffff;margin-bottom:6px">Talk to your coach</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#AAAAAA;line-height:1.6;margin-bottom:24px">Your AI coach is live the moment onboarding is done. Ask it anything — form, nutrition, when to add weight, how to adjust your plan around an injury. It reads your data and gives you a real answer. <strong style="color:#ffffff">Use it.</strong></div>
+
+  <!-- Step 03 -->
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#C8FF00;letter-spacing:0.1em;margin-bottom:2px">03</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#ffffff;margin-bottom:6px">Log every session</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#AAAAAA;line-height:1.6;margin-bottom:24px">Every set you log makes your coach smarter. The programme adapts based on what your data actually shows — not what it guessed about you on day one. <strong style="color:#ffffff">Log everything. Miss nothing.</strong></div>
+
+  <!-- Step 04 -->
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#C8FF00;letter-spacing:0.1em;margin-bottom:2px">04</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#ffffff;margin-bottom:6px">Set a daily reminder</div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#AAAAAA;line-height:1.6">Go to <span style="color:#C8FF00">Account → Workout Reminder</span> and set a time. One push notification a day. The sessions you almost skip are the ones that matter most.</div>
+
+</td></tr>
+</table>
+</td></tr>
+
+<!-- CTA -->
+<tr><td style="padding:0 40px 16px 40px">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+  <tr><td style="background:#C8FF00;border-radius:8px;text-align:center;padding:16px 24px">
+    <a href="https://www.klemforge.com/app.html"
+      style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#111111;text-decoration:none;letter-spacing:0.05em;display:block">Open FORGE →</a>
+  </td></tr>
+  </table>
+</td></tr>
+
+<!-- TRUST LINE -->
+<tr><td style="padding:0 40px 32px 40px">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+  <tr><td style="background:#111111;border-radius:8px;padding:14px 20px;text-align:center">
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;color:#AAAAAA;line-height:1.6"><strong style="color:#C8FF00">7-day free trial</strong> started today. No card charged until it ends. Cancel anytime.</div>
+  </td></tr>
+  </table>
+</td></tr>
+
+<!-- Divider -->
+<tr><td style="padding:0">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+  <tr><td style="border-top:1px solid #eeeeee;font-size:0;line-height:0">&nbsp;</td></tr>
+  </table>
+</td></tr>
+
+<!-- FOOTER -->
+<tr><td style="padding:24px 40px;text-align:center">
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#999999;margin-bottom:4px">FORGE · AI Performance Coach</div>
+  <div style="margin-bottom:6px"><a href="https://www.klemforge.com" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#999999;text-decoration:none">klemforge.com</a></div>
+  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;color:#BBBBBB">You received this because you signed up for FORGE.</div>
+</td></tr>
+
+</table>
+<!-- End main container -->
+
+</td></tr>
+</table>
+<!-- End wrapper -->
+
 </body>
 </html>`
     ).catch(() => {});
