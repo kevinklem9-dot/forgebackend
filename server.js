@@ -1295,126 +1295,336 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="supported-color-schemes" content="dark">
 <title>Welcome to FORGE</title>
 <style>
-body, .email-body { margin:0; padding:0; }
-.hero-bg { background-color:#ffffff !important; }
-.hero-headline { color:#0a0a0a !important; }
-.hero-sub { color:#0a0a0a !important; }
-.hero-body-text { color:#555555 !important; }
-.steps-outer { background-color:#f7f7f7 !important; border-color:#eeeeee !important; }
-.step-divider { border-bottom-color:#eeeeee !important; }
-.step-title { color:#0a0a0a !important; }
-.step-body-text { color:#444444 !important; }
-.step-emphasis { color:#0a0a0a !important; }
-.step-num { background-color:#0a0a0a !important; color:#e8ff3d !important; }
-.step-nav { background-color:#0a0a0a !important; color:#e8ff3d !important; }
-.cta-bg { background-color:#ffffff !important; }
-.btn-bg { background-color:#e8ff3d !important; }
-.btn-text { color:#000000 !important; }
-.trust-text { color:#999999 !important; }
-.footer-bg { background-color:#0a0a0a !important; }
-.footer-text { color:#666666 !important; }
-.footer-url { color:#e8ff3d !important; }
-.footer-legal { color:#444444 !important; }
-.days-pill { background-color:#e8ff3d !important; color:#000000 !important; }
+/* Force dark on ALL devices including light mode */
+body, .email-bg {
+  background-color: #0a0a0a !important;
+  color: #f0f0f0 !important;
+}
+.hero-bg {
+  background-color: #0a0a0a !important;
+}
+.steps-outer {
+  background-color: #1a1a1a !important;
+  border-color: #333333 !important;
+}
+.step-divider {
+  border-bottom-color: #2a2a2a !important;
+}
+.step-title {
+  color: #f0f0f0 !important;
+}
+.step-body-text {
+  color: #bbbbbb !important;
+}
+.step-emphasis {
+  color: #ffffff !important;
+}
+.step-num {
+  color: #e8ff3d !important;
+}
+.step-nav {
+  color: #e8ff3d !important;
+}
+.hero-headline {
+  color: #f0f0f0 !important;
+}
+.hero-sub {
+  color: #e8ff3d !important;
+}
+.hero-body-text {
+  color: #d0d0d0 !important;
+}
+.days-accent {
+  color: #e8ff3d !important;
+}
+.btn-bg {
+  background-color: #e8ff3d !important;
+}
+.btn-text {
+  color: #000000 !important;
+}
+.trust-text {
+  color: #555555 !important;
+}
+.footer-bg {
+  background-color: #0a0a0a !important;
+}
+.footer-text {
+  color: #555555 !important;
+}
+.footer-url {
+  color: #e8ff3d !important;
+}
+.footer-legal {
+  color: #555555 !important;
+}
 
+/* Light mode override — force dark anyway */
+@media (prefers-color-scheme: light) {
+  body, .email-bg { background-color: #0a0a0a !important; }
+  .hero-bg { background-color: #0a0a0a !important; }
+  .steps-outer { background-color: #1a1a1a !important; border-color: #333333 !important; }
+  .step-divider { border-bottom-color: #2a2a2a !important; }
+  .step-title { color: #f0f0f0 !important; }
+  .step-body-text { color: #bbbbbb !important; }
+  .step-emphasis { color: #ffffff !important; }
+  .step-num { color: #e8ff3d !important; }
+  .hero-headline { color: #f0f0f0 !important; }
+  .hero-sub { color: #e8ff3d !important; }
+  .hero-body-text { color: #d0d0d0 !important; }
+  .days-accent { color: #e8ff3d !important; }
+  .btn-bg { background-color: #e8ff3d !important; }
+  .btn-text { color: #000000 !important; }
+  .trust-text { color: #555555 !important; }
+  .footer-text { color: #555555 !important; }
+  .footer-url { color: #e8ff3d !important; }
+  .footer-legal { color: #555555 !important; }
+}
+
+/* Dark mode — same dark design */
 @media (prefers-color-scheme: dark) {
-  .hero-bg { background-color:#0a0a0a !important; }
-  .hero-headline { color:#f0f0f0 !important; }
-  .hero-sub { color:#e8ff3d !important; }
-  .hero-body-text { color:#d0d0d0 !important; }
-  .steps-outer { background-color:#1a1a1a !important; border-color:#333333 !important; }
-  .step-divider { border-bottom-color:#2a2a2a !important; }
-  .step-title { color:#f0f0f0 !important; }
-  .step-body-text { color:#bbbbbb !important; }
-  .step-emphasis { color:#ffffff !important; }
-  .step-num { background-color:#111111 !important; color:#e8ff3d !important; border:1px solid #333 !important; }
-  .step-nav { background-color:#111111 !important; color:#e8ff3d !important; }
-  .cta-bg { background-color:#0a0a0a !important; }
-  .btn-bg { background-color:#e8ff3d !important; }
-  .btn-text { color:#000000 !important; }
-  .trust-text { color:#555555 !important; }
-  .footer-text { color:#666666 !important; }
-  .footer-url { color:#e8ff3d !important; }
-  .footer-legal { color:#555555 !important; }
-  .days-pill { background-color:#e8ff3d !important; color:#000000 !important; }
+  body, .email-bg { background-color: #0a0a0a !important; }
+  .hero-bg { background-color: #0a0a0a !important; }
+  .steps-outer { background-color: #1a1a1a !important; border-color: #333333 !important; }
+  .step-divider { border-bottom-color: #2a2a2a !important; }
+  .step-title { color: #f0f0f0 !important; }
+  .step-body-text { color: #bbbbbb !important; }
+  .step-emphasis { color: #ffffff !important; }
+  .step-num { color: #e8ff3d !important; }
+  .hero-headline { color: #f0f0f0 !important; }
+  .hero-sub { color: #e8ff3d !important; }
+  .hero-body-text { color: #d0d0d0 !important; }
+  .days-accent { color: #e8ff3d !important; }
+  .btn-bg { background-color: #e8ff3d !important; }
+  .btn-text { color: #000000 !important; }
+  .trust-text { color: #555555 !important; }
+  .footer-text { color: #555555 !important; }
+  .footer-url { color: #e8ff3d !important; }
+  .footer-legal { color: #555555 !important; }
 }
 </style>
 </head>
-<body class="email-body" style="margin:0;padding:0;background:#f0f0f0">
+<body class="email-bg" style="margin:0;padding:0;background-color:#0a0a0a">
 
-<div style="display:none;font-size:1px;color:#f0f0f0;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden">
+<div style="display:none;font-size:1px;color:#0a0a0a;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden">
 Your programme is ready to build. Here's where to start.
 </div>
 
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f0f0f0">
+<table role="presentation" width="100%" cellpadding="0"
+  cellspacing="0" class="email-bg"
+  style="background-color:#0a0a0a">
 <tr><td align="center" style="padding:40px 20px">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%">
+<table role="presentation" width="600" cellpadding="0"
+  cellspacing="0"
+  style="max-width:600px;width:100%;background-color:#0a0a0a">
 
 <!-- HEADER -->
-<tr><td class="footer-bg" bgcolor="#0a0a0a" style="padding:36px 24px 32px;text-align:center;background:#0a0a0a;border-radius:12px 12px 0 0">
-  <div style="font-family:'Courier New',Courier,monospace;font-size:36px;font-weight:700;color:#e8ff3d;letter-spacing:4px;line-height:1;margin-bottom:6px">FORGE</div>
-  <div style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#888888;letter-spacing:4px;text-transform:uppercase">AI Performance Coach</div>
-</td></tr>
-
-<!-- HERO -->
-<tr><td class="hero-bg" bgcolor="#ffffff" style="padding:36px 24px 28px;background:#ffffff">
-  <div class="hero-headline" style="font-family:'Courier New',Courier,monospace;font-size:38px;font-weight:700;color:#0a0a0a;letter-spacing:1px;line-height:1.1;margin-bottom:10px">Welcome, ${name}.</div>
-  <div class="hero-sub" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:20px;color:#0a0a0a;font-weight:600;margin-bottom:14px">Let's build something.</div>
-  <div class="hero-body-text" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;color:#555555;line-height:1.7">
-    <span class="days-pill" style="font-family:'Courier New',Courier,monospace;background:#e8ff3d;color:#000000;padding:2px 8px;border-radius:4px;font-weight:600;font-size:13px">7 days</span> of full access. Here's how to use every one.
+<tr><td class="footer-bg"
+  style="padding:36px 24px 32px;text-align:center;
+  background-color:#0a0a0a;border-radius:12px 12px 0 0">
+  <div style="font-family:'Courier New',Courier,monospace;
+    font-size:36px;font-weight:700;color:#e8ff3d;
+    letter-spacing:4px;line-height:1;margin-bottom:6px">
+    FORGE
+  </div>
+  <div class="footer-text"
+    style="font-family:'Courier New',Courier,monospace;
+    font-size:10px;color:#555555;letter-spacing:4px;
+    text-transform:uppercase">
+    AI Performance Coach
   </div>
 </td></tr>
 
-<!-- STEPS -->
-<tr><td class="hero-bg" bgcolor="#ffffff" style="padding:0 24px 28px;background:#ffffff">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="steps-outer" style="background:#f7f7f7;border:1px solid #eeeeee;border-radius:16px">
+<!-- HERO -->
+<tr><td class="hero-bg"
+  style="padding:36px 24px 28px;background-color:#0a0a0a">
+  <div class="hero-headline"
+    style="font-family:'Courier New',Courier,monospace;
+    font-size:38px;font-weight:700;color:#f0f0f0;
+    letter-spacing:1px;line-height:1.1;margin-bottom:10px">
+    Welcome, ${name}.
+  </div>
+  <div class="hero-sub"
+    style="font-family:-apple-system,BlinkMacSystemFont,
+    'Segoe UI',Helvetica,Arial,sans-serif;
+    font-size:20px;color:#e8ff3d;font-weight:600;
+    margin-bottom:14px">
+    Let's build something.
+  </div>
+  <div class="hero-body-text"
+    style="font-family:-apple-system,BlinkMacSystemFont,
+    'Segoe UI',Helvetica,Arial,sans-serif;
+    font-size:15px;color:#d0d0d0;line-height:1.7">
+    <span class="days-accent"
+      style="font-family:'Courier New',Courier,monospace;
+      color:#e8ff3d;font-weight:700;font-size:14px;
+      letter-spacing:1px">7 DAYS</span>
+    of full access. Here's how to use every one.
+  </div>
+</td></tr>
 
-  <tr><td class="step-divider" style="padding:22px 24px;border-bottom:1px solid #eeeeee">
-    <div class="step-num" style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#e8ff3d;background:#0a0a0a;display:inline-block;padding:2px 8px;border-radius:4px;letter-spacing:2px;margin-bottom:10px">01</div>
-    <div class="step-title" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#0a0a0a;margin-bottom:8px">Finish your onboarding</div>
-    <div class="step-body-text" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#444444;line-height:1.7">If you haven't completed your profile yet — do it now. Your sport, your schedule, your goals, your injury history. The more honest your answers, the sharper your programme. This is the step most people rush. <strong class="step-emphasis" style="color:#0a0a0a">Don't.</strong></div>
+<!-- STEPS CARD -->
+<tr><td class="hero-bg"
+  style="padding:0 24px 28px;background-color:#0a0a0a">
+<table role="presentation" width="100%" cellpadding="0"
+  cellspacing="0" class="steps-outer"
+  style="background-color:#1a1a1a;border:1px solid #333333;
+  border-radius:16px">
+
+  <tr><td class="step-divider"
+    style="padding:22px 24px;border-bottom:1px solid #2a2a2a">
+    <div class="step-num"
+      style="font-family:'Courier New',Courier,monospace;
+      font-size:10px;color:#e8ff3d;letter-spacing:2px;
+      margin-bottom:10px">— 01</div>
+    <div class="step-title"
+      style="font-family:-apple-system,BlinkMacSystemFont,
+      'Segoe UI',Helvetica,Arial,sans-serif;
+      font-size:15px;font-weight:700;color:#f0f0f0;
+      margin-bottom:8px">Finish your onboarding</div>
+    <div class="step-body-text"
+      style="font-family:-apple-system,BlinkMacSystemFont,
+      'Segoe UI',Helvetica,Arial,sans-serif;
+      font-size:14px;color:#bbbbbb;line-height:1.7">
+      If you haven't completed your profile yet — do it now.
+      Your sport, your schedule, your goals, your injury
+      history. The more honest your answers, the sharper
+      your programme. This is the step most people rush.
+      <strong class="step-emphasis"
+        style="color:#ffffff">Don't.</strong>
+    </div>
   </td></tr>
 
-  <tr><td class="step-divider" style="padding:22px 24px;border-bottom:1px solid #eeeeee">
-    <div class="step-num" style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#e8ff3d;background:#0a0a0a;display:inline-block;padding:2px 8px;border-radius:4px;letter-spacing:2px;margin-bottom:10px">02</div>
-    <div class="step-title" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#0a0a0a;margin-bottom:8px">Talk to your coach</div>
-    <div class="step-body-text" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#444444;line-height:1.7">Your AI coach is live the moment onboarding is done. Ask it anything — form, nutrition, when to add weight, how to adjust your plan around an injury. It reads your data and gives you a real answer. <strong class="step-emphasis" style="color:#0a0a0a">Use it.</strong></div>
+  <tr><td class="step-divider"
+    style="padding:22px 24px;border-bottom:1px solid #2a2a2a">
+    <div class="step-num"
+      style="font-family:'Courier New',Courier,monospace;
+      font-size:10px;color:#e8ff3d;letter-spacing:2px;
+      margin-bottom:10px">— 02</div>
+    <div class="step-title"
+      style="font-family:-apple-system,BlinkMacSystemFont,
+      'Segoe UI',Helvetica,Arial,sans-serif;
+      font-size:15px;font-weight:700;color:#f0f0f0;
+      margin-bottom:8px">Talk to your coach</div>
+    <div class="step-body-text"
+      style="font-family:-apple-system,BlinkMacSystemFont,
+      'Segoe UI',Helvetica,Arial,sans-serif;
+      font-size:14px;color:#bbbbbb;line-height:1.7">
+      Your AI coach is live the moment onboarding is done.
+      Ask it anything — form, nutrition, when to add weight,
+      how to adjust your plan around an injury. It reads your
+      data and gives you a real answer.
+      <strong class="step-emphasis"
+        style="color:#ffffff">Use it.</strong>
+    </div>
   </td></tr>
 
-  <tr><td class="step-divider" style="padding:22px 24px;border-bottom:1px solid #eeeeee">
-    <div class="step-num" style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#e8ff3d;background:#0a0a0a;display:inline-block;padding:2px 8px;border-radius:4px;letter-spacing:2px;margin-bottom:10px">03</div>
-    <div class="step-title" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#0a0a0a;margin-bottom:8px">Log every session</div>
-    <div class="step-body-text" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#444444;line-height:1.7">Every set you log makes your coach smarter. The programme adapts based on what your data actually shows — not what it guessed about you on day one. <strong class="step-emphasis" style="color:#0a0a0a">Log everything. Miss nothing.</strong></div>
+  <tr><td class="step-divider"
+    style="padding:22px 24px;border-bottom:1px solid #2a2a2a">
+    <div class="step-num"
+      style="font-family:'Courier New',Courier,monospace;
+      font-size:10px;color:#e8ff3d;letter-spacing:2px;
+      margin-bottom:10px">— 03</div>
+    <div class="step-title"
+      style="font-family:-apple-system,BlinkMacSystemFont,
+      'Segoe UI',Helvetica,Arial,sans-serif;
+      font-size:15px;font-weight:700;color:#f0f0f0;
+      margin-bottom:8px">Log every session</div>
+    <div class="step-body-text"
+      style="font-family:-apple-system,BlinkMacSystemFont,
+      'Segoe UI',Helvetica,Arial,sans-serif;
+      font-size:14px;color:#bbbbbb;line-height:1.7">
+      Every set you log makes your coach smarter. The
+      programme adapts based on what your data actually
+      shows — not what it guessed about you on day one.
+      <strong class="step-emphasis"
+        style="color:#ffffff">Log everything.
+        Miss nothing.</strong>
+    </div>
   </td></tr>
 
   <tr><td style="padding:22px 24px">
-    <div class="step-num" style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#e8ff3d;background:#0a0a0a;display:inline-block;padding:2px 8px;border-radius:4px;letter-spacing:2px;margin-bottom:10px">04</div>
-    <div class="step-title" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#0a0a0a;margin-bottom:8px">Set a daily reminder</div>
-    <div class="step-body-text" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;color:#444444;line-height:1.7">Go to <span class="step-nav" style="font-family:'Courier New',Courier,monospace;background:#0a0a0a;color:#e8ff3d;padding:1px 7px;border-radius:4px;font-size:12px">Account → Workout Reminder</span> and set a time. One push notification a day. The sessions you almost skip are the ones that matter most.</div>
+    <div class="step-num"
+      style="font-family:'Courier New',Courier,monospace;
+      font-size:10px;color:#e8ff3d;letter-spacing:2px;
+      margin-bottom:10px">— 04</div>
+    <div class="step-title"
+      style="font-family:-apple-system,BlinkMacSystemFont,
+      'Segoe UI',Helvetica,Arial,sans-serif;
+      font-size:15px;font-weight:700;color:#f0f0f0;
+      margin-bottom:8px">Set a daily reminder</div>
+    <div class="step-body-text"
+      style="font-family:-apple-system,BlinkMacSystemFont,
+      'Segoe UI',Helvetica,Arial,sans-serif;
+      font-size:14px;color:#bbbbbb;line-height:1.7">
+      Go to
+      <span class="step-nav"
+        style="font-family:'Courier New',Courier,monospace;
+        color:#e8ff3d;font-size:12px">
+        Account → Workout Reminder</span>
+      and set a time. One push notification a day. The
+      sessions you almost skip are the ones that matter most.
+    </div>
   </td></tr>
 
 </table>
 </td></tr>
 
 <!-- CTA -->
-<tr><td class="cta-bg hero-bg" bgcolor="#ffffff" style="padding:0 24px 28px;background:#ffffff">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-  <tr><td class="btn-bg" bgcolor="#e8ff3d" style="background:#e8ff3d;border-radius:10px;text-align:center;padding:18px">
+<tr><td class="hero-bg"
+  style="padding:0 24px 28px;background-color:#0a0a0a">
+  <table role="presentation" width="100%"
+    cellpadding="0" cellspacing="0">
+  <tr><td class="btn-bg"
+    style="background-color:#e8ff3d;border-radius:10px;
+    text-align:center;padding:18px">
     <a href="https://www.klemforge.com/app.html"
       class="btn-text"
-      style="font-family:'Courier New',Courier,monospace;font-size:13px;font-weight:700;color:#000000;text-decoration:none;letter-spacing:2px;text-transform:uppercase;display:block">OPEN FORGE</a>
+      style="font-family:'Courier New',Courier,monospace;
+      font-size:13px;font-weight:700;color:#000000;
+      text-decoration:none;letter-spacing:2px;
+      text-transform:uppercase;display:block">
+      OPEN FORGE
+    </a>
   </td></tr>
   </table>
-  <div class="trust-text" style="text-align:center;margin-top:14px;font-family:'Courier New',Courier,monospace;font-size:10px;color:#999999;letter-spacing:1.5px;text-transform:uppercase">7-day free trial &nbsp;·&nbsp; no card charged &nbsp;·&nbsp; cancel anytime</div>
+  <div class="trust-text"
+    style="text-align:center;margin-top:14px;
+    font-family:'Courier New',Courier,monospace;
+    font-size:10px;color:#555555;letter-spacing:1.5px;
+    text-transform:uppercase">
+    7-day free trial &nbsp;·&nbsp; no card charged
+    &nbsp;·&nbsp; cancel anytime
+  </div>
 </td></tr>
 
 <!-- FOOTER -->
-<tr><td class="footer-bg" bgcolor="#0a0a0a" style="padding:24px;background:#0a0a0a;text-align:center;border-radius:0 0 12px 12px">
-  <div class="footer-text" style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#666666;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">FORGE · AI Performance Coach</div>
-  <div style="margin-bottom:8px"><a href="https://www.klemforge.com" class="footer-url" style="font-family:'Courier New',Courier,monospace;font-size:10px;color:#e8ff3d;text-decoration:none;letter-spacing:1px">klemforge.com</a></div>
-  <div class="footer-legal" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;color:#444444">You received this because you signed up for FORGE.</div>
+<tr><td class="footer-bg"
+  style="padding:24px;background-color:#0a0a0a;
+  text-align:center;border-radius:0 0 12px 12px">
+  <div class="footer-text"
+    style="font-family:'Courier New',Courier,monospace;
+    font-size:10px;color:#555555;letter-spacing:2px;
+    text-transform:uppercase;margin-bottom:6px">
+    FORGE · AI Performance Coach
+  </div>
+  <div style="margin-bottom:8px">
+    <a href="https://www.klemforge.com"
+      class="footer-url"
+      style="font-family:'Courier New',Courier,monospace;
+      font-size:10px;color:#e8ff3d;text-decoration:none;
+      letter-spacing:1px">klemforge.com</a>
+  </div>
+  <div class="footer-legal"
+    style="font-family:-apple-system,BlinkMacSystemFont,
+    'Segoe UI',Helvetica,Arial,sans-serif;
+    font-size:11px;color:#555555">
+    You received this because you signed up for FORGE.
+  </div>
 </td></tr>
 
 </table>
