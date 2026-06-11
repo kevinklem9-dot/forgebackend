@@ -1366,8 +1366,19 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
             },
             tags: ['trial']
           })
-        }).catch(err =>
-          console.error('[mailchimp] Add error:',
+        })
+        .then(async res => {
+          const body = await res.json();
+          if (!res.ok) {
+            console.error('[mailchimp] Add failed:',
+              res.status, JSON.stringify(body));
+          } else {
+            console.log('[mailchimp] Contact added:',
+              email, 'status:', body.status);
+          }
+        })
+        .catch(err =>
+          console.error('[mailchimp] Network error:',
             err.message)
         );
       }
