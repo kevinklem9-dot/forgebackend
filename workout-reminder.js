@@ -69,9 +69,45 @@ async function sendWorkoutReminders() {
         .eq('user_id', user.id);
       if (!subs?.length) continue;
 
+      // Get user's local hour using their timezone
+      const userTz = user.reminder_timezone || 'UTC';
+      let localHour;
+      try {
+        const formatter = new Intl.DateTimeFormat('en-US', {
+          timeZone: userTz,
+          hour: 'numeric',
+          hour12: false
+        });
+        localHour = parseInt(formatter.format(new Date()));
+      } catch (e) {
+        localHour = new Date().getUTCHours();
+      }
+
+      const firstName = (user.name || 'champion').split(' ')[0];
+
+      let notifTitle, notifBody;
+
+      if (localHour < 12) {
+        // Morning
+        notifTitle = firstName + ', your session starts now.';
+        notifBody = 'The day is ahead of you. Don\'t waste the window.';
+      } else if (localHour < 17) {
+        // Afternoon
+        notifTitle = firstName + ', don\'t let it slip.';
+        notifBody = 'The day is moving. Your session isn\'t going to log itself.';
+      } else if (localHour < 21) {
+        // Evening
+        notifTitle = firstName + ', this is the window.';
+        notifBody = 'It\'s now or you\'re skipping. You already know which one wins.';
+      } else {
+        // Late
+        notifTitle = firstName + ', still time.';
+        notifBody = 'Even 30 minutes is better than nothing. Get it done.';
+      }
+
       const payload = JSON.stringify({
-        title: 'Time to train, ' + (user.name || 'champion'),
-        body: 'Your programme is ready. Open FORGE.',
+        title: notifTitle,
+        body: notifBody,
         url: '/app.html',
         icon: '/icons/icon-192.png',
         badge: '/icons/icon-72.png'
