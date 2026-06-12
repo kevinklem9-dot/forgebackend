@@ -6725,7 +6725,7 @@ app.get('/api/coach/seat-count', requireAuth, requireCoach, async (req, res) => 
 // ── Cron — daily workout reminders ─────────────────────
 // Call every ~5 min from Railway cron. Sends a push to users whose reminder_time
 // (their LOCAL HH:MM) matches the current time in their reminder_timezone, within a
-// 5-min window. Authenticated with the shared x-cron-secret.
+// 10-min window. Authenticated with the shared x-cron-secret.
 app.post('/api/cron/reminders', async (req, res) => {
   try {
     if (req.headers['x-cron-secret'] !== process.env.CRON_SECRET) {
@@ -6748,7 +6748,7 @@ app.post('/api/cron/reminders', async (req, res) => {
         const nowLocal = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(now);
         const [nh, nm] = nowLocal.split(':').map(Number);
         const [rh, rm] = String(user.reminder_time).split(':').map(Number);
-        if (rh === nh && Math.abs(rm - nm) <= 5) {
+        if (rh === nh && Math.abs(rm - nm) <= 10) {
           await sendPushToUser(
             user.id,
             'Time to train, ' + (user.name || 'champion'),
