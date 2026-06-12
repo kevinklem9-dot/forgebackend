@@ -4967,6 +4967,20 @@ app.post('/api/push/subscribe', requireAuth, async (req, res) => {
   }
 });
 
+// Unsubscribe from push (remove this device's subscription)
+app.delete('/api/push/subscribe', requireAuth, async (req, res) => {
+  const { endpoint } = req.body;
+  if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+
+  await supabase
+    .from('push_subscriptions')
+    .delete()
+    .eq('user_id', req.user.id)
+    .eq('subscription->>endpoint', endpoint);
+
+  res.json({ success: true });
+});
+
 // Trigger grace period notification sequence
 app.post('/api/push/grace-period', requireAuth, async (req, res) => {
   const userId = req.user.id;
