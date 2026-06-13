@@ -2056,12 +2056,14 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
         nutrition: freshPlan?.nutrition_plan || planData.nutrition_plan
       };
 
+      const appliedInstructions = [];
       for (const match of planUpdateMatches) {
         try {
           const updateInstruction = JSON.parse(match[1].trim());
           const updatedPlan = applyPlanUpdate(currentPlan, updateInstruction);
           currentPlan.workout = updatedPlan.workout;
           currentPlan.nutrition = updatedPlan.nutrition;
+          appliedInstructions.push(updateInstruction);
           planUpdate = { type: updateInstruction.type, summary: updateInstruction.summary };
         } catch(e) {
           console.error('Plan update parse error:', e.message);
@@ -2078,6 +2080,35 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
             translations: {} // reset cache — next fetch re-translates
           })
           .eq('id', (freshPlan || planData).id);
+
+        // Keep an active custom programme in sync: re-apply the SAME instruction(s) to the
+        // programme's own workout days. Plan/Log panels render against the active custom
+        // programme when one exists, so without this the coach's edit never shows there.
+        // Surgical — the user-built programme is preserved, only the edited exercises change.
+        // nutrition: {} keeps nutrition-type instructions as harmless no-ops; only .workout
+        // is persisted. Own try/catch so a programme failure can't undo the plan save above.
+        try {
+          const { data: activeProgs } = await supabase
+            .from('programmes')
+            .select('id, plan_data')
+            .eq('user_id', req.user.id)
+            .eq('is_active', true)
+            .eq('is_archived', false)
+            .limit(1);
+          if (activeProgs?.length && activeProgs[0].plan_data?.workout) {
+            const prog = activeProgs[0];
+            let progWorkout = prog.plan_data.workout;
+            for (const instr of appliedInstructions) {
+              progWorkout = applyPlanUpdate({ workout: progWorkout, nutrition: {} }, instr).workout;
+            }
+            await supabase
+              .from('programmes')
+              .update({ plan_data: { ...prog.plan_data, workout: progWorkout } })
+              .eq('id', prog.id);
+          }
+        } catch (e) {
+          console.error('Programme sync error:', e.message);
+        }
       }
     }
 
@@ -2298,6 +2329,27 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
           translations: {} // reset cache — next fetch re-translates
         }).eq('id', planData.id);
         planUpdate = { type: updateInstruction.type, summary: updateInstruction.summary };
+
+        // Keep an active custom programme in sync with the same change (see chat handler).
+        try {
+          const { data: activeProgs } = await supabase
+            .from('programmes')
+            .select('id, plan_data')
+            .eq('user_id', req.user.id)
+            .eq('is_active', true)
+            .eq('is_archived', false)
+            .limit(1);
+          if (activeProgs?.length && activeProgs[0].plan_data?.workout) {
+            const prog = activeProgs[0];
+            const progWorkout = applyPlanUpdate({ workout: prog.plan_data.workout, nutrition: {} }, updateInstruction).workout;
+            await supabase
+              .from('programmes')
+              .update({ plan_data: { ...prog.plan_data, workout: progWorkout } })
+              .eq('id', prog.id);
+          }
+        } catch (e) {
+          console.error('Programme sync error (checkin):', e.message);
+        }
       } catch(e) {
         console.error('Checkin plan update error:', e.message);
       }
