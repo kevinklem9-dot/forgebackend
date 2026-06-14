@@ -1,10 +1,10 @@
 /**
  * FORGE — Daily Workout Reminder Cron Job
- * Schedule: Every 15 minutes → "0,15,30,45 * * * *"
+ * Schedule: Every 5 minutes → "*/5 * * * *"
  * Run on Railway as a separate service or via cron trigger.
  *
  * Sends a push to users whose reminder_time (their LOCAL HH:MM, stored with an
- * IANA reminder_timezone) falls inside the current 15-minute cron window.
+ * IANA reminder_timezone) falls inside the current 5-minute cron window.
  * Mirrors the live POST /api/cron/reminders logic, but sends via the web-push
  * library (VAPID-signed + encrypted) like cron/weekly-review.js.
  */
@@ -15,7 +15,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 
 // Cron cadence in minutes. Fire once when local time enters [reminder, reminder + WINDOW_MIN).
 // Keep this equal to the Railway cron interval so each reminder fires exactly once per day.
-const WINDOW_MIN = 15;
+const WINDOW_MIN = 5;
 
 async function sendWorkoutReminders() {
   // ── Web Push setup (VAPID) ─────────────────────────────
