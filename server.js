@@ -2423,6 +2423,7 @@ app.post('/api/log', requireAuth, async (req, res) => {
     const historyByName = new Map(); // name -> history row
     const statByName = new Map();     // name -> { bestSet, est1rm, setsLen }
     for (const ex of exercises) {
+      if (ex.cardio) continue; // cardio logs carry no weight/reps — skip PR + history processing
       // exercises now have a sets_data array: [{weight, reps}, ...]
       // Use best set for PR calculation, total volume across all sets
       const setsData = ex.sets_data || [{ weight: ex.weight, reps: ex.reps }];
@@ -6655,6 +6656,176 @@ app.post('/api/coach/clients/:clientId/reset-nutrition', requireAuth, requireCoa
     res.json({ ok: true, nutrition_plan: restored });
   } catch(err) {
     console.error('[reset-nutrition]', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── SET ACTIVE PLAN (coach toggles a client between their AI and coach plans) ──────
+// Switch the client's live workout plan to their AI plan (coach_assigned:false).
+app.patch('/api/coach/clients/:clientId/activate-ai-plan', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: planRow } = await supabase.from('plans')
+      .select('id, workout_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const wp = planRow?.workout_plan || null;
+    // The AI plan is the live plan when no coach plan is active, else the preserved backup.
+    const aiPlan = wp ? (wp.coach_assigned ? (wp._ai_backup || null) : wp) : null;
+    if (!aiPlan || !((aiPlan.days || []).length)) {
+      return res.status(400).json({ error: 'no_ai_plan' });
+    }
+    const newPlan = { ...aiPlan, coach_assigned: false };
+    delete newPlan._ai_backup;
+    if (planRow?.id) {
+      await supabase.from('plans').update({
+        workout_plan: newPlan, translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', planRow.id);
+    }
+    await sendPushToUser(clientId, 'Workout plan updated',
+      'Your coach switched you to the AI workout plan.',
+      '/app.html?panel=workout').catch(() => {});
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('[activate-ai-plan]', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Switch the client's live workout plan to their coach-assigned plan (coach_assigned:true).
+// Rebuilds the live plan from the coach's saved programme so the AI backup is preserved.
+app.patch('/api/coach/clients/:clientId/activate-coach-plan', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: prog } = await supabase.from('coach_programmes')
+      .select('*').eq('coach_id', req.user.id).eq('client_id', clientId)
+      .neq('programme_type', 'nutrition').eq('is_template', false)
+      .order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    if (!prog) return res.status(404).json({ error: 'no_coach_plan' });
+    const coachPlanData = {
+      days: (prog.programme_data?.sessions || []).map((s, i) => ({
+        day_index: i,
+        day_name: s.name || `Day ${i + 1}`,
+        label: s.name || `Day ${i + 1}`,
+        coach_note: s.note || null,
+        exercises: (s.exercises || []).map(e => ({
+          name: e.name, sets: e.sets, reps: e.reps,
+          rest: e.rpe || e.weight || null,
+          note: `${e.rpe ? 'RPE ' + e.rpe : ''}${e.weight ? e.weight : ''}`.trim() || null,
+        }))
+      })),
+      coach_assigned: true,
+      coach_name: req.coachProfile.name || 'Your coach',
+      programme_name: prog.name,
+    };
+    const { data: existingPlan } = await supabase.from('plans')
+      .select('id, workout_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    coachPlanData._ai_backup = existingPlan?.workout_plan
+      ? (existingPlan.workout_plan.coach_assigned ? (existingPlan.workout_plan._ai_backup || null) : existingPlan.workout_plan)
+      : null;
+    if (existingPlan?.id) {
+      await supabase.from('plans').update({
+        workout_plan: coachPlanData, translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', existingPlan.id);
+    } else {
+      await supabase.from('plans').insert({
+        user_id: clientId, workout_plan: coachPlanData,
+        generated_at: new Date().toISOString(),
+      });
+    }
+    await sendPushToUser(clientId, 'Workout plan updated',
+      'Your coach switched you to their workout plan.',
+      '/app.html?panel=workout').catch(() => {});
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('[activate-coach-plan]', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Switch the client's live nutrition plan to their AI nutrition (coach_assigned:false).
+app.patch('/api/coach/clients/:clientId/activate-ai-nutrition', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: planRow } = await supabase.from('plans')
+      .select('id, nutrition_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const np = planRow?.nutrition_plan || null;
+    const aiNutrition = np ? (np.coach_assigned ? (np._ai_backup || null) : np) : null;
+    if (!aiNutrition || !(aiNutrition.calories || aiNutrition.daily_calories || (aiNutrition.meals || []).length)) {
+      return res.status(400).json({ error: 'no_ai_nutrition' });
+    }
+    const newN = { ...aiNutrition, coach_assigned: false };
+    delete newN._ai_backup;
+    if (planRow?.id) {
+      await supabase.from('plans').update({
+        nutrition_plan: newN, translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', planRow.id);
+    }
+    await sendPushToUser(clientId, 'Nutrition plan updated',
+      'Your coach switched you to the AI nutrition plan.',
+      '/app.html?panel=nutrition').catch(() => {});
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('[activate-ai-nutrition]', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Switch the client's live nutrition plan to their coach-assigned nutrition (coach_assigned:true).
+app.patch('/api/coach/clients/:clientId/activate-coach-nutrition', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: prog } = await supabase.from('coach_programmes')
+      .select('*').eq('coach_id', req.user.id).eq('client_id', clientId)
+      .eq('programme_type', 'nutrition').eq('is_template', false)
+      .order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    if (!prog || !prog.nutrition_data) return res.status(404).json({ error: 'no_coach_nutrition' });
+    const coachName = req.coachProfile.coach_title || req.coachProfile.name || 'Your coach';
+    const { data: existingPlanN } = await supabase.from('plans')
+      .select('id, nutrition_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const prevN = existingPlanN?.nutrition_plan || null;
+    const aiBackup = prevN ? (prevN.coach_assigned ? (prevN._ai_backup || null) : prevN) : null;
+    const liveNutrition = {
+      ...prog.nutrition_data,
+      coach_assigned: true,
+      coach_name: coachName,
+      assigned_at: new Date().toISOString(),
+      _ai_backup: aiBackup,
+    };
+    if (existingPlanN?.id) {
+      await supabase.from('plans').update({
+        nutrition_plan: liveNutrition, translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', existingPlanN.id);
+    } else {
+      await supabase.from('plans').insert({
+        user_id: clientId, nutrition_plan: liveNutrition,
+        generated_at: new Date().toISOString(),
+      });
+    }
+    await sendPushToUser(clientId, 'Nutrition plan updated',
+      'Your coach switched you to their nutrition plan.',
+      '/app.html?panel=nutrition').catch(() => {});
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('[activate-coach-nutrition]', err.message);
     console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
