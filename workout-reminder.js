@@ -1,13 +1,11 @@
-/**
- * FORGE — Daily Workout Reminder Cron Job
- * Schedule: Every 5 minutes → "*/5 * * * *"
- * Run on Railway as a separate service or via cron trigger.
- *
- * Sends a push to users whose reminder_time (their LOCAL HH:MM, stored with an
- * IANA reminder_timezone) falls inside the current 5-minute cron window.
- * Mirrors the live POST /api/cron/reminders logic, but sends via the web-push
- * library (VAPID-signed + encrypted) like cron/weekly-review.js.
- */
+// FORGE — Daily Workout Reminder Cron Job
+// Schedule: Every 5 minutes - "*/5 * * * *"
+// Run on Railway as a separate service or via cron trigger.
+//
+// Sends a push to users whose reminder_time (their LOCAL HH:MM, stored with an
+// IANA reminder_timezone) falls inside the current 5-minute cron window.
+// Mirrors the live POST /api/cron/reminders logic, but sends via the web-push
+// library (VAPID-signed + encrypted) like cron/weekly-review.js.
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 
