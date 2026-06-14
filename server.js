@@ -3454,7 +3454,25 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     allAuthUsers.forEach(u => emailMap[u.id] = u.email);
 
     const users = (profiles || []).map(p => ({ ...p, email: emailMap[p.id] || '—' }));
-    res.json({ users });
+
+    // FIX 2: count active-paid vs active-exempt vs trial separately so comped (exempt)
+    // accounts are no longer reported as paying. Derived from the profiles already fetched
+    // above — no extra query. (is_exempt IS NOT TRUE → counts false/null/undefined as paid.)
+    const stats = { active_paid: 0, active_exempt: 0, trial: 0 };
+    (profiles || []).forEach(p => {
+      if (p.subscription_status === 'active') {
+        if (p.is_exempt === true) stats.active_exempt++;
+        else stats.active_paid++;
+      } else if (p.subscription_status === 'trial') {
+        stats.trial++;
+      }
+    });
+
+    // FIX 3: the admin signup graph + headline stats are derived from this response. The
+    // profiles query above has NO date filter, so today's signups are already included.
+    // Disable caching so the dashboard always reflects the latest data.
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.json({ users, stats });
   } catch (err) {
     console.error('Admin users error:', err.message);
     console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
