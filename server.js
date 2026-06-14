@@ -5336,7 +5336,7 @@ async function requireCoach(req, res, next) {
     // Active trial — check the 14-day window
     if (profile.coach_plan_status === 'trial' && profile.coach_trial_start) {
       const trialEnd = new Date(profile.coach_trial_start);
-      trialEnd.setDate(trialEnd.getDate() + 14);
+      trialEnd.setDate(trialEnd.getDate() + 7);
       if (new Date() > trialEnd) {
         await supabase.from('profiles')
           .update({ coach_plan_status: 'expired' })
@@ -6438,8 +6438,15 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
 
       // Get existing plan to update or create new
       const { data: existingPlan } = await supabase.from('plans')
-        .select('id').eq('user_id', client_id)
+        .select('id, workout_plan').eq('user_id', client_id)
         .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+
+      // FIX 7: preserve the client's AI workout plan so they can toggle back to it.
+      // Mirrors the nutrition _ai_backup logic above. If the current plan is already a
+      // coach plan, carry its existing backup forward rather than backing up a coach plan.
+      coachPlanData._ai_backup = existingPlan?.workout_plan
+        ? (existingPlan.workout_plan.coach_assigned ? (existingPlan.workout_plan._ai_backup || null) : existingPlan.workout_plan)
+        : null;
 
       if (existingPlan?.id) {
         await supabase.from('plans').update({
@@ -6557,8 +6564,12 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
           programme_name: data.name,
         };
         const { data: existingPlan } = await supabase.from('plans')
-          .select('id').eq('user_id', data.client_id)
+          .select('id, workout_plan').eq('user_id', data.client_id)
           .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+        // FIX 7: preserve the AI workout backup across coach programme edits.
+        updatedPlanData._ai_backup = existingPlan?.workout_plan
+          ? (existingPlan.workout_plan.coach_assigned ? (existingPlan.workout_plan._ai_backup || null) : existingPlan.workout_plan)
+          : null;
         if (existingPlan?.id) {
           await supabase.from('plans').update({
             workout_plan: updatedPlanData, translations: {},
@@ -6593,6 +6604,27 @@ app.get('/api/coach/clients/:clientId/nutrition-plan', requireAuth, requireCoach
     res.json({ nutrition_plan: planRow?.nutrition_plan || null });
   } catch(err) {
     console.error('[nutrition-plan GET]', err.message);
+    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Returns the client's bodyweight log (weight history) — coach view.
+// Reads bodyweight_log (weight_kg, logged_at) — same source as GET /api/bodyweight.
+app.get('/api/coach/clients/:clientId/bodyweight', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data, error } = await supabase
+      .from('bodyweight_log')
+      .select('weight_kg, logged_at')
+      .eq('user_id', clientId)
+      .order('logged_at', { ascending: false })
+      .limit(60);
+    if (error) throw error;
+    res.json({ bodyweight: data || [] });
+  } catch(err) {
     console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
   }
 });
