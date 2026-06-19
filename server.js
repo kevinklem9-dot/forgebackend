@@ -3706,16 +3706,40 @@ app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
     // FIX 8: exclude archived programmes by default. ?include_archived=true returns all
     // (the frontend uses that to render the collapsed "Archived" section).
     const includeArchived = req.query.include_archived === 'true';
+    const typeFilter = req.query.type;
     let pq = supabase
       .from('programmes')
       .select('id, name, description, created_at, is_active, is_archived, plan_data, programme_type')
       .eq('user_id', req.user.id);
     if (!includeArchived) pq = pq.or('is_archived.is.null,is_archived.eq.false');
+    if (typeFilter === 'nutrition') pq = pq.eq('programme_type', 'nutrition');
+    else if (typeFilter === 'workout') pq = pq.in('programme_type', ['workout', 'custom']);
+    // no typeFilter or typeFilter === 'all' → no additional filter (existing behaviour)
     const { data, error } = await pq.order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ programmes: data || [] });
   } catch(err) {
     console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Returns the user's active nutrition-type programme (or null). Registered BEFORE the
+// /:id/full route so 'active-nutrition' is never captured as an :id param.
+app.get('/api/programmes/active-nutrition', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('programmes')
+      .select('id, name, description, created_at, is_active, plan_data, programme_type')
+      .eq('user_id', req.user.id)
+      .eq('programme_type', 'nutrition')
+      .eq('is_active', true)
+      .or('is_archived.is.null,is_archived.eq.false')
+      .maybeSingle();
+    if (error) throw error;
+    res.json({ programme: data || null });
+  } catch(err) {
+    console.error('Server error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3750,6 +3774,7 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
       .from('programmes')
       .select('id', { count: 'exact', head: true })
       .eq('user_id', req.user.id)
+      .eq('programme_type', programme_type || 'workout') // scope the limit per programme type
       .or('is_archived.is.null,is_archived.eq.false'); // FIX 8: archived don't count toward the limit
 
     if ((count || 0) >= limit) {
@@ -3923,7 +3948,7 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
 
     const { data: prog, error: progErr } = await supabase
       .from('programmes')
-      .select('id, name, plan_data')
+      .select('id, name, plan_data, programme_type')
       .eq('id', id)
       .eq('user_id', req.user.id)
       .maybeSingle();
@@ -3935,6 +3960,34 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
     const pd = prog.plan_data || {};
     const workout_plan = pd.workout ?? pd.workout_plan ?? null;
     let nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
+
+    const progType = prog.programme_type || 'workout';
+
+    if (progType === 'nutrition') {
+      const nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
+      if (!nutrition_plan) return res.status(400).json({ error: 'programme_has_no_plan' });
+      // For nutrition-only programmes: only update nutrition_plan, never touch workout_plan
+      const { data: existingPlan } = await supabase
+        .from('plans').select('workout_plan, translations, source_language')
+        .eq('user_id', req.user.id).maybeSingle();
+      await supabase.from('plans').delete().eq('user_id', req.user.id);
+      const { error: planErr } = await supabase.from('plans').insert({
+        user_id: req.user.id,
+        workout_plan: existingPlan?.workout_plan ?? null,
+        nutrition_plan,
+        translations: existingPlan?.translations ?? {},
+        source_language: existingPlan?.source_language ?? 'en'
+      });
+      if (planErr) throw planErr;
+      // Deactivate other nutrition programmes only, then activate this one
+      await supabase.from('programmes').update({ is_active: false })
+        .eq('user_id', req.user.id).eq('programme_type', 'nutrition');
+      await supabase.from('programmes').update({
+        is_active: true, updated_at: new Date().toISOString()
+      }).eq('id', id).eq('user_id', req.user.id);
+      return res.json({ ok: true });
+    }
+
     if (!workout_plan) return res.status(400).json({ error: 'programme_has_no_plan' });
 
     // Workout-only programmes (e.g. the custom builder, programme_type 'custom') carry no
