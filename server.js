@@ -721,7 +721,7 @@ const corsOptions = {
       // Dev origins only outside production — never trust localhost in prod.
       ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:8080'] : []),
     ].filter(Boolean);
-    if (allowed.some(o => origin.startsWith(o))) return callback(null, true);
+    if (allowed.includes(origin)) return callback(null, true);
     callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -1440,15 +1440,17 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Transfer-Encoding', 'chunked');
   res.setHeader('X-Accel-Buffering', 'no');
+  res.writeHead(200); // commit headers as 200 up front (before the heartbeat flushes them)
 
-  // Send a heartbeat comment every 20 seconds to prevent proxy timeout
+  // Send a heartbeat every 20 seconds to prevent proxy timeout (real byte, not '' —
+  // an empty string sends zero bytes in chunked encoding and never keeps the socket alive)
   const heartbeat = setInterval(() => {
-    try { res.write(''); } catch(e) { clearInterval(heartbeat); }
+    try { res.write('\n'); } catch(e) { clearInterval(heartbeat); }
   }, 20000);
 
   const sendResponse = (status, data) => {
     clearInterval(heartbeat);
-    res.status(status).end(JSON.stringify(data));
+    res.end(JSON.stringify(data));
   };
 
   try {
@@ -1604,7 +1606,8 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     // Delete any existing plan for this user first (clean slate)
     console.log('Deleting existing plan...');
-    await supabase.from('plans').delete().eq('user_id', req.user.id);
+    const { error: deleteError } = await supabase.from('plans').delete().eq('user_id', req.user.id);
+    if (deleteError) console.error('[generate-plan] delete error:', deleteError);
 
     // Save to DB — reset translations cache, store source language
     console.log('Inserting new plan...');
@@ -1623,12 +1626,13 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     // Also save to programmes table (deactivate existing, add new active one)
     const planName = `${profile?.goal || 'My'} Plan — ${new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
     await supabase.from('programmes').update({ is_active: false }).eq('user_id', req.user.id);
-    const { data: obProg } = await supabase.from('programmes').insert({
+    const { data: obProg, error: progInsertError } = await supabase.from('programmes').insert({
       user_id: req.user.id,
       name: planName,
       plan_data: { workout: plan.workout, nutrition: plan.nutrition },
       is_active: true
     }).select('id').maybeSingle();
+    if (progInsertError) console.error('[generate-plan] programmes insert error:', progInsertError);
     // One-line AI description for the My Programmes list — async, doesn't block onboarding.
     if (obProg?.id) {
       generateProgrammeDescription(obProg.id, {
@@ -1640,7 +1644,11 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     }
 
     // Mark onboarding complete
-    await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
+    const { error: onboardingError } = await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
+    if (onboardingError) {
+      console.error('[generate-plan] onboarding_complete update failed:', onboardingError);
+      return sendResponse(500, { error: 'Plan generated but failed to complete setup. Please try again.' });
+    }
 
     console.log('Plan generated successfully for:', profile.name);
     sendResponse(200, { plan: data });
