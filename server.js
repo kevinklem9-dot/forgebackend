@@ -6563,6 +6563,15 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
           generated_at: new Date().toISOString(),
         });
       }
+      // Deactivate the client's saved nutrition programmes so they don't shadow the
+      // coach plan on next boot. Best-effort: must never block the response or push.
+      try {
+        await supabase
+          .from('programmes')
+          .update({ is_active: false })
+          .eq('user_id', client_id)
+          .eq('programme_type', 'nutrition');
+      } catch (_) { /* best-effort */ }
       await sendPushToUser(client_id, 'Nutrition plan updated',
         'Your coach has updated your nutrition plan',
         '/app.html?panel=nutrition').catch(() => {});
@@ -6890,6 +6899,15 @@ app.patch('/api/coach/clients/:clientId/activate-coach-nutrition', requireAuth, 
         generated_at: new Date().toISOString(),
       });
     }
+    // Deactivate the client's saved nutrition programmes so they don't shadow the
+    // coach plan on next boot. Best-effort: must never block the response or push.
+    try {
+      await supabase
+        .from('programmes')
+        .update({ is_active: false })
+        .eq('user_id', clientId)
+        .eq('programme_type', 'nutrition');
+    } catch (_) { /* best-effort */ }
     await sendPushToUser(clientId, 'Nutrition plan updated',
       'Your coach switched you to their nutrition plan.',
       '/app.html?panel=nutrition').catch(() => {});
