@@ -2814,7 +2814,7 @@ app.get('/api/bodyweight/history', requireAuth, async (req, res) => {
     const starting_weight = history[0].weight_kg;
     const current_weight = history[history.length - 1].weight_kg;
     const change = Number(current_weight) - Number(starting_weight);
-    const total_change = (change >= 0 ? '+' : '−') + Math.abs(change).toFixed(1);
+    const total_change = (change >= 0 ? '+' : '-') + Math.abs(change).toFixed(1);
 
     res.json({
       history,
@@ -6135,6 +6135,23 @@ app.get('/api/my-coach-messages', requireAuth, async (req, res) => {
       .eq('sender_role', 'coach').is('read_at', null);
     res.json({ messages: (data || []).reverse(), coach_id: link.coach_id });
   } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/my-coach/feedback', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('coach_session_feedback')
+      .select('id, feedback_text, created_at, session_log_id, is_general, seen_by_client')
+      .eq('client_id', req.user.id)
+      .eq('visible_to_client', true)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) throw error;
+    res.json({ feedback: data || [] });
+  } catch(err) {
+    console.error('Server error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.post('/api/my-coach-messages', requireAuth, async (req, res) => {
