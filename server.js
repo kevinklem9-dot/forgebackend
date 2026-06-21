@@ -6503,7 +6503,21 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
           label: s.name || `Day ${i + 1}`,
           coach_note: s.note || null,
           scheduled_days: Array.isArray(s.scheduled_days) ? s.scheduled_days : [],
-          exercises: (s.exercises || []).map(e => ({
+          exercises: (s.exercises || []).map(e => (e.cardio ? {
+            name: e.name,
+            cardio: true,
+            sets_data: [{
+              cardio: true,
+              type: 'cardio',
+              duration: { value: parseFloat(String(e.duration||'').replace(',','.')) || null, unit: 'min' },
+              distance: { value: parseFloat(String(e.distance||'').replace(',','.')) || null, unit: 'km' },
+              intensity: e.intensity || null,
+              intervals: null
+            }],
+            sets: 1,
+            reps_range: e.reps || null,
+            target_sets: 1
+          } : {
             name: e.name,
             sets: e.sets,
             reps: e.reps,
@@ -6652,7 +6666,21 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
             label: s.name || `Day ${i + 1}`,
             coach_note: s.note || null,
             scheduled_days: Array.isArray(s.scheduled_days) ? s.scheduled_days : [],
-            exercises: (s.exercises || []).map(e => ({
+            exercises: (s.exercises || []).map(e => (e.cardio ? {
+              name: e.name,
+              cardio: true,
+              sets_data: [{
+                cardio: true,
+                type: 'cardio',
+                duration: { value: parseFloat(String(e.duration||'').replace(',','.')) || null, unit: 'min' },
+                distance: { value: parseFloat(String(e.distance||'').replace(',','.')) || null, unit: 'km' },
+                intensity: e.intensity || null,
+                intervals: null
+              }],
+              sets: 1,
+              reps_range: e.reps || null,
+              target_sets: 1
+            } : {
               name: e.name, sets: e.sets, reps: e.reps,
               rest: e.rpe || e.weight || null,
             }))
@@ -6830,7 +6858,21 @@ app.patch('/api/coach/clients/:clientId/activate-coach-plan', requireAuth, requi
         label: s.name || `Day ${i + 1}`,
         coach_note: s.note || null,
         scheduled_days: Array.isArray(s.scheduled_days) ? s.scheduled_days : [],
-        exercises: (s.exercises || []).map(e => ({
+        exercises: (s.exercises || []).map(e => (e.cardio ? {
+          name: e.name,
+          cardio: true,
+          sets_data: [{
+            cardio: true,
+            type: 'cardio',
+            duration: { value: parseFloat(String(e.duration||'').replace(',','.')) || null, unit: 'min' },
+            distance: { value: parseFloat(String(e.distance||'').replace(',','.')) || null, unit: 'km' },
+            intensity: e.intensity || null,
+            intervals: null
+          }],
+          sets: 1,
+          reps_range: e.reps || null,
+          target_sets: 1
+        } : {
           name: e.name, sets: e.sets, reps: e.reps,
           rest: e.rpe || e.weight || null,
           note: `${e.rpe ? 'RPE ' + e.rpe : ''}${e.weight ? e.weight : ''}`.trim() || null,
