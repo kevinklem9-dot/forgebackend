@@ -6502,6 +6502,7 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
           day_name: s.name || `Day ${i + 1}`,
           label: s.name || `Day ${i + 1}`,
           coach_note: s.note || null,
+          scheduled_days: Array.isArray(s.scheduled_days) ? s.scheduled_days : [],
           exercises: (s.exercises || []).map(e => ({
             name: e.name,
             sets: e.sets,
@@ -6650,6 +6651,7 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
             day_name: s.name || `Day ${i + 1}`,
             label: s.name || `Day ${i + 1}`,
             coach_note: s.note || null,
+            scheduled_days: Array.isArray(s.scheduled_days) ? s.scheduled_days : [],
             exercises: (s.exercises || []).map(e => ({
               name: e.name, sets: e.sets, reps: e.reps,
               rest: e.rpe || e.weight || null,
@@ -6827,6 +6829,7 @@ app.patch('/api/coach/clients/:clientId/activate-coach-plan', requireAuth, requi
         day_name: s.name || `Day ${i + 1}`,
         label: s.name || `Day ${i + 1}`,
         coach_note: s.note || null,
+        scheduled_days: Array.isArray(s.scheduled_days) ? s.scheduled_days : [],
         exercises: (s.exercises || []).map(e => ({
           name: e.name, sets: e.sets, reps: e.reps,
           rest: e.rpe || e.weight || null,
