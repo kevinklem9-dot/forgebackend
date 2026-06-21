@@ -6540,6 +6540,14 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
           generated_at: new Date().toISOString(),
         });
       }
+
+      // Deactivate the client's saved workout/custom programmes so they don't shadow
+      // the coach plan on next boot. Best-effort: must never block the response or push.
+      try {
+        await supabase.from('programmes').update({ is_active: false })
+          .eq('user_id', client_id)
+          .in('programme_type', ['workout', 'custom']);
+      } catch (_) {}
     }
 
     // Nutrition assignment → write nutrition_plan into the client's live plan
@@ -6772,6 +6780,24 @@ app.patch('/api/coach/clients/:clientId/activate-ai-plan', requireAuth, requireC
         generated_at: new Date().toISOString(),
       }).eq('id', planRow.id);
     }
+    // Switching back to the AI plan: reactivate the client's most recent non-archived
+    // workout/custom programme so My Programmes shows an ACTIVE plan again. Best-effort.
+    try {
+      const { data: latestProg } = await supabase
+        .from('programmes')
+        .select('id')
+        .eq('user_id', clientId)
+        .in('programme_type', ['workout', 'custom'])
+        .or('is_archived.is.null,is_archived.eq.false')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (latestProg?.id) {
+        await supabase.from('programmes')
+          .update({ is_active: true })
+          .eq('id', latestProg.id);
+      }
+    } catch (_) {}
     await sendPushToUser(clientId, 'Workout plan updated',
       'Your coach switched you to the AI workout plan.',
       '/app.html?panel=workout').catch(() => {});
@@ -6828,6 +6854,13 @@ app.patch('/api/coach/clients/:clientId/activate-coach-plan', requireAuth, requi
         generated_at: new Date().toISOString(),
       });
     }
+    // Deactivate the client's saved workout/custom programmes so they don't shadow the
+    // coach plan on next boot (mirrors the nutrition deactivation in POST /coach/programmes).
+    try {
+      await supabase.from('programmes').update({ is_active: false })
+        .eq('user_id', clientId)
+        .in('programme_type', ['workout', 'custom']);
+    } catch (_) {}
     await sendPushToUser(clientId, 'Workout plan updated',
       'Your coach switched you to their workout plan.',
       '/app.html?panel=workout').catch(() => {});
