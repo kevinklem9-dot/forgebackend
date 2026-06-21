@@ -6624,11 +6624,19 @@ app.post('/api/coach/generate-shopping-list', requireAuth, requireCoach, async (
     }
     const mealsForPrompt = meals.map(m => ({
       name: m.name || '',
-      foods: m.foods || m.note || m.notes || '',
+      foods: (Array.isArray(m.foods) && m.foods.length)
+        ? m.foods
+        : (m.notes || m.note || ''),
       kcal: m.kcal != null ? m.kcal : m.calories,
       protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g,
     }));
-    const prompt = `Based on these meals for a client's weekly nutrition plan, generate a practical weekly shopping list grouped by category (Proteins, Vegetables, Fruits, Grains/Carbs, Dairy, Fats/Oils, Other). Assume a full 7-day week and be specific with quantities where possible. Return ONLY the shopping list as plain text: each category as an UPPERCASE heading on its own line, followed by "- item (quantity)" bullet lines. No preamble, no closing remarks.\n\nMeals: ${JSON.stringify(mealsForPrompt)}`;
+    const prompt = `Based on these meals for a client's weekly nutrition plan, generate a practical weekly shopping list grouped by category (Proteins, Vegetables, Fruits, Grains/Carbs, Dairy, Fats/Oils, Other). Assume a full 7-day week and be specific with quantities where possible. Return ONLY the shopping list as plain text: each category as an UPPERCASE heading on its own line, followed by "- item (quantity)" bullet lines. No preamble, no closing remarks.\n\nMeals:\n${mealsForPrompt.map(m => {
+    const detail = Array.isArray(m.foods) && m.foods.length
+      ? 'Foods: ' + m.foods.map(f => f.name || f).join(', ')
+      : (m.foods ? 'Description: ' + m.foods : 'No specific foods listed');
+    return m.name + ' (' + m.kcal + ' kcal, ' + m.protein_g + 'g protein, ' +
+      m.carbs_g + 'g carbs, ' + m.fat_g + 'g fat) — ' + detail;
+  }).join('\n')}`;
     const message = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 1500,
