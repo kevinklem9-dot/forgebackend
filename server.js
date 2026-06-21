@@ -1633,6 +1633,30 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       is_active: true
     }).select('id').maybeSingle();
     if (progInsertError) console.error('[generate-plan] programmes insert error:', progInsertError);
+
+    // Also save the AI nutrition plan as its own active 'nutrition' programme row so it shows
+    // in My Programmes (and stays available to switch back to if a coach later assigns a custom
+    // nutrition plan). Deactivate any existing nutrition programmes first so only one is active.
+    // Best-effort — must never block onboarding.
+    try {
+      await supabase.from('programmes')
+        .update({ is_active: false })
+        .eq('user_id', req.user.id)
+        .eq('programme_type', 'nutrition');
+    } catch(_) {}
+    try {
+      await supabase.from('programmes').insert({
+        user_id: req.user.id,
+        name: (profile?.goal || 'My') + ' Nutrition Plan — ' +
+          new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' }),
+        plan_data: { nutrition: plan.nutrition },
+        programme_type: 'nutrition',
+        is_active: true
+      });
+    } catch(nutritionProgErr) {
+      console.error('[generate-plan] nutrition programme insert error:', nutritionProgErr);
+    }
+
     // One-line AI description for the My Programmes list — async, doesn't block onboarding.
     if (obProg?.id) {
       generateProgrammeDescription(obProg.id, {
