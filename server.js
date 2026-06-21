@@ -6222,11 +6222,6 @@ app.get('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, asyn
       .order('created_at', { ascending: false })
       .limit(300);
     if (error) throw error;
-    // Mark unread client-sent messages as read
-    await supabase.from('coach_messages')
-      .update({ read_at: new Date().toISOString() })
-      .eq('coach_id', req.user.id).eq('client_id', clientId)
-      .eq('sender_role', 'client').is('read_at', null);
     res.json({ messages: (data || []).reverse() });
   } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
