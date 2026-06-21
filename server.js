@@ -5252,6 +5252,15 @@ app.get('/api/founding-member/slots', async (req, res) => {
 
 app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
   try {
+    // SECURITY: self-service founding-member claims are disabled. This endpoint granted a
+    // free lifetime subscription (subscription_status='lifetime') with NO payment check.
+    // The only legitimate lifetime-grant path is the Stripe webhook
+    // (checkout.session.completed, billing==='lifetime'). Handler preserved below for
+    // reference; this guard returns 403 for every request and MUST stay first in the try
+    // block so it fires before any DB read.
+    return res.status(403).json({
+      error: 'Founding member claims are closed.'
+    });
     const { tier } = req.body; // 'iron' or 'steel'
     if (!['iron','steel'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
     const { data: config } = await supabase.from('founding_member_config').select('*').maybeSingle();
@@ -5297,6 +5306,27 @@ app.post('/api/referral/apply', requireAuth, async (req, res) => {
   try {
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'No code' });
+
+    // SECURITY (guard): block repeat trial-extension. Without this, any user could re-apply a
+    // referral code on every call and keep pushing trial_ends_at out (= permanent free access).
+    // 1) refuse if already on a paid/lifetime plan; 2) dedup on referred_by, which this
+    // endpoint already sets on a successful apply, so a referral can be applied only once.
+    // (referred_by is the existing column that records a referral was applied — used instead
+    // of a new referral_applied_at column to avoid a schema migration / deploy window.)
+    const { data: prof } = await supabase
+      .from('profiles')
+      .select('subscription_status, trial_ends_at, referred_by')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (prof && ['active', 'lifetime'].includes(prof.subscription_status)) {
+      return res.status(400).json({
+        error: 'Cannot apply code to an active subscription.'
+      });
+    }
+    if (prof && prof.referred_by) {
+      return res.status(400).json({ error: 'Referral code already applied.' });
+    }
+
     const { data: referrer } = await supabase.from('profiles').select('id, referral_stats').eq('referral_code', code.toUpperCase()).maybeSingle();
     if (!referrer) return res.status(404).json({ error: 'Invalid code' });
     if (referrer.id === req.user.id) return res.status(400).json({ error: 'Cannot refer yourself' });
@@ -5329,6 +5359,29 @@ app.post('/api/creator-code/validate', async (req, res) => {
 
 app.post('/api/creator-code/redeem', requireAuth, async (req, res) => {
   try {
+    // SECURITY (guard): block repeat trial-extension. Without this, any user could redeem a
+    // creator code on every call and keep extending trial_ends_at (= permanent free Forge
+    // access, since trial grants full access). 1) refuse if already on a paid/lifetime plan;
+    // 2) dedup via the existing creator_code_uses table — one creator-code redemption per user.
+    const { data: prof } = await supabase
+      .from('profiles')
+      .select('subscription_status, trial_ends_at')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (prof && ['active', 'lifetime'].includes(prof.subscription_status)) {
+      return res.status(400).json({
+        error: 'Cannot apply code to an active subscription.'
+      });
+    }
+    const { data: priorUses } = await supabase
+      .from('creator_code_uses')
+      .select('id')
+      .eq('user_id', req.user.id)
+      .limit(1);
+    if (priorUses && priorUses.length) {
+      return res.status(400).json({ error: 'Creator code already applied.' });
+    }
+
     const { code } = req.body;
     const { data } = await supabase.from('creator_codes')
       .select('*').eq('code', code.toUpperCase().trim()).maybeSingle();
@@ -7226,8 +7279,12 @@ app.get('/api/coach/seat-count', requireAuth, requireCoach, async (req, res) => 
 // 10-min window. Authenticated with the shared x-cron-secret.
 app.post('/api/cron/reminders', async (req, res) => {
   try {
-    if (req.headers['x-cron-secret'] !== process.env.CRON_SECRET) {
-      return res.status(401).json({ error: 'Unauthorised' });
+    // Fail-closed: if CRON_SECRET is unset, `undefined !== undefined` is false and the old
+    // check passed — letting an unauthenticated caller trigger mass push. Require the header
+    // to be present AND match (mirrors the sibling check in /api/coach/check-inactive-clients).
+    const cronSecret = req.headers['x-cron-secret'];
+    if (!cronSecret || cronSecret !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
     const now = new Date();
     // Active + trial users with a reminder set (is_frozen filtered in JS for correct NULL handling).
