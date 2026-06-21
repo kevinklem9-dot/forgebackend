@@ -5457,7 +5457,7 @@ async function countActiveClients(coachId) {
 // Generates a private, coach-facing overview of a client and stores it on the
 // coach_clients connection row. Declared as a function declaration so it is
 // hoisted and callable from the connection-accept handler defined earlier.
-async function generateClientSummary(coachId, clientId) {
+async function generateClientSummary(coachId, clientId, lang) {
   // Full profile (only columns that exist on profiles — there is no `sport` column)
   const { data: prof } = await supabase
     .from('profiles')
@@ -5498,7 +5498,12 @@ async function generateClientSummary(coachId, clientId) {
     current_streak: streakRow?.current_streak || 0,
   };
 
-  const prompt = `You are writing a private client overview for a fitness coach.
+  // Optional language: defaults to English (LANG_NAMES omits 'en'), so a missing/'en'/unknown
+  // code yields no instruction and the prompt stays byte-identical to the original English behaviour.
+  const langName = LANG_NAMES[lang] || 'English';
+  const langInstruction = (langName === 'English') ? '' : `Write this summary in ${langName}. `;
+
+  const prompt = `${langInstruction}You are writing a private client overview for a fitness coach.
 Based on the following client data, write a concise 3-4 paragraph
 professional summary that covers:
 1. Who they are and their primary goal (be specific — if goal is
@@ -5534,10 +5539,11 @@ Client data: ${JSON.stringify(clientData)}`;
 app.post('/api/coach/clients/:clientId/generate-summary', requireAuth, requireCoach, async (req, res) => {
   try {
     const { clientId } = req.params;
+    const { lang } = req.body || {};
     if (!await verifyClientConnection(req.user.id, clientId)) {
       return res.status(403).json({ error: 'no_connection' });
     }
-    const summary = await generateClientSummary(req.user.id, clientId);
+    const summary = await generateClientSummary(req.user.id, clientId, lang);
     res.json({ summary, summary_generated_at: new Date().toISOString() });
   } catch(err) {
     console.error('[generate-summary]', err.message);
