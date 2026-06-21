@@ -3232,7 +3232,7 @@ app.get('/api/plan/days', requireAuth, async (req, res) => {
 // ── REPAIR PLAN DAYS (fix corrupted day_index values) ──
 app.post('/api/plan/repair-days', requireAuth, async (req, res) => {
   try {
-    const { data: planData } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const { data: planData } = await supabase.from('plans').select('id, user_id, workout_plan, nutrition_plan, generated_at, source_language').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle();
     if (!planData) return res.status(404).json({ error: 'No plan found' });
 
     const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
@@ -4263,7 +4263,7 @@ app.post('/api/review/generate', requireAuth, loadSubscription, async (req, res)
 
     const [profileRes, sessionsRes, prsRes] = await Promise.all([
       supabase.from('profiles').select('name, goal, days_per_week').eq('id', userId).maybeSingle(),
-      supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', weekStart.toISOString()),
+      supabase.from('session_logs').select('*').eq('user_id', userId).gte('created_at', weekStart.toISOString()),
       supabase.from('personal_records').select('exercise_name, weight_kg, reps').eq('user_id', userId).gte('achieved_at', weekStartStr),
     ]);
 
@@ -4396,7 +4396,7 @@ app.post('/api/monthly-review/generate', requireAuth, loadSubscription, async (r
 
     const [profileRes, sessionsRes, prsRes, metricsRes] = await Promise.all([
       supabase.from('profiles').select('name, goal, experience, days_per_week').eq('id', userId).maybeSingle(),
-      supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', monthStart).order('created_at', { ascending: false }),
+      supabase.from('session_logs').select('*').eq('user_id', userId).gte('created_at', monthStart).order('created_at', { ascending: false }),
       supabase.from('personal_records').select('exercise_name, weight_kg, reps').eq('user_id', userId).gte('achieved_at', monthStart),
       supabase.from('body_metrics').select('weight_kg, logged_at').eq('user_id', userId).gte('logged_at', monthStart).order('logged_at', { ascending: false }),
     ]);
@@ -7368,7 +7368,7 @@ app.post('/api/coach/check-inactive-clients', async (req, res) => {
     let notified = 0;
     for (const link of (links || [])) {
       if (!link.client_id) continue;
-      const { data: lastLog } = await supabase.from('workout_logs')
+      const { data: lastLog } = await supabase.from('session_logs')
         .select('created_at').eq('user_id', link.client_id)
         .order('created_at', { ascending: false }).limit(1).maybeSingle();
       if (!lastLog?.created_at) continue;
