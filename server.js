@@ -5133,6 +5133,26 @@ async function sendPushToUser(userId, title, body, url = '/') {
     if (!subs?.length) return;
     const payload = JSON.stringify({ title, body, url });
     for (const row of subs) {
+      // Send-time SSRF guard (defence-in-depth): even if a stale/invalid endpoint slipped
+      // into the DB before subscribe-time validation existed, never POST to a host outside
+      // the known push services. Uses `continue` (not `return`) so the user's OTHER valid
+      // devices still receive the push — matches this loop's existing per-row "ignore
+      // individual failures" design. (No caller reads sendPushToUser's return value.)
+      const ALLOWED_PUSH_HOSTS = [
+        'https://fcm.googleapis.com',
+        'https://updates.push.services.mozilla.com',
+        'https://push.services.mozilla.com',
+        'https://web.push.apple.com',
+        'https://api.push.apple.com',
+        'https://androidpush.googleapis.com',
+        'https://fcm-push-gateway.googleapis.com',
+      ];
+      const sendEndpoint = row?.subscription?.endpoint || '';
+      if (!sendEndpoint || !ALLOWED_PUSH_HOSTS.some(h => sendEndpoint.startsWith(h))) {
+        console.warn('[sendPushToUser] blocked invalid endpoint:',
+          sendEndpoint.substring(0, 80));
+        continue;
+      }
       try {
         await fetch(row.subscription.endpoint, {
           method: 'POST',
@@ -5150,8 +5170,42 @@ async function sendPushToUser(userId, title, body, url = '/') {
 // Subscribe to push
 app.post('/api/push/subscribe', requireAuth, async (req, res) => {
   try {
-    const { subscription } = req.body;
-    if (!subscription?.endpoint) return res.status(400).json({ error: 'Invalid subscription' });
+    const { subscription } = req.body || {};
+    if (!subscription || typeof subscription !== 'object') {
+      return res.status(400).json({ error: 'Invalid subscription' });
+    }
+
+    const endpoint = subscription?.endpoint;
+    if (!endpoint || typeof endpoint !== 'string') {
+      return res.status(400).json({ error: 'Invalid subscription endpoint' });
+    }
+
+    // SSRF guard: only store push subscriptions whose endpoint points at a known push
+    // service. sendPushToUser() later POSTs server-side to this stored endpoint, so an
+    // unvalidated client-supplied URL could target internal infrastructure. startsWith
+    // (not includes) — the host is a prefix; real endpoints have a path after it.
+    const ALLOWED_PUSH_HOSTS = [
+      'https://fcm.googleapis.com',
+      'https://updates.push.services.mozilla.com',
+      'https://push.services.mozilla.com',
+      'https://web.push.apple.com',
+      'https://api.push.apple.com',
+      'https://androidpush.googleapis.com',
+      'https://fcm-push-gateway.googleapis.com',
+    ];
+
+    const endpointAllowed = ALLOWED_PUSH_HOSTS.some(host =>
+      endpoint.startsWith(host)
+    );
+
+    if (!endpointAllowed) {
+      console.warn('[push/subscribe] rejected endpoint:',
+        endpoint.substring(0, 80));
+      return res.status(400).json({
+        error: 'Invalid push endpoint'
+      });
+    }
+
     await supabase.from('push_subscriptions').upsert({
       user_id: req.user.id,
       subscription,
