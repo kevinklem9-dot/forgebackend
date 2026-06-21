@@ -1576,14 +1576,24 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
         console.log(`Attempt ${attempt}: calling Anthropic...`);
         const message = await anthropic.messages.create({
           model: 'claude-haiku-4-5-20251001',
-          max_tokens: 8000,
+          max_tokens: 16000,
           messages: [{ role: 'user', content: prompt }]
         });
         const raw = message.content[0].text;
+        console.log(`[generate-plan] attempt ${attempt} response length: ${raw.length} chars`);
         console.log(`Attempt ${attempt}: Anthropic responded, length:`, raw.length);
 
         // Strip markdown fences
         let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+        // Truncation guard: a complete plan object ends with '}'. If the stripped response
+        // does not, the model hit the max_tokens ceiling mid-JSON — throw a clear error so
+        // Railway logs show the real cause (and the retry loop tries again) instead of a
+        // cryptic JSON.parse failure. Must run BEFORE the substring() extraction below, which
+        // would otherwise always force a trailing '}'.
+        if (clean.length > 100 && !clean.trimEnd().endsWith('}')) {
+          throw new Error('Response truncated — JSON incomplete');
+        }
 
         // Find outermost { }
         const start = clean.indexOf('{');
