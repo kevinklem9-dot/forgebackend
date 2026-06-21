@@ -1023,10 +1023,39 @@ const planLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 20, skip: skipNon
 const checkinLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, skip: skipNonProd, message: { error: 'Too many check-ins — slow down.' } });
 const signupLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 50, skip: skipNonProd, message: { error: 'Too many signups — try again later.' } });
 const resetLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, skip: skipNonProd, message: { error: 'Too many reset attempts — try again later.' } });
+
+// Dedicated AI-endpoint limiters (per-IP, hourly) — same pattern as the limiters above and
+// skipped outside production via skipNonProd. These routes previously had only the global
+// 500/15min limiter, which is weak protection against token-cost abuse.
+const aiLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  skip: skipNonProd,
+  message: { error: 'Too many AI requests. Please wait before trying again.' }
+});
+
+const summaryLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  skip: skipNonProd,
+  message: { error: 'Too many summary generations. Please wait.' }
+});
+
+const programmesGenLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  skip: skipNonProd,
+  message: { error: 'Too many programme generations. Please wait before trying again.' }
+});
 app.use('/api/', limiter);
 app.use('/api/chat', chatLimiter);
 app.use('/api/generate-plan', planLimiter);
 app.use('/api/checkin', checkinLimiter);
+app.use('/api/programmes/generate', programmesGenLimiter);
+app.use('/api/translate-plan', aiLimiter);
+app.use('/api/review/generate', aiLimiter);
+app.use('/api/monthly-review/generate', aiLimiter);
+app.use('/api/coach/generate-shopping-list', aiLimiter);
 
 // ── REQUEST TIMEOUT ────────────────────────────
 // Fail a stuck request at 30s instead of holding the socket open to the 180s
@@ -5589,7 +5618,7 @@ Client data: ${JSON.stringify(clientData)}`;
 }
 
 // On-demand summary generation / regeneration for a coach viewing a client.
-app.post('/api/coach/clients/:clientId/generate-summary', requireAuth, requireCoach, async (req, res) => {
+app.post('/api/coach/clients/:clientId/generate-summary', requireAuth, requireCoach, summaryLimiter, async (req, res) => {
   try {
     const { clientId } = req.params;
     const { lang } = req.body || {};
