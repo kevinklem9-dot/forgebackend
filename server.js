@@ -5563,11 +5563,29 @@ app.post('/api/coach/setup', requireAuth, async (req, res) => {
     const planConfig = COACH_PLAN_CONFIG[plan];
     const userId = req.user.id;
 
+    // SECURITY: block infinite free-trial resets. Read the existing profile first — if a
+    // coach trial was already started, preserve the ORIGINAL coach_trial_start and mark the
+    // status 'expired' so requireCoach enforces payment immediately (mirrors the isPostTrial
+    // guard in the Stripe webhook). maybeSingle() → null on a missing row (never throws).
+    const { data: existingProfile } = await supabase
+      .from('profiles')
+      .select('coach_trial_start, coach_plan_status')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    const hadPriorTrial = !!(existingProfile?.coach_trial_start);
+    const trialStart = hadPriorTrial
+      ? existingProfile.coach_trial_start
+      : new Date().toISOString();
+    const currentStatus = existingProfile?.coach_plan_status;
+    const trialStatus = hadPriorTrial
+      ? (currentStatus === 'active' ? 'active' : 'expired')
+      : 'trial';
+
     const updates = {
       account_type: 'coach',
       coach_plan: plan,
-      coach_plan_status: 'trial',
-      coach_trial_start: new Date().toISOString(),
+      coach_plan_status: trialStatus,
+      coach_trial_start: trialStart,
       coach_commission_rate: planConfig.commissionRate,
       coach_bio: (bio || '').toString().slice(0, 200) || null,
       coach_title: (title || '').toString().slice(0, 100),
@@ -5578,7 +5596,7 @@ app.post('/api/coach/setup', requireAuth, async (req, res) => {
     const { error } = await supabase.from('profiles').update(updates).eq('id', userId);
     if (error) throw error;
 
-    res.json({ ok: true, plan, status: 'trial' });
+    res.json({ ok: true, plan, status: trialStatus });
   } catch(err) {
     console.error('Coach setup error:', err.message);
     console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
