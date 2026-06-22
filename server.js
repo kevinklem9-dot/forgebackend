@@ -973,7 +973,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     res.json({ received: true });
   } catch(err) {
     console.error('Webhook handler error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1066,6 +1066,7 @@ const TIMEOUT_EXEMPT = [
   '/api/generate-plan', '/api/chat', '/api/checkin', '/api/translate-plan',
   '/api/review/generate', '/api/monthly-review/generate',
   '/api/exercise/video', '/api/exercise/buftest',
+  '/api/notifications/unread-counts',
 ];
 app.use((req, res, next) => {
   if (!TIMEOUT_EXEMPT.some(p => req.path.startsWith(p))) {
@@ -1092,34 +1093,39 @@ app.use((req, res, next) => {
 
 // ── AUTH MIDDLEWARE ────────────────────────────
 async function requireAuth(req, res, next) {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'Unauthorised' });
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Unauthorised' });
 
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-  if (error || !user) {
-    console.warn(`Auth failed: ${req.ip} — ${error?.message || 'invalid token'}`);
-    return res.status(401).json({ error: 'Invalid token' });
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) {
+      console.warn(`Auth failed: ${req.ip} — ${error?.message || 'invalid token'}`);
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    req.user = user;
+
+    // Check frozen status on every authenticated request
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('is_frozen, subscription_tier, subscription_status, trial_ends_at, is_exempt')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (profile?.is_frozen) {
+      return res.status(403).json({
+        error: 'account_frozen',
+        message: 'Your account has been suspended. Contact support to resolve this.'
+      });
+    }
+
+    // Cache profile data on request so loadSubscription doesn't need to re-fetch
+    req.profileCache = profile || null;
+    next();
+  } catch(err) {
+    console.error('[requireAuth] unexpected error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Authentication error' });
   }
-
-  req.user = user;
-
-  // Check frozen status on every authenticated request
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('is_frozen, subscription_tier, subscription_status, trial_ends_at, is_exempt')
-    .eq('id', user.id)
-    .maybeSingle();
-
-  if (profile?.is_frozen) {
-    return res.status(403).json({
-      error: 'account_frozen',
-      message: 'Your account has been suspended. Contact support to resolve this.'
-    });
-  }
-
-  // Cache profile data on request so loadSubscription doesn't need to re-fetch
-  req.profileCache = profile || null;
-  next();
 }
 
 
@@ -1442,7 +1448,7 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
     res.json({ requires_confirmation: true, email });
   } catch (err) {
     console.error('Signup error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1459,7 +1465,7 @@ app.post('/api/reset-password', resetLimiter, async (req, res) => {
     if (error) console.error('Reset password error:', error.message);
     res.json({ success: true });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1920,7 +1926,7 @@ app.post('/api/translate-plan', requireAuth, async (req, res) => {
     res.json({ ok: true, ...result });
   } catch (err) {
     console.error('translate-plan error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1958,7 +1964,7 @@ app.get('/api/plan', requireAuth, async (req, res) => {
     res.json({ plan: { ...planWithoutCache, workout_plan, nutrition_plan } });
   } catch (err) {
     console.error('Get plan error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1974,7 +1980,7 @@ app.get('/api/profile', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ profile: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2040,7 +2046,7 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     res.json({ profile: data });
   } catch (err) {
     console.error('Profile update error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2195,7 +2201,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
   } catch (err) {
     console.error('Chat error:', err.message);
     console.error('Chat stack:', err.stack);
-    res.status(500).json({ error: 'Internal server error' });
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2440,7 +2446,7 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
     if (err.message?.includes('overloaded') || err.status === 529) {
       return res.status(503).json({ error: 'AI is busy — please try again in a moment.' });
     }
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2570,7 +2576,7 @@ app.post('/api/log', requireAuth, async (req, res) => {
     res.json({ success: true, new_prs: prUpdates });
   } catch (err) {
     console.error('Log error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2588,7 +2594,7 @@ app.get('/api/history/:exerciseName', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ history: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2608,7 +2614,7 @@ app.get('/api/history', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ history: (data || []).reverse() });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2638,7 +2644,7 @@ app.get('/api/sessions', requireAuth, async (req, res) => {
     res.json({ sessions: data || [] });
   } catch (err) {
     console.error('[sessions] error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2655,7 +2661,7 @@ app.get('/api/prs', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ prs: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2691,7 +2697,7 @@ app.get('/api/prs/search', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ prs: data || [] });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2736,7 +2742,7 @@ app.post('/api/bodyweight', requireAuth, async (req, res) => {
     res.json({ success: true, entry: data });
   } catch (err) {
     console.error('[bodyweight] save exception:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2828,7 +2834,7 @@ app.get('/api/stats', requireAuth, async (req, res) => {
     res.json({ streak, longest_streak, badges, monthly_counts });
   } catch (err) {
     console.error('Stats error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2849,7 +2855,7 @@ app.get('/api/bodyweight', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ history: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2896,7 +2902,7 @@ app.get('/api/bodyweight/history', requireAuth, async (req, res) => {
       highest_weight: Math.max(...weights)
     });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3202,7 +3208,7 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ conversations: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3219,7 +3225,7 @@ app.get('/api/conversations/:id', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ conversation: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3235,7 +3241,7 @@ app.get('/api/plan/days', requireAuth, async (req, res) => {
     })) || [];
     res.json({ days });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3268,7 +3274,7 @@ app.post('/api/plan/repair-days', requireAuth, async (req, res) => {
     await supabase.from('plans').update({ workout_plan: plan, translations: {} }).eq('id', planData.id);
     res.json({ success: true, days: plan.days.map(d => ({ day_index: d.day_index, day_name: d.day_name, label: d.label })) });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3301,7 +3307,7 @@ app.post('/api/conversations', requireAuth, async (req, res) => {
       res.json({ conversation: data });
     }
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3317,7 +3323,7 @@ app.delete('/api/conversations/:id', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3364,7 +3370,7 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
       renewalDate,
     });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3433,7 +3439,7 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
     res.json({ url: session.url, session_id: session.id });
   } catch (err) {
     console.error('Stripe checkout error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3456,7 +3462,7 @@ app.post('/api/stripe/portal', requireAuth, async (req, res) => {
     if (err.message?.includes('configuration')) {
       return res.status(500).json({ error: 'Billing portal not configured. Go to Stripe Dashboard → Settings → Billing → Customer portal and save the settings.' });
     }
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3476,7 +3482,7 @@ app.post('/api/stripe/sync-subscription', requireAuth, async (req, res) => {
     res.json({ ok: true, synced: true, tier, status });
   } catch(err) {
     console.error('Sync subscription error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3491,7 +3497,7 @@ app.post('/api/admin/clear-translation-cache', requireAuth, requireAdmin, async 
     if (error) throw error;
     res.json({ success: true, message: 'All translation caches cleared' });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3547,7 +3553,7 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     res.json({ users, stats });
   } catch (err) {
     console.error('Admin users error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3571,7 +3577,7 @@ app.patch('/api/admin/users/:userId/freeze', requireAuth, requireAdmin, async (r
 
     res.json({ success: true, profile: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3617,7 +3623,7 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
     res.json({ success: true });
   } catch (err) {
     console.error('Delete user error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3643,7 +3649,7 @@ app.patch('/api/subscription/tier', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, tier: data.subscription_tier, trialEndsAt: data.trial_ends_at });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3659,7 +3665,7 @@ app.patch('/api/admin/users/:userId/expire-trial', requireAuth, requireAdmin, as
     if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3690,7 +3696,7 @@ app.patch('/api/admin/users/:userId/tier', requireAuth, requireAdmin, async (req
     if (error) throw error;
     res.json({ success: true, profile: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3717,7 +3723,7 @@ app.patch('/api/admin/users/:userId/coach-plan', requireAuth, requireAdmin, asyn
       .update(updates).eq('id', userId).select().maybeSingle();
     if (error) throw error;
     res.json({ success: true, profile: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── ADMIN — Coach exempt toggle (bypasses requireCoach plan-status check) ──
@@ -3730,7 +3736,7 @@ app.patch('/api/admin/users/:userId/coach-exempt', requireAuth, requireAdmin, as
       .update({ is_coach_exempt: exempt }).eq('id', userId).select().maybeSingle();
     if (error) throw error;
     res.json({ success: true, profile: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── App version (used by frontend auto-update banner) ──
@@ -3790,7 +3796,7 @@ app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
     if (error) throw error;
     res.json({ programmes: data || [] });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3810,7 +3816,7 @@ app.get('/api/programmes/active-nutrition', requireAuth, async (req, res) => {
     res.json({ programme: data || null });
   } catch(err) {
     console.error('Server error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3828,7 +3834,7 @@ app.get('/api/programmes/:id/full', requireAuth, async (req, res) => {
     if (!data) return res.status(404).json({ error: 'programme_not_found' });
     res.json({ programme: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3890,7 +3896,7 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
     if (error) throw error;
     res.json({ programme: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4084,7 +4090,7 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
 
     res.json({ ok: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4130,7 +4136,7 @@ app.patch('/api/programmes/:id', requireAuth, async (req, res) => {
 
     res.json({ programme: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4146,7 +4152,7 @@ app.patch('/api/programmes/:id/archive', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4161,7 +4167,7 @@ app.patch('/api/programmes/:id/restore', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4186,7 +4192,7 @@ app.delete('/api/programmes/:id', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4244,7 +4250,7 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csv);
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4328,7 +4334,7 @@ Write a concise weekly review (100-150 words) covering: how the week went, any h
     res.json({ review: { summary, workouts_completed: sessions.length, prs_hit: prs.length, week_start: weekStartStr } });
   } catch (err) {
     console.error('Weekly review generate error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4351,7 +4357,7 @@ app.get('/api/review/latest', requireAuth, loadSubscription, async (req, res) =>
     if (data && !data.summary && data.ai_insights) data.summary = data.ai_insights;
     res.json({ review: data || null });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4380,7 +4386,7 @@ app.get('/api/monthly-review/latest', requireAuth, loadSubscription, async (req,
 
     res.json({ review: data || null });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4490,7 +4496,7 @@ Be direct, specific, and use their actual numbers. No generic filler. Write like
     res.json({ review: { summary, workouts_completed: sessions.length, prs_hit: prs.length, month_start: monthStart } });
   } catch(err) {
     console.error('Monthly review error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -5007,7 +5013,7 @@ app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
 
     res.json({ success: true, remapped: changed });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -5071,7 +5077,7 @@ app.post('/api/launch-pricing/record-subscription', requireAuth, async (req, res
       ...(tier === 'forge' && nowEnded ? { forge_active: false } : {}),
     });
     res.json({ ok: true, promo_active: !nowEnded, remaining: LAUNCH_PROMO_THRESHOLD - newSold });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Admin: view and control launch pricing
@@ -5092,7 +5098,7 @@ app.patch('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, re
       forge_sold: config?.forge_sold || 0,
     });
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 const server = app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
@@ -5212,7 +5218,7 @@ app.post('/api/push/subscribe', requireAuth, async (req, res) => {
     }, { onConflict: 'user_id' });
     res.json({ ok: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -5293,7 +5299,7 @@ app.post('/api/push/founding-member-notify', requireAuth, async (req, res) => {
     await sendPushToUser(userId, 'Founding Member access — limited slots', 'Pay once, train forever. First 500 members only. You\'re eligible now.');
     await supabase.from('profiles').update({ founding_notified_at: new Date().toISOString() }).eq('id', userId);
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -5306,7 +5312,7 @@ app.get('/api/testimonial', async (req, res) => {
       quote: "Built me a full programme in under 2 minutes. I've tried four other apps. This is the first one that felt like it actually knew what I needed.",
       attribution: "— James, training for football season"
     });
-  } catch(e) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(e) { console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/admin/testimonial', requireAuth, requireAdmin, async (req, res) => {
@@ -5314,7 +5320,7 @@ app.patch('/api/admin/testimonial', requireAuth, requireAdmin, async (req, res) 
     const { quote, attribution } = req.body;
     await supabase.from('app_config').upsert({ key: 'paywall_testimonial', value: { quote, attribution } }, { onConflict: 'key' });
     res.json({ ok: true });
-  } catch(e) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(e) { console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -5325,7 +5331,7 @@ app.post('/api/trial-feedback', requireAuth, async (req, res) => {
     const { feedback } = req.body;
     await supabase.from('trial_feedback').insert({ user_id: req.user.id, feedback, created_at: new Date().toISOString() });
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -5340,7 +5346,7 @@ app.get('/api/founding-member/slots', async (req, res) => {
       steel_total: data?.steel_total || 250,
       steel_sold: data?.steel_sold || 0,
     });
-  } catch(e) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(e) { console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
@@ -5374,7 +5380,7 @@ app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
       lifetime_tier: tier,
     }).eq('id', req.user.id);
     res.json({ ok: true, tier });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -5391,7 +5397,7 @@ app.get('/api/referral', requireAuth, async (req, res) => {
     }
     const stats = profile.referral_stats || { clicks: 0, signups: 0, conversions: 0, credits: 0 };
     res.json({ code: profile.referral_code, stats });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Apply referral code on signup — called after account creation
@@ -5431,7 +5437,7 @@ app.post('/api/referral/apply', requireAuth, async (req, res) => {
     stats.signups = (stats.signups || 0) + 1;
     await supabase.from('profiles').update({ referral_stats: stats }).eq('id', referrer.id);
     res.json({ ok: true, trialDays: 14 });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -5447,7 +5453,7 @@ app.post('/api/creator-code/validate', async (req, res) => {
     if (data.expires_at && new Date(data.expires_at) < new Date()) return res.status(400).json({ error: 'Code expired' });
     if (data.max_uses && data.uses_count >= data.max_uses) return res.status(400).json({ error: 'Code fully redeemed' });
     res.json({ ok: true, trial_days: data.trial_days || 14, name: data.name });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/creator-code/redeem', requireAuth, async (req, res) => {
@@ -5490,7 +5496,7 @@ app.post('/api/creator-code/redeem', requireAuth, async (req, res) => {
       code_id: data.id, user_id: req.user.id, used_at: new Date().toISOString()
     });
     res.json({ ok: true, trial_days: data.trial_days || 14 });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Admin: create creator code
@@ -5503,14 +5509,14 @@ app.post('/api/admin/creator-codes', requireAuth, requireAdmin, async (req, res)
     }).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, code: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/admin/creator-codes', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { data } = await supabase.from('creator_codes').select('*').order('created_at', { ascending: false });
     res.json({ codes: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -5579,7 +5585,7 @@ async function requireCoach(req, res, next) {
     req.coachProfile = profile;
     next();
   } catch(e) {
-    console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 }
 
@@ -5693,7 +5699,7 @@ app.post('/api/coach/clients/:clientId/generate-summary', requireAuth, requireCo
     res.json({ summary, summary_generated_at: new Date().toISOString() });
   } catch(err) {
     console.error('[generate-summary]', err.message);
-    res.status(500).json({ error: 'summary_failed' });
+    if (!res.headersSent) res.status(500).json({ error: 'summary_failed' });
   }
 });
 
@@ -5745,7 +5751,7 @@ app.post('/api/coach/setup', requireAuth, async (req, res) => {
     res.json({ ok: true, plan, status: trialStatus });
   } catch(err) {
     console.error('Coach setup error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -5805,7 +5811,7 @@ app.post('/api/coach/create-checkout', requireAuth, async (req, res) => {
     res.json({ url: session.url, session_id: session.id });
   } catch(err) {
     console.error('Coach create-checkout error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -5818,7 +5824,7 @@ app.post('/api/coach/downgrade', requireAuth, async (req, res) => {
     }).eq('id', req.user.id);
     if (error) throw error;
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Coach profile ──────────────────────────────────────
@@ -5828,7 +5834,7 @@ app.get('/api/coach/profile', requireAuth, requireCoach, async (req, res) => {
       .select('account_type, coach_plan, coach_plan_status, coach_trial_start, coach_commission_rate, coach_bio, coach_title, coach_stripe_subscription_id, name')
       .eq('id', req.user.id).maybeSingle();
     res.json({ profile: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/coach/profile', requireAuth, requireCoach, async (req, res) => {
@@ -5840,7 +5846,7 @@ app.patch('/api/coach/profile', requireAuth, requireCoach, async (req, res) => {
     if (Object.keys(update).length === 0) return res.status(400).json({ error: 'Nothing to update' });
     await supabase.from('profiles').update(update).eq('id', req.user.id);
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Client management ──────────────────────────────────
@@ -5888,7 +5894,7 @@ app.get('/api/coach/clients', requireAuth, requireCoach, async (req, res) => {
       last_active: r.client_id ? (lastActiveById[r.client_id] || null) : null,
     }));
     res.json({ clients });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res) => {
@@ -6032,7 +6038,7 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
     }
   } catch(err) {
     console.error('Coach invite error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -6053,7 +6059,7 @@ app.delete('/api/coach/clients/:clientId', requireAuth, requireCoach, async (req
         '/app.html?panel=account').catch(() => {});
     }
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Client data — coach reads client data ─────────────
@@ -6131,7 +6137,7 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
     });
   } catch(err) {
     console.error('Coach overview error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -6149,7 +6155,7 @@ app.get('/api/coach/clients/:clientId/plan', requireAuth, requireCoach, async (r
       .limit(1).maybeSingle();
     res.json({ plan: plan?.workout_plan || null });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -6175,7 +6181,7 @@ app.get('/api/coach/clients/:clientId/ai-activity', requireAuth, requireCoach, a
         monthly_review_enabled: true,
       },
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async (req, res) => {
@@ -6187,7 +6193,7 @@ app.get('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async (
     const { data } = await supabase.from('coach_notes')
       .select('*').eq('coach_id', req.user.id).eq('client_id', clientId).maybeSingle();
     res.json({ notes: data || null });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async (req, res) => {
@@ -6203,7 +6209,7 @@ app.post('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async 
     }, { onConflict: 'coach_id,client_id' }).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, notes: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Coach session feedback ────────────────────────────
@@ -6219,7 +6225,7 @@ app.get('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, asyn
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ feedback: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, async (req, res) => {
@@ -6243,7 +6249,7 @@ app.post('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, asy
     const { data, error } = await supabase.from('coach_session_feedback').insert(row).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, feedback: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (req, res) => {
@@ -6270,7 +6276,7 @@ app.patch('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (r
       .update(patch).eq('id', feedbackId).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, feedback: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (req, res) => {
@@ -6284,7 +6290,7 @@ app.delete('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (
     const { error } = await supabase.from('coach_session_feedback').delete().eq('id', feedbackId);
     if (error) throw error;
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Client-facing: feedback shared by my coach ────────
@@ -6313,7 +6319,7 @@ app.get('/api/my-coach-feedback', requireAuth, async (req, res) => {
         session_logged_at: f.session_log_id ? (sessionLabelById[f.session_log_id]?.logged_at || null) : null,
       })),
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Coach ↔ Client messaging ──────────────────────────
@@ -6336,7 +6342,7 @@ app.get('/api/my-coach-messages', requireAuth, async (req, res) => {
       .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
       .eq('sender_role', 'coach').is('read_at', null);
     res.json({ messages: (data || []).reverse(), coach_id: link.coach_id });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/my-coach/feedback', requireAuth, async (req, res) => {
@@ -6352,7 +6358,7 @@ app.get('/api/my-coach/feedback', requireAuth, async (req, res) => {
     res.json({ feedback: data || [] });
   } catch(err) {
     console.error('Server error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -6376,7 +6382,7 @@ app.post('/api/my-coach-messages', requireAuth, async (req, res) => {
       `${clientName} sent you a message`,
       '/app.html?panel=clients').catch(() => {});
     res.json({ ok: true, message: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, async (req, res) => {
@@ -6393,7 +6399,7 @@ app.get('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, asyn
       .limit(300);
     if (error) throw error;
     res.json({ messages: (data || []).reverse() });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, async (req, res) => {
@@ -6415,7 +6421,7 @@ app.post('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, asy
       `${coachName} replied to your message`,
       '/app.html?panel=my-coach').catch(() => {});
     res.json({ ok: true, message: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Manual coach reviews (when AI review disabled) ────
@@ -6456,7 +6462,7 @@ app.post('/api/coach/clients/:clientId/manual-review', requireAuth, requireCoach
       `Your coach posted a ${review_type} review`,
       '/app.html?panel=coach').catch(() => {});
     res.json({ ok: true, review: row });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/coach/clients/:clientId/manual-reviews', requireAuth, requireCoach, async (req, res) => {
@@ -6471,7 +6477,7 @@ app.get('/api/coach/clients/:clientId/manual-reviews', requireAuth, requireCoach
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ reviews: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/my-manual-reviews', requireAuth, async (req, res) => {
@@ -6485,7 +6491,7 @@ app.get('/api/my-manual-reviews', requireAuth, async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ reviews: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Notifications: unread counts ──────────────────────
@@ -6577,7 +6583,7 @@ app.get('/api/notifications/unread-counts', requireAuth, async (req, res) => {
     }
 
     res.json(out);
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/notifications/mark-seen', requireAuth, async (req, res) => {
@@ -6604,7 +6610,7 @@ app.post('/api/notifications/mark-seen', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'bad_type' });
     }
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/notifications/mark-client-messages-seen/:clientId', requireAuth, requireCoach, async (req, res) => {
@@ -6618,7 +6624,7 @@ app.post('/api/notifications/mark-client-messages-seen/:clientId', requireAuth, 
       .eq('coach_id', req.user.id).eq('client_id', clientId)
       .eq('sender_role', 'client').is('read_at', null);
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/coach/clients/:clientId/review-settings', requireAuth, requireCoach, async (req, res) => {
@@ -6640,7 +6646,7 @@ app.patch('/api/coach/clients/:clientId/review-settings', requireAuth, requireCo
       .upsert(row, { onConflict: 'coach_id,client_id' }).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, settings: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Programmes ────────────────────────────────────────
@@ -6649,7 +6655,7 @@ app.get('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => 
     const { data } = await supabase.from('coach_programmes')
       .select('*').eq('coach_id', req.user.id).order('updated_at', { ascending: false });
     res.json({ programmes: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => {
@@ -6798,7 +6804,7 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
     }
 
     res.json({ ok: true, programme: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // FIX 7: generate a weekly shopping list from a coach-built nutrition plan's meals.
@@ -6836,7 +6842,7 @@ app.post('/api/coach/generate-shopping-list', requireAuth, requireCoach, async (
     res.json({ shopping_list });
   } catch (err) {
     console.error('generate-shopping-list error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -6902,7 +6908,7 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
       }
     }
     res.json({ ok: true, programme: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async (req, res) => {
@@ -6911,7 +6917,7 @@ app.delete('/api/coach/programmes/:programmeId', requireAuth, requireCoach, asyn
     await supabase.from('coach_programmes')
       .delete().eq('id', programmeId).eq('coach_id', req.user.id);
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Returns the client's current live nutrition plan (coach-assigned or AI).
@@ -6927,7 +6933,7 @@ app.get('/api/coach/clients/:clientId/nutrition-plan', requireAuth, requireCoach
     res.json({ nutrition_plan: planRow?.nutrition_plan || null });
   } catch(err) {
     console.error('[nutrition-plan GET]', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -6948,7 +6954,7 @@ app.get('/api/coach/clients/:clientId/bodyweight', requireAuth, requireCoach, as
     if (error) throw error;
     res.json({ bodyweight: data || [] });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -6978,7 +6984,7 @@ app.post('/api/coach/clients/:clientId/reset-nutrition', requireAuth, requireCoa
     res.json({ ok: true, nutrition_plan: restored });
   } catch(err) {
     console.error('[reset-nutrition]', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -7031,7 +7037,7 @@ app.patch('/api/coach/clients/:clientId/activate-ai-plan', requireAuth, requireC
     res.json({ ok: true });
   } catch(err) {
     console.error('[activate-ai-plan]', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -7109,7 +7115,7 @@ app.patch('/api/coach/clients/:clientId/activate-coach-plan', requireAuth, requi
     res.json({ ok: true });
   } catch(err) {
     console.error('[activate-coach-plan]', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -7142,7 +7148,7 @@ app.patch('/api/coach/clients/:clientId/activate-ai-nutrition', requireAuth, req
     res.json({ ok: true });
   } catch(err) {
     console.error('[activate-ai-nutrition]', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -7197,7 +7203,7 @@ app.patch('/api/coach/clients/:clientId/activate-coach-nutrition', requireAuth, 
     res.json({ ok: true });
   } catch(err) {
     console.error('[activate-coach-nutrition]', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -7226,7 +7232,7 @@ app.get('/api/my-coach', requireAuth, async (req, res) => {
       pendingCoach = { connection_id: pending.id, coach_id: pending.coach_id, requested_at: pending.created_at, ...coachProfile };
     }
     res.json({ coach, pending: pendingCoach });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Lightweight check used by the Account panel every time it opens — returns the most recent
@@ -7255,7 +7261,7 @@ app.get('/api/my-pending-coach-request', requireAuth, async (req, res) => {
         requested_at: row.created_at,
       }
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach-connection/:connectionId/respond', requireAuth, async (req, res) => {
@@ -7296,7 +7302,7 @@ app.post('/api/coach-connection/:connectionId/respond', requireAuth, async (req,
         '/app.html?panel=clients').catch(() => {});
     }
     res.json({ ok: true, action });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach-connection/disconnect', requireAuth, async (req, res) => {
@@ -7311,7 +7317,7 @@ app.post('/api/coach-connection/disconnect', requireAuth, async (req, res) => {
       'A client has ended your coaching connection.',
       '/app.html?panel=clients').catch(() => {});
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Commission ────────────────────────────────────────
@@ -7349,7 +7355,7 @@ app.get('/api/coach/commissions', requireAuth, requireCoach, async (req, res) =>
       pending: sum(pendingRes.data),
       clients: clientList,
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Seat count ────────────────────────────────────────
@@ -7363,7 +7369,7 @@ app.get('/api/coach/seat-count', requireAuth, requireCoach, async (req, res) => 
       limit: limit === Infinity ? null : limit,
       plan,
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Cron — daily workout reminders ─────────────────────
@@ -7412,7 +7418,7 @@ app.post('/api/cron/reminders', async (req, res) => {
     res.json({ sent });
   } catch (err) {
     console.error('reminders cron error:', err.message);
-    res.status(500).json({ error: 'Internal server error' });
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -7449,6 +7455,6 @@ app.post('/api/coach/check-inactive-clients', async (req, res) => {
     res.json({ ok: true, notified });
   } catch(err) {
     console.error('check-inactive-clients error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
