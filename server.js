@@ -1303,7 +1303,7 @@ app.get('/api/vapid-public-key', (req, res) => {
 
 // ── SIGNUP — Check email + create account ──────
 app.post('/api/signup', signupLimiter, async (req, res) => {
-  const { email, password, name } = req.body;
+  const { email, password, name, language } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'All fields required.' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address.' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
@@ -1350,7 +1350,8 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
             name,
             subscription_tier: 'iron',
             subscription_status: 'trial',
-            trial_ends_at: trialEndsAt
+            trial_ends_at: trialEndsAt,
+            preferred_language: language || 'en'
           })
           .eq('id', data.user.id)
           .select('id')
@@ -1365,7 +1366,8 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
           name,
           subscription_tier: 'iron',
           subscription_status: 'trial',
-          trial_ends_at: trialEndsAt
+          trial_ends_at: trialEndsAt,
+          preferred_language: language || 'en'
         });
       }
 
