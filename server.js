@@ -7246,7 +7246,6 @@ app.get('/api/my-pending-coach-request', requireAuth, async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-    console.log('[my-pending] result for user', req.user.id, ':', JSON.stringify(row));
     if (!row) return res.json({ pending: false });
     const { data: coachProfile } = await supabase.from('profiles')
       .select('name, coach_title, coach_bio').eq('id', row.coach_id).maybeSingle();
