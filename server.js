@@ -5154,15 +5154,32 @@ app.get('/api/exercise/find-ids', requireAuth, requireAdmin, async (req, res) =>
 // PUSH NOTIFICATIONS
 // ═══════════════════════════════════════════════════════
 
+// Web Push (VAPID) — server-side push for sendPushToUser. A raw fetch to the push
+// endpoint is unsigned + unencrypted and rejected by every push service, so we sign +
+// encrypt via the web-push library, exactly like workout-reminder.js. Wrapped in
+// try/catch so a missing/invalid VAPID key degrades to a logged no-op instead of
+// crashing the server at boot (mirrors the Stripe/Resend init pattern above).
+const webpush = require('web-push');
+try {
+  webpush.setVapidDetails(
+    'mailto:' + (process.env.VAPID_EMAIL || 'hello@forge.app'),
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+  console.log('Web Push (VAPID) initialised ✓');
+} catch (e) {
+  console.error('Web Push init failed — sendPushToUser disabled:', e.message);
+}
+
 // Send push notification to a user
 async function sendPushToUser(userId, title, body, url = '/') {
   try {
     const { data: subs } = await supabase
       .from('push_subscriptions')
-      .select('subscription')
+      .select('id, subscription')
       .eq('user_id', userId);
     if (!subs?.length) return;
-    const payload = JSON.stringify({ title, body, url });
+    const payload = { title, body, url };
     for (const row of subs) {
       // Send-time SSRF guard (defence-in-depth): even if a stale/invalid endpoint slipped
       // into the DB before subscribe-time validation existed, never POST to a host outside
@@ -5185,15 +5202,18 @@ async function sendPushToUser(userId, title, body, url = '/') {
         continue;
       }
       try {
-        await fetch(row.subscription.endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'TTL': '86400',
-          },
-          body: payload,
-        }).catch(() => {});
-      } catch(e) { /* ignore individual failures */ }
+        // VAPID-signed + encrypted via web-push (mirrors workout-reminder.js). On a
+        // 404/410 the subscription is gone — delete it so we stop trying. Other devices
+        // still get the push (loop continues on individual failures).
+        await webpush.sendNotification(row.subscription, JSON.stringify(payload));
+      } catch (err) {
+        if (err.statusCode === 410 || err.statusCode === 404) {
+          await supabase.from('push_subscriptions').delete().eq('id', row.id);
+          console.log(`[sendPushToUser] removed expired subscription ${row.id} (user ${userId})`);
+        } else {
+          console.error(`[sendPushToUser] push failed for ${userId}:`, err.statusCode || err.message);
+        }
+      }
     }
   } catch(e) { console.error('sendPushToUser error:', e.message); }
 }
@@ -5599,7 +5619,7 @@ async function requireCoach(req, res, next) {
     // Active trial — check the 14-day window
     if (profile.coach_plan_status === 'trial' && profile.coach_trial_start) {
       const trialEnd = new Date(profile.coach_trial_start);
-      trialEnd.setDate(trialEnd.getDate() + 7);
+      trialEnd.setDate(trialEnd.getDate() + 14);
       if (new Date() > trialEnd) {
         await supabase.from('profiles')
           .update({ coach_plan_status: 'expired' })
