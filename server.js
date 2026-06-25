@@ -2102,7 +2102,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
       try {
         response = await anthropic.messages.create({
           model: 'claude-sonnet-4-6',
-          max_tokens: 6000,
+          max_tokens: 12000,
           system: systemPrompt,
           messages: sanitised
         });
@@ -2118,11 +2118,12 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     }
 
     const rawReply = response.content[0].text;
+    const cleanedRaw = rawReply.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '').trim();
 
     // Extract ALL plan update tags (there could be multiple)
-    const planUpdateMatches = [...rawReply.matchAll(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/g)];
+    const planUpdateMatches = [...cleanedRaw.matchAll(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/g)];
     let planUpdate = null;
-    let cleanReply = rawReply.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
+    let cleanReply = cleanedRaw.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
 
     if (planUpdateMatches.length > 0 && planData) {
       // Fetch the absolute latest plan from DB (not from earlier Promise.all)
@@ -3046,7 +3047,9 @@ function buildCoachPrompt(profile, planData, recentHistory, context, language, a
     ? `\nLANGUAGE: You MUST respond entirely in ${langNames[language] || language}. Every word of your response must be in ${langNames[language] || language}. Do not switch to English under any circumstances.`
     : '';
 
-  return `You are a world-class personal trainer and nutrition coach embedded in the FORGE fitness app. You are coaching a specific client. Be direct, specific, and actionable. No fluff. Use their exact numbers when relevant.${contextStr}${langStr}
+  return `IMPORTANT: Never output your internal reasoning, thinking process, JSON structures, or technical plan instructions in plain text. Your visible response must only contain natural coaching language. PLAN_UPDATE tags are processed automatically and never shown to users.
+
+You are a world-class personal trainer and nutrition coach embedded in the FORGE fitness app. You are coaching a specific client. Be direct, specific, and actionable. No fluff. Use their exact numbers when relevant.${contextStr}${langStr}
 
 CLIENT PROFILE:
 - Name: ${profile?.name || 'User'}
