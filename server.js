@@ -6665,9 +6665,14 @@ app.get('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => 
 
 app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => {
   try {
-    const { client_id, name, programme_data, nutrition_data, programme_type, is_template } = req.body;
+    let { client_id, name, programme_data, nutrition_data, programme_type, is_template } = req.body;
     if (!name) return res.status(400).json({ error: 'Missing name' });
     const ptype = programme_type || 'workout';
+
+    // SECURITY (IDOR fix): a template must never be bound to a client. Forcing client_id to
+    // null when is_template is true closes the bypass where is_template:true skipped the
+    // connection check below while the row still persisted an attacker-supplied client_id.
+    if (is_template) client_id = null;
 
     if (client_id && !is_template) {
       if (!await verifyClientConnection(req.user.id, client_id)) {
@@ -6861,7 +6866,18 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
     const { data, error } = await supabase.from('coach_programmes')
       .update(update).eq('id', programmeId).eq('coach_id', req.user.id).select().maybeSingle();
     if (error) throw error;
-    if (data?.client_id) {
+    // SECURITY (IDOR fix): re-verify the coach still has an active connection with this client
+    // before any client-facing write. Without this, a coach disconnected from a client — or
+    // never connected, via a pre-fix template row that still carries a client_id — could
+    // overwrite that user's live plan and push to their device. Templates never touch a
+    // client's live plan, so they are exempt from the check AND from the write block below.
+    if (data?.client_id && !data?.is_template) {
+      const stillConnected = await verifyClientConnection(req.user.id, data.client_id);
+      if (!stillConnected) {
+        return res.status(403).json({ error: 'no_connection' });
+      }
+    }
+    if (data?.client_id && !data?.is_template) {
       await sendPushToUser(data.client_id, 'Programme updated',
         'Your coach has updated your programme.', '/app.html?panel=workout').catch(() => {});
 
