@@ -2353,12 +2353,24 @@ function applyPlanUpdate(plan, instruction) {
 }
 
 // ── POST-WORKOUT CHECK-IN ──────────────────────
-app.post('/api/checkin', requireAuth, async (req, res) => {
+app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
   try {
     // If this user's coach has disabled post-workout check-ins, skip silently
     // and tell the client there's nothing to show.
     if (await isReviewDisabledByCoach(req.user.id, 'post_workout_checkin_enabled')) {
       return res.json({ disabled: true });
+    }
+
+    // Enforce the monthly AI cap for Iron tier (mirrors /api/chat). loadSubscription
+    // resolves exempt/trial accounts to a non-iron tier, so they bypass this automatically.
+    if (req.subscription?.tier === 'iron') {
+      const usage = await getCoachUsage(req.user.id);
+      if (usage >= 20) {
+        return res.status(429).json({
+          error: 'monthly_limit_reached',
+          message: 'Monthly AI limit reached. Upgrade to continue.'
+        });
+      }
     }
 
     const { session_summary, feeling, difficulty, messages, language } = req.body;
@@ -3385,8 +3397,23 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
 
 app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
   try {
-    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { tier, billing, is_promo } = req.body;
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });
+    const { tier, billing } = req.body;
     if (!tier || !billing) return res.status(400).json({ error: 'Missing tier or billing' });
+
+    // Validate tier + billing against an allow-list — never trust raw client values.
+    if (!['iron','steel','forge','coach_starter','coach_pro','coach_elite'].includes(tier)) {
+      return res.status(400).json({ error: 'Invalid tier' });
+    }
+    if (!['monthly','annual','lifetime'].includes(billing)) {
+      return res.status(400).json({ error: 'Invalid billing' });
+    }
+
+    // Derive promo eligibility server-side instead of trusting a client-supplied is_promo.
+    // A tier only qualifies for promo pricing while ITS launch promo is still active.
+    const pricingStatus = await getLaunchPricingStatus();
+    const is_promo = (tier === 'steel' && !!pricingStatus?.steel_active) ||
+                     (tier === 'forge' && !!pricingStatus?.forge_active) || false;
 
     const userId = req.user.id;
     const userEmail = req.user.email;
@@ -5064,25 +5091,10 @@ app.get('/api/launch-pricing', async (req, res) => {
 
 // Increment counter when a paid subscription completes
 app.post('/api/launch-pricing/record-subscription', requireAuth, async (req, res) => {
-  try {
-    const { tier } = req.body; // 'steel' or 'forge'
-    if (!['steel','forge'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
-    const status = await getLaunchPricingStatus();
-    if (!status[`${tier}_active`]) return res.json({ ok: true, promo_active: false });
-    const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
-    const newSold = (config?.[`${tier}_sold`] || 0) + 1;
-    const nowEnded = newSold >= LAUNCH_PROMO_THRESHOLD;
-    await supabase.from('launch_pricing_config').upsert({
-      id: 1,
-      steel_active: config?.steel_active ?? true,
-      steel_sold: tier === 'steel' ? newSold : (config?.steel_sold || 0),
-      forge_active: config?.forge_active ?? true,
-      forge_sold: tier === 'forge' ? newSold : (config?.forge_sold || 0),
-      ...(tier === 'steel' && nowEnded ? { steel_active: false } : {}),
-      ...(tier === 'forge' && nowEnded ? { forge_active: false } : {}),
-    });
-    res.json({ ok: true, promo_active: !nowEnded, remaining: LAUNCH_PROMO_THRESHOLD - newSold });
-  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
+  // DISABLED: this endpoint let any authenticated user increment the global launch-promo
+  // counter with NO payment verification. Real increments are driven by the Stripe webhook
+  // (checkout.session.completed -> stripe_recordLaunchSub). Route kept; body always 403s.
+  return res.status(403).json({ error: 'Forbidden' });
 });
 
 // Admin: view and control launch pricing
@@ -5106,6 +5118,14 @@ app.patch('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, re
   } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
+if (process.env.NODE_ENV !== 'production') {
+  console.warn(
+    '⚠️  WARNING: NODE_ENV is not "production" ' +
+    '(current: ' + (process.env.NODE_ENV || 'unset') + '). ' +
+    'ALL RATE LIMITING IS DISABLED. ' +
+    'Set NODE_ENV=production in Railway environment variables.'
+  );
+}
 const server = app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 // Increase timeout to 3 minutes — plan generation with Sonnet can take up to 90 seconds
 server.timeout = 180000;
@@ -6050,6 +6070,12 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
 app.delete('/api/coach/clients/:clientId', requireAuth, requireCoach, async (req, res) => {
   try {
     const { clientId } = req.params;
+    // Reject a non-UUID clientId before it reaches the .or() filter below — an unvalidated
+    // value is interpolated raw into a PostgREST filter string (filter-injection risk).
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(clientId)) {
+      return res.status(400).json({ error: 'Invalid client ID' });
+    }
     // Find the link — clientId param may be a profile id OR a connection id
     const { data: link } = await supabase.from('coach_clients')
       .select('id, client_id').eq('coach_id', req.user.id)
