@@ -5294,6 +5294,17 @@ server.timeout = 180000;
 server.keepAliveTimeout = 180000;
 server.headersTimeout = 185000;
 
+// Keep Railway dyno warm — ping every 10 minutes
+const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN
+  : 'https://forge-production-db97.up.railway.app';
+
+setInterval(() => {
+  fetch(BACKEND_URL + '/health')
+    .then(() => console.log('[keep-alive] ping ok'))
+    .catch(e => console.log('[keep-alive] ping failed:', e.message));
+}, 10 * 60 * 1000);
+
 // ── DEBUG — View raw plan (admin only) ────────
 app.get('/api/debug/plan', requireAuth, requireAdmin, async (req, res) => {
   const { data } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle();
