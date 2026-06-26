@@ -19,6 +19,12 @@ let mwExerciseCache = null;
 let mwExerciseCacheTime = 0;
 const MW_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
+// ── STRIPE WEBHOOK IDEMPOTENCY ────────────────────────
+// Stripe retries webhook deliveries (network blips, slow 2xx). Track processed event
+// IDs in-memory so a retry can't double-apply a handler (e.g. double credits). Covers
+// the common retry case within one server instance; pruned below to stay bounded.
+const processedWebhookEvents = new Set();
+
 // ── YOUTUBE VIDEO LOOKUP ─────────────────────────────────
 // Replaces MuscleWiki — YouTube Data API v3, 10k free calls/day
 // Each exercise cached in Supabase permanently after first lookup
@@ -753,6 +759,20 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // ── IDEMPOTENCY ───────────────────────────────────────
+  // Ignore an event already processed by this instance so a Stripe retry can't
+  // double-apply (e.g. double credits). Keyed on the verified event.id.
+  if (processedWebhookEvents.has(event.id)) {
+    console.log('[webhook] duplicate event ignored:', event.id);
+    return res.json({ received: true });
+  }
+  processedWebhookEvents.add(event.id);
+  // Prune oldest entries to prevent unbounded growth (add first, then prune).
+  if (processedWebhookEvents.size > 10000) {
+    const first = processedWebhookEvents.values().next().value;
+    processedWebhookEvents.delete(first);
+  }
+
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
@@ -966,6 +986,72 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
           .select('id').eq('stripe_customer_id', invoice.customer).maybeSingle();
         if (profile) {
           await supabase.from('profiles').update({ subscription_status: 'past_due' }).eq('id', profile.id);
+        }
+        break;
+      }
+
+      case 'charge.refunded': {
+        try {
+          const charge = event.data.object;
+          const customerId = charge.customer;
+          if (!customerId) break;
+          // Partial-refund guard: act only on FULL refunds. Stripe sets charge.refunded=true
+          // only when the entire amount is refunded; partial refunds leave it false and take
+          // no automated action (support handles those manually).
+          if (!charge.refunded) {
+            console.log('[webhook] partial refund — no access revocation');
+            break;
+          }
+          // 30-day money-back window: only auto-revoke within the guarantee period (matches
+          // terms.html). A full refund after 30 days is logged but handled manually by support.
+          const chargeDate = new Date(charge.created * 1000);
+          const daysSinceCharge = (Date.now() - chargeDate) / (1000 * 60 * 60 * 24);
+          if (daysSinceCharge > 30) {
+            console.log('[webhook] refund outside 30-day window — no access revocation, user should contact support');
+            break;
+          }
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('id, subscription_status')
+            .eq('stripe_customer_id', customerId)
+            .maybeSingle();
+          if (!profile) break;
+          await supabase.from('profiles')
+            .update({
+              subscription_status: 'expired',
+              subscription_tier: 'iron',
+              lifetime_tier: null
+            })
+            .eq('id', profile.id);
+          console.log('[webhook] charge.refunded → access revoked for', profile.id);
+        } catch(e) {
+          console.error('[webhook] charge.refunded error:', e.message);
+        }
+        break;
+      }
+
+      case 'charge.dispute.created': {
+        try {
+          const dispute = event.data.object;
+          const customerId = dispute.customer;
+          if (!customerId) break;
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('id')
+            .eq('stripe_customer_id', customerId)
+            .maybeSingle();
+          if (!profile) break;
+          await supabase.from('profiles')
+            .update({
+              subscription_status: 'expired',
+              subscription_tier: 'iron',
+              lifetime_tier: null,
+              is_frozen: true
+            })
+            .eq('id', profile.id);
+          console.log('[webhook] charge.dispute.created → account frozen for', profile.id);
+        } catch(e) {
+          console.error('[webhook] charge.dispute.created error:', e.message);
         }
         break;
       }
@@ -1989,6 +2075,66 @@ app.get('/api/profile', requireAuth, async (req, res) => {
 // ── UPDATE PROFILE ─────────────────────────────
 app.patch('/api/profile', requireAuth, async (req, res) => {
   try {
+    // ── INPUT VALIDATION (Audit 4, 2a) ── bound/whitelist profile fields before they
+    // reach the DB or flow into AI prompts (prompt-injection surface). `body` aliases
+    // req.body so the string caps below mutate the SAME object the allowed-list copy reads.
+    const body = req.body;
+
+    // A) Numeric range validation
+    if (body.age !== undefined) {
+      const age = Number(body.age);
+      if (!Number.isInteger(age) || age < 13 || age > 100)
+        return res.status(400).json({ error: 'Invalid age' });
+    }
+    if (body.height_cm !== undefined) {
+      const h = Number(body.height_cm);
+      if (isNaN(h) || h < 100 || h > 250)
+        return res.status(400).json({ error: 'Invalid height' });
+    }
+    if (body.weight_kg !== undefined) {
+      const w = Number(body.weight_kg);
+      if (isNaN(w) || w < 25 || w > 400)
+        return res.status(400).json({ error: 'Invalid weight' });
+    }
+    if (body.target_weight_kg !== undefined && body.target_weight_kg !== null) {
+      const tw = Number(body.target_weight_kg);
+      if (isNaN(tw) || tw < 25 || tw > 400)
+        return res.status(400).json({ error: 'Invalid target weight' });
+    }
+    if (body.days_per_week !== undefined) {
+      const d = Number(body.days_per_week);
+      if (!Number.isInteger(d) || d < 1 || d > 7)
+        return res.status(400).json({ error: 'Invalid days per week' });
+    }
+
+    // B) String length caps (mutate req.body before the allowed-list copy below)
+    if (body.name !== undefined)
+      body.name = String(body.name).slice(0, 100);
+    if (body.diet_restrictions !== undefined)
+      body.diet_restrictions = String(body.diet_restrictions).slice(0, 500);
+    if (body.injuries !== undefined)
+      body.injuries = String(body.injuries).slice(0, 500);
+    if (body.bio !== undefined)
+      body.bio = String(body.bio).slice(0, 500);
+
+    // C) Enum validation. goal uses the app's REAL vocabulary and may arrive as an array
+    // or a comma-joined multi-select (e.g. "muscle, strength") or 'custom' — validate every
+    // token, allow empty (no goal chosen yet). experience/sex are single values.
+    const VALID_GOALS = ['muscle', 'fat_loss', 'endurance', 'sport', 'strength', 'custom'];
+    const VALID_EXPERIENCE = ['beginner', 'intermediate', 'advanced'];
+    const VALID_SEX = ['male', 'female', 'other'];
+    if (body.goal !== undefined && body.goal !== null) {
+      const goalTokens = Array.isArray(body.goal)
+        ? body.goal
+        : String(body.goal).split(',').map(g => g.trim()).filter(Boolean);
+      if (!goalTokens.every(g => VALID_GOALS.includes(g)))
+        return res.status(400).json({ error: 'Invalid goal' });
+    }
+    if (body.experience !== undefined && !VALID_EXPERIENCE.includes(body.experience))
+      return res.status(400).json({ error: 'Invalid experience' });
+    if (body.sex !== undefined && !VALID_SEX.includes(body.sex))
+      return res.status(400).json({ error: 'Invalid sex' });
+
     // Only update columns that exist in the schema — ignore unknowns
     const allowed = ['name','age','sex','height_cm','weight_kg','goal','experience',
       'days_per_week','preferred_days','equipment','diet_style','diet_restrictions',
@@ -2091,7 +2237,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
 
     let activeProgramme = null;
     try {
-      const { data: _ap } = await supabase.from('programmes').select('name, plan_data').eq('user_id', req.user.id).eq('is_active', true).maybeSingle();
+      const { data: _ap } = await supabase.from('programmes').select('name, plan_data').eq('user_id', req.user.id).eq('programme_type', 'workout').eq('is_active', true).order('updated_at', { ascending: false }).limit(1).maybeSingle();
       if (_ap && _ap.name) activeProgramme = { name: _ap.name, goal: (_ap.plan_data && (_ap.plan_data.goal || (_ap.plan_data.workout && _ap.plan_data.workout.goal))) || (profile && profile.goal) || null };
     } catch(e) { /* programme context is best-effort */ }
     const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context, language, activeProgramme);
@@ -2125,7 +2271,16 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     let planUpdate = null;
     let cleanReply = cleanedRaw.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
 
-    if (planUpdateMatches.length > 0 && planData) {
+    // ── PLAN-EDITING TIER GATE (Audit 5, F4) ──
+    // plan_editing is a Steel+ feature (trial/exempt resolve to accessTier 'forge', so they
+    // keep it). Iron users still get the chat reply — the PLAN_UPDATE tags are already
+    // stripped from cleanReply above; we append an upgrade note and skip applying any edit.
+    const canEditPlan = hasAccess('plan_editing', req.subscription?.accessTier, req.subscription?.isExempt);
+    if (planUpdateMatches.length > 0 && !canEditPlan) {
+      cleanReply = cleanReply + '\n\n' + 'Plan editing is available on Steel and above. Upgrade to let your AI coach update your programme.';
+    }
+
+    if (planUpdateMatches.length > 0 && planData && canEditPlan) {
       // Fetch the absolute latest plan from DB (not from earlier Promise.all)
       const { data: freshPlan } = await supabase
         .from('plans').select(PLAN_CORE_FIELDS).eq('user_id', req.user.id)
@@ -2638,7 +2793,7 @@ app.get('/api/history', requireAuth, async (req, res) => {
 // panel can render workouts grouped by session rather than flattened by exercise.
 app.get('/api/sessions', requireAuth, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
     console.log('[sessions] fetching for user:', req.user.id);
     // ROOT CAUSE OF THE 500: this select used to request `feeling, difficulty`, but
     // session_logs has no such columns (schema: id, user_id, day_index, day_label,
@@ -2723,6 +2878,9 @@ app.post('/api/bodyweight', requireAuth, async (req, res) => {
     const w = parseFloat(weight_kg);
     console.log('[bodyweight] save attempt:', { user_id: req.user.id, weight_kg });
     if (isNaN(w)) return res.status(400).json({ error: 'invalid_weight' });
+    if (w < 20 || w > 500) {
+      return res.status(400).json({ error: 'Weight must be between 20 and 500 kg' });
+    }
     const today = new Date().toISOString().split('T')[0];
 
     // Manual upsert instead of .upsert({ onConflict: 'user_id,logged_at' }) — the
@@ -4244,7 +4402,7 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
     // history). Selecting only the columns the CSV emits instead of every column.
     const { data: sessions, error } = await supabase
       .from('session_logs')
-      .select('logged_at, exercises, feeling, difficulty')
+      .select('logged_at, exercises')
       .eq('user_id', req.user.id)
       .order('logged_at', { ascending: false });
 
@@ -4257,19 +4415,17 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
       .maybeSingle();
 
     // Build CSV
-    const rows = ['Date,Exercise,Set,Weight (kg),Reps,Session Rating,Session Difficulty'];
+    const rows = ['Date,Exercise,Set,Weight (kg),Reps'];
     for (const session of sessions || []) {
       const date = session.logged_at?.split('T')[0] || '';
-      const rating = session.feeling || '';
-      const difficulty = session.difficulty || '';
       const exercises = session.exercises || [];
       for (const ex of exercises) {
         const sets = ex.sets_data || [];
         if (sets.length === 0) {
-          rows.push(`${date},"${ex.name}",—,—,—,${rating},${difficulty}`);
+          rows.push(`${date},"${ex.name}",—,—,—`);
         } else {
           sets.forEach((s, i) => {
-            rows.push(`${date},"${ex.name}",${i + 1},${s.weight || 0},${s.reps || 0},${rating},${difficulty}`);
+            rows.push(`${date},"${ex.name}",${i + 1},${s.weight || 0},${s.reps || 0}`);
           });
         }
       }
@@ -4640,7 +4796,11 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 
 
 // ── EXERCISE VIDEO PROXY ────────────────────────────────
-app.get('/api/exercise/video/*', requireAuth, (req, res) => {
+app.get('/api/exercise/video/*', requireAuth, loadSubscription, (req, res) => {
+  // Forge-tier feature — gate server-side so lower tiers can't stream exercise videos.
+  if (!hasAccess('video_demos', req.subscription?.accessTier, req.subscription?.isExempt)) {
+    return res.status(403).json({ error: 'upgrade_required', feature: 'video_demos' });
+  }
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.status(404).json({ error: 'No API key configured' });
 
