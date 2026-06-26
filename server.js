@@ -734,6 +734,8 @@ const corsOptions = {
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization']
 };
+const compression = require('compression');
+app.use(compression()); // gzip all responses — first so every downstream response is compressed
 app.use(helmet({ contentSecurityPolicy: false })); // Security headers
 // Explicit hardening on top of helmet — DENY framing outright (helmet defaults to
 // SAMEORIGIN) and lock down powerful browser features the app never uses.
@@ -2023,7 +2025,7 @@ app.get('/api/plan', requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('plans')
-      .select('*')
+      .select('id, workout_plan, nutrition_plan, source_language, translations')
       .eq('user_id', req.user.id)
       .order('generated_at', { ascending: false })
       .limit(1)
