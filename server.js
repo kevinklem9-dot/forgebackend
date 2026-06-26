@@ -3081,6 +3081,160 @@ app.get('/api/bodyweight/history', requireAuth, async (req, res) => {
   }
 });
 
+// ── BODY METRICS ──────────────────────────────
+// Registered here (before the retention mount further down) so these own /api/metrics and
+// take precedence over any /metrics defined in routes/retention.js. POST upserts one row per
+// user per day keyed on (user_id, logged_at) — REQUIRES a UNIQUE (user_id, logged_at)
+// constraint on body_metrics (see deployment note); without it the upsert errors.
+app.post('/api/metrics', requireAuth, async (req, res) => {
+  if (res.headersSent) return;
+  try {
+    const userId = req.user.id;
+    const {
+      weight_kg, body_fat_pct, muscle_mass_kg,
+      visceral_fat_rating, bone_mass_kg,
+      body_water_pct, metabolic_age, bmr, tdee,
+      activity_level, chest_cm, waist_cm, hips_cm,
+      arm_cm, thigh_cm, left_arm_cm, right_arm_cm,
+      left_thigh_cm, right_thigh_cm,
+      left_calf_cm, right_calf_cm, notes
+    } = req.body;
+
+    // Validate at least one metric provided
+    const fields = [
+      weight_kg, body_fat_pct, muscle_mass_kg,
+      visceral_fat_rating, bone_mass_kg,
+      body_water_pct, metabolic_age, chest_cm,
+      waist_cm, hips_cm, left_arm_cm, right_arm_cm,
+      left_thigh_cm, right_thigh_cm,
+      left_calf_cm, right_calf_cm
+    ];
+    if (fields.every(f => f === undefined || f === null || f === '')) {
+      return res.status(400).json({ error: 'Enter at least one measurement' });
+    }
+
+    // Numeric range validation
+    const numChecks = [
+      [weight_kg, 20, 500, 'weight'],
+      [body_fat_pct, 1, 70, 'body fat'],
+      [muscle_mass_kg, 5, 200, 'muscle mass'],
+      [visceral_fat_rating, 1, 59, 'visceral fat'],
+      [bone_mass_kg, 0.5, 10, 'bone mass'],
+      [body_water_pct, 20, 80, 'body water'],
+      [metabolic_age, 10, 120, 'metabolic age'],
+    ];
+    for (const [val, min, max, name] of numChecks) {
+      if (val !== undefined && val !== null && val !== '') {
+        const n = Number(val);
+        if (isNaN(n) || n < min || n > max) {
+          return res.status(400).json({ error: `Invalid ${name} value` });
+        }
+      }
+    }
+
+    // Validate activity_level if provided
+    const VALID_ACTIVITY = [
+      'sedentary', 'lightly_active',
+      'moderately_active', 'very_active',
+      'extremely_active'
+    ];
+    if (activity_level && !VALID_ACTIVITY.includes(activity_level)) {
+      return res.status(400).json({ error: 'Invalid activity level' });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+
+    // Upsert — one entry per user per day
+    const { data, error } = await supabase
+      .from('body_metrics')
+      .upsert({
+        user_id: userId,
+        logged_at: today,
+        weight_kg: weight_kg || null,
+        body_fat_pct: body_fat_pct || null,
+        muscle_mass_kg: muscle_mass_kg || null,
+        visceral_fat_rating: visceral_fat_rating || null,
+        bone_mass_kg: bone_mass_kg || null,
+        body_water_pct: body_water_pct || null,
+        metabolic_age: metabolic_age || null,
+        bmr: bmr || null,
+        tdee: tdee || null,
+        activity_level: activity_level || null,
+        chest_cm: chest_cm || null,
+        waist_cm: waist_cm || null,
+        hips_cm: hips_cm || null,
+        arm_cm: arm_cm || null,
+        thigh_cm: thigh_cm || null,
+        left_arm_cm: left_arm_cm || null,
+        right_arm_cm: right_arm_cm || null,
+        left_thigh_cm: left_thigh_cm || null,
+        right_thigh_cm: right_thigh_cm || null,
+        left_calf_cm: left_calf_cm || null,
+        right_calf_cm: right_calf_cm || null,
+        notes: notes?.slice(0, 500) || null
+      }, { onConflict: 'user_id,logged_at' })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return res.json({ success: true, metric: data });
+  } catch (e) {
+    if (!res.headersSent) {
+      console.error('[metrics] POST error:', e.message);
+      return res.status(500).json({ error: 'Failed to save metrics' });
+    }
+  }
+});
+
+app.get('/api/metrics', requireAuth, async (req, res) => {
+  if (res.headersSent) return;
+  try {
+    const userId = req.user.id;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 90, 1), 365);
+
+    const { data, error } = await supabase
+      .from('body_metrics')
+      .select('*')
+      .eq('user_id', userId)
+      .order('logged_at', { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+    return res.json({ metrics: data || [] });
+  } catch (e) {
+    if (!res.headersSent) {
+      console.error('[metrics] GET error:', e.message);
+      return res.status(500).json({ error: 'Failed to fetch metrics' });
+    }
+  }
+});
+
+app.get('/api/metrics/latest', requireAuth, async (req, res) => {
+  if (res.headersSent) return;
+  try {
+    const userId = req.user.id;
+
+    // Get last two entries for trend calculation
+    const { data, error } = await supabase
+      .from('body_metrics')
+      .select('*')
+      .eq('user_id', userId)
+      .order('logged_at', { ascending: false })
+      .limit(2);
+
+    if (error) throw error;
+    return res.json({
+      latest: data?.[0] || null,
+      previous: data?.[1] || null
+    });
+  } catch (e) {
+    if (!res.headersSent) {
+      console.error('[metrics] latest error:', e.message);
+      return res.status(500).json({ error: 'Failed to fetch latest metrics' });
+    }
+  }
+});
+
 // ── PROMPT BUILDERS ────────────────────────────
 function buildPlanPrompt(profile, language, mwExercises) {
   const langNames = {en:'English',es:'Spanish',fr:'French',de:'German',it:'Italian',pt:'Portuguese',nl:'Dutch',uk:'Ukrainian',fi:'Finnish',ar:'Arabic',zh:'Chinese',ja:'Japanese'};
@@ -5839,7 +5993,7 @@ async function generateClientSummary(coachId, clientId, lang) {
   // Latest body metrics (weight, body fat if tracked)
   const { data: metrics } = await supabase
     .from('body_metrics')
-    .select('weight_kg, body_fat, logged_at')
+    .select('weight_kg, body_fat_pct, logged_at')
     .eq('user_id', clientId)
     .order('logged_at', { ascending: false })
     .limit(1)
@@ -5863,7 +6017,7 @@ async function generateClientSummary(coachId, clientId, lang) {
   const clientData = {
     ...prof,
     latest_weight_kg: metrics?.weight_kg ?? prof.weight_kg ?? null,
-    latest_body_fat: metrics?.body_fat ?? null,
+    latest_body_fat: metrics?.body_fat_pct ?? null,
     sessions_last_30_days: sessionCount || 0,
     current_streak: streakRow?.current_streak || 0,
   };
@@ -7195,6 +7349,37 @@ app.get('/api/coach/clients/:clientId/bodyweight', requireAuth, requireCoach, as
     res.json({ bodyweight: data || [] });
   } catch(err) {
     console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Reads body_metrics (all columns) for a connected client — coach read-only view.
+app.get('/api/coach/clients/:clientId/metrics', requireAuth, requireCoach, async (req, res) => {
+  if (res.headersSent) return;
+  try {
+    const { clientId } = req.params;
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(clientId)) {
+      return res.status(400).json({ error: 'Invalid client ID' });
+    }
+    const connected = await verifyClientConnection(req.user.id, clientId);
+    if (!connected) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+
+    const { data, error } = await supabase
+      .from('body_metrics')
+      .select('*')
+      .eq('user_id', clientId)
+      .order('logged_at', { ascending: false })
+      .limit(90);
+
+    if (error) throw error;
+    return res.json({ metrics: data || [] });
+  } catch (e) {
+    if (!res.headersSent) {
+      console.error('[coach metrics] error:', e.message);
+      return res.status(500).json({ error: 'Failed to fetch client metrics' });
+    }
   }
 });
 
