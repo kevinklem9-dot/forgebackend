@@ -3113,22 +3113,21 @@ app.post('/api/metrics', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Enter at least one measurement' });
     }
 
-    // Numeric range validation
+    // Numeric range validation — coerce to a number first so string inputs (e.g. "18.5")
+    // range-check correctly. toNum maps blank/missing to null, which the loop skips.
+    const toNum = v => (v === undefined || v === null || v === '') ? null : parseFloat(v);
     const numChecks = [
-      [weight_kg, 20, 500, 'weight'],
-      [body_fat_pct, 1, 70, 'body fat'],
-      [muscle_mass_kg, 5, 200, 'muscle mass'],
-      [visceral_fat_rating, 1, 59, 'visceral fat'],
-      [bone_mass_kg, 0.5, 10, 'bone mass'],
-      [body_water_pct, 20, 80, 'body water'],
-      [metabolic_age, 10, 120, 'metabolic age'],
+      [toNum(weight_kg), 20, 500, 'weight'],
+      [toNum(body_fat_pct), 1, 70, 'body fat'],
+      [toNum(muscle_mass_kg), 5, 200, 'muscle mass'],
+      [toNum(visceral_fat_rating), 1, 59, 'visceral fat'],
+      [toNum(bone_mass_kg), 0.5, 10, 'bone mass'],
+      [toNum(body_water_pct), 20, 80, 'body water'],
+      [toNum(metabolic_age), 10, 120, 'metabolic age'],
     ];
     for (const [val, min, max, name] of numChecks) {
-      if (val !== undefined && val !== null && val !== '') {
-        const n = Number(val);
-        if (isNaN(n) || n < min || n > max) {
-          return res.status(400).json({ error: `Invalid ${name} value` });
-        }
+      if (val !== null && (isNaN(val) || val < min || val > max)) {
+        return res.status(400).json({ error: `Invalid ${name} value` });
       }
     }
 
@@ -3138,7 +3137,7 @@ app.post('/api/metrics', requireAuth, async (req, res) => {
       'moderately_active', 'very_active',
       'extremely_active'
     ];
-    if (activity_level && !VALID_ACTIVITY.includes(activity_level)) {
+    if (activity_level && activity_level !== '' && !VALID_ACTIVITY.includes(activity_level)) {
       return res.status(400).json({ error: 'Invalid activity level' });
     }
 
@@ -3156,7 +3155,8 @@ app.post('/api/metrics', requireAuth, async (req, res) => {
         visceral_fat_rating: visceral_fat_rating || null,
         bone_mass_kg: bone_mass_kg || null,
         body_water_pct: body_water_pct || null,
-        metabolic_age: metabolic_age || null,
+        metabolic_age: (metabolic_age === undefined || metabolic_age === null || metabolic_age === '')
+          ? null : Math.round(Number(metabolic_age)),
         bmr: bmr || null,
         tdee: tdee || null,
         activity_level: activity_level || null,
