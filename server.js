@@ -6757,7 +6757,7 @@ app.post('/api/my-coach-messages', requireAuth, async (req, res) => {
     const { data: clientProfile } = await supabase.from('profiles').select('name').eq('id', req.user.id).maybeSingle();
     const clientName = clientProfile?.name || 'Your client';
     await sendPushToUser(link.coach_id, 'New client message',
-      `${clientName} sent you a message`,
+      `${clientName}: ${text.slice(0, 100)}`,
       '/app.html?panel=clients').catch(() => {});
     res.json({ ok: true, message: data });
   } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
@@ -6795,8 +6795,8 @@ app.post('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, asy
     }).select().maybeSingle();
     if (error) throw error;
     const coachName = req.coachProfile?.name || 'Your coach';
-    await sendPushToUser(clientId, 'Coach replied',
-      `${coachName} replied to your message`,
+    await sendPushToUser(clientId, 'Message from your coach',
+      `${coachName}: ${text.slice(0, 100)}`,
       '/app.html?panel=my-coach').catch(() => {});
     res.json({ ok: true, message: data });
   } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
@@ -6838,7 +6838,7 @@ app.post('/api/coach/clients/:clientId/manual-review', requireAuth, requireCoach
     // Push the client so they see it
     await sendPushToUser(clientId, 'Coach review',
       `Your coach posted a ${review_type} review`,
-      '/app.html?panel=coach').catch(() => {});
+      '/app.html?panel=progress').catch(() => {});
     res.json({ ok: true, review: row });
   } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
