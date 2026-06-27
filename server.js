@@ -2272,6 +2272,12 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     const planUpdateMatches = [...cleanedRaw.matchAll(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/g)];
     let planUpdate = null;
     let cleanReply = cleanedRaw.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
+    // Belt-and-braces: strip any leaked day_index references from the visible reply
+    // (PLAN_UPDATE tags are already removed above, so this only touches prose).
+    cleanReply = cleanReply
+      .replace(/\bday_index\s*:?\s*\d+/gi, '')
+      .replace(/\bday_index\b/gi, '')
+      .trim();
 
     // ── PLAN-EDITING TIER GATE (Audit 5, F4) ──
     // plan_editing is a Steel+ feature (trial/exempt resolve to accessTier 'forge', so they
@@ -2423,6 +2429,13 @@ function applyPlanUpdate(plan, instruction) {
     if (day) day.exercises = instruction.exercises;
   }
 
+  if (instruction.type === 'rename_day') {
+    const day = updated.workout?.days?.find(d => d.day_index === instruction.day_index);
+    if (day && instruction.label) {
+      day.label = String(instruction.label).slice(0, 100);
+    }
+  }
+
   if (instruction.type === 'reschedule_days') {
     if (instruction.mapping && updated.workout?.days) {
       const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
@@ -2565,6 +2578,11 @@ app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
     const planUpdateMatch = rawReply.match(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/);
     let planUpdate = null;
     let cleanReply = rawReply.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
+    // Belt-and-braces: strip any leaked day_index references from the visible reply
+    cleanReply = cleanReply
+      .replace(/\bday_index\s*:?\s*\d+/gi, '')
+      .replace(/\bday_index\b/gi, '')
+      .trim();
 
     if (planUpdateMatch && planData) {
       try {
@@ -3444,6 +3462,9 @@ PLAN UPDATE TYPES — use exactly as shown:
 8. REPLACE ALL EXERCISES ON A DAY:
 <PLAN_UPDATE>{"type":"update_day","day_index":0,"exercises":[{"name":"Exercise","note":"cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8}],"summary":"Replaced Monday workout"}</PLAN_UPDATE>
 
+9. RENAME A DAY'S LABEL (e.g. "Push A" → "Chest & Triceps"):
+<PLAN_UPDATE>{"type":"rename_day","day_index":0,"label":"Chest & Triceps","summary":"Renamed Monday to Chest and Triceps"}</PLAN_UPDATE>
+
 - Add a training day: <PLAN_UPDATE>{"type":"add_day","day":{"day_index":4,"day_name":"Friday","label":"Lower Body B","exercises":[{"name":"Squat","note":"Full depth","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]},"summary":"Added Friday lower body session"}</PLAN_UPDATE>
 
 - Remove a training day: <PLAN_UPDATE>{"type":"remove_day","day_index":4,"summary":"Removed Friday session"}</PLAN_UPDATE>
@@ -3467,6 +3488,8 @@ CRITICAL RULES FOR PLAN EDITING:
 - The plan shown in your context is the current live plan — treat it as ground truth
 
 RULES:
+- NEVER mention day_index, field names, JSON structure, or any technical implementation detail in your conversational response. These are for tags only — the user never sees them.
+- ALWAYS refer to days by their name (Monday, Tuesday etc) or their label (Push A, Leg Day etc) in conversation. Never say 'day_index 0' or 'day_index 1' to the user.
 - ALWAYS use the OCCUPIED and FREE day_index lists above — never guess
 - NEVER move a workout to an OCCUPIED day_index unless the user specifically asks to swap two days
 - If the user asks to move to an occupied day, tell them what's already there and ask if they want to swap
@@ -3522,7 +3545,10 @@ YOUR TASK:
 PLAN EDITING: If you decide to adapt the plan based on their feedback, include a <PLAN_UPDATE> tag:
 <PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Exercise Name","changes":{"sets":"4","reps":"8-10"},"summary":"Brief description of change"}</PLAN_UPDATE>
 
-The tag will be hidden from the user — only your text is shown. Always explain any changes you make in your text response.`;
+The tag will be hidden from the user — only your text is shown. Always explain any changes you make in your text response.
+
+- NEVER mention day_index, field names, JSON structure, or any technical implementation detail in your response. These are for tags only.
+- ALWAYS refer to days by their name (Monday, Tuesday etc) or their label in conversation. Never say 'day_index 0' or similar to the user.`;
 }
 
 
