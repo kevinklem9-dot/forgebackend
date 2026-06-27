@@ -7635,26 +7635,36 @@ app.patch('/api/coach/clients/:clientId/activate-coach-nutrition', requireAuth, 
 // ── Client-facing endpoints ───────────────────────────
 app.get('/api/my-coach', requireAuth, async (req, res) => {
   try {
-    // Active coach
-    const { data: link } = await supabase.from('coach_clients')
-      .select('id, coach_id, connected_at, status')
-      .eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
-    // Pending request (most recent)
-    const { data: pending } = await supabase.from('coach_clients')
-      .select('id, coach_id, created_at, status')
-      .eq('client_id', req.user.id).eq('status', 'pending').order('created_at', { ascending: false }).limit(1).maybeSingle();
+    // Active coach + pending request are independent of each other — fetch concurrently.
+    const [{ data: link }, { data: pending }] = await Promise.all([
+      // Active coach
+      supabase.from('coach_clients')
+        .select('id, coach_id, connected_at, status')
+        .eq('client_id', req.user.id).eq('status', 'active').maybeSingle(),
+      // Pending request (most recent)
+      supabase.from('coach_clients')
+        .select('id, coach_id, created_at, status')
+        .eq('client_id', req.user.id).eq('status', 'pending').order('created_at', { ascending: false }).limit(1).maybeSingle(),
+    ]);
+
+    // Each profile lookup depends on its row above, but the two lookups are independent
+    // of each other — run them concurrently too (resolve to null when not needed).
+    const [{ data: linkProfile }, { data: pendingProfile }] = await Promise.all([
+      link?.coach_id
+        ? supabase.from('profiles').select('name, coach_title, coach_bio').eq('id', link.coach_id).maybeSingle()
+        : Promise.resolve({ data: null }),
+      pending?.coach_id
+        ? supabase.from('profiles').select('name, coach_title, coach_bio').eq('id', pending.coach_id).maybeSingle()
+        : Promise.resolve({ data: null }),
+    ]);
 
     let coach = null;
     let pendingCoach = null;
     if (link?.coach_id) {
-      const { data: coachProfile } = await supabase.from('profiles')
-        .select('name, coach_title, coach_bio').eq('id', link.coach_id).maybeSingle();
-      coach = { coach_id: link.coach_id, connected_at: link.connected_at, ...coachProfile };
+      coach = { coach_id: link.coach_id, connected_at: link.connected_at, ...linkProfile };
     }
     if (pending?.coach_id) {
-      const { data: coachProfile } = await supabase.from('profiles')
-        .select('name, coach_title, coach_bio').eq('id', pending.coach_id).maybeSingle();
-      pendingCoach = { connection_id: pending.id, coach_id: pending.coach_id, requested_at: pending.created_at, ...coachProfile };
+      pendingCoach = { connection_id: pending.id, coach_id: pending.coach_id, requested_at: pending.created_at, ...pendingProfile };
     }
     res.json({ coach, pending: pendingCoach });
   } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
